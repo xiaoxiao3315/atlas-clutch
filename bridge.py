@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import atexit
+import ctypes
 import hashlib
 import json
 import logging
@@ -11,6 +13,9 @@ import time
 import traceback
 import urllib.error
 import urllib.request
+import uuid
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -18,11 +23,49 @@ ENV_FILE = ROOT / ".env"
 STATE_FILE = ROOT / "state.json"
 LOG_DIR = ROOT / "logs"
 LOG_FILE = LOG_DIR / "bridge.log"
+LOG_ROTATE_BYTES = 5 * 1024 * 1024
+RUNTIME_DIR = ROOT / "runtime"
+LOCK_FILE = RUNTIME_DIR / "bridge.lock"
+PID_FILE = RUNTIME_DIR / "bridge.pid"
+HEARTBEAT_FILE = RUNTIME_DIR / "heartbeat.json"
+STOP_FILE = RUNTIME_DIR / "stop.request"
+TEMPLATES_DIR = ROOT / "templates"
 PROCESSED_STATE_KEY = "processed_message_keys"
 DEFAULT_PROCESSED_LIMIT = 500
 STARTED_AT = time.time()
+STARTED_AT_TEXT = datetime.now().astimezone().isoformat(timespec="seconds")
 
 LOGGER = logging.getLogger("octo-hermes-bridge")
+
+
+class AlreadyRunningError(RuntimeError):
+    def __init__(self, message: str, lock_info: dict | None = None) -> None:
+        super().__init__(message)
+        self.lock_info = lock_info or {}
+
+
+@dataclass
+class SingleInstanceGuard:
+    runtime_dir: Path
+    lock_file: Path
+    pid_file: Path
+    run_id: str
+    pid: int
+    active: bool = True
+
+    def release(self) -> None:
+        if not self.active:
+            return
+        self.active = False
+        for path in (self.lock_file, self.pid_file):
+            try:
+                if not path.exists():
+                    continue
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if data.get("run_id") == self.run_id:
+                    path.unlink()
+            except Exception:
+                pass
 
 
 def setup_logging() -> None:
@@ -30,6 +73,8 @@ def setup_logging() -> None:
     LOGGER.setLevel(logging.INFO)
     if LOGGER.handlers:
         return
+
+    rotate_log_if_needed()
 
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
 
@@ -40,6 +85,18 @@ def setup_logging() -> None:
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setFormatter(formatter)
     LOGGER.addHandler(stream_handler)
+
+
+def rotate_log_if_needed() -> None:
+    if not LOG_FILE.exists() or LOG_FILE.stat().st_size <= LOG_ROTATE_BYTES:
+        return
+    backup = LOG_FILE.with_name(f"{LOG_FILE.name}.1")
+    try:
+        if backup.exists():
+            backup.unlink()
+        LOG_FILE.replace(backup)
+    except OSError as exc:
+        print(f"[bridge] log rotation skipped: {exc}", file=sys.stderr)
 
 
 def secret_values() -> list[str]:
@@ -84,6 +141,202 @@ def short_id(value: str) -> str:
     return f"{text[:6]}...{text[-4:]}"
 
 
+def display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+def iso_now() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def startup_method() -> str:
+    method = os.environ.get("OHB_START_METHOD", "").strip().lower()
+    if method in {"manual", "task"}:
+        return method
+    legacy_method = os.environ.get("BRIDGE_STARTUP", "").strip().lower()
+    if legacy_method == "task":
+        return "task"
+    return "unknown"
+
+
+def process_command_line(pid: int) -> str:
+    if os.name != "nt":
+        return ""
+    try:
+        command = (
+            "$p=Get-CimInstance Win32_Process -Filter \"ProcessId = %d\" "
+            "-ErrorAction SilentlyContinue; if ($p) { $p.CommandLine }"
+        ) % pid
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", command],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=3,
+        )
+        return (result.stdout or "").strip()
+    except Exception:
+        return ""
+
+
+def pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+
+    if os.name == "nt":
+        process_query_limited_information = 0x1000
+        still_active = 259
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == still_active
+        finally:
+            kernel32.CloseHandle(handle)
+
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def process_looks_like_bridge(pid: int) -> bool:
+    if pid == os.getpid():
+        return True
+    command_line = process_command_line(pid).lower()
+    if not command_line:
+        return True
+    return "bridge.py" in command_line
+
+
+def read_json_file(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def write_json_atomic(path: Path, body: dict) -> None:
+    path.parent.mkdir(exist_ok=True)
+    tmp_file = path.with_suffix(f"{path.suffix}.tmp")
+    tmp_file.write_text(json.dumps(body, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp_file, path)
+
+
+def acquire_single_instance(runtime_dir: Path = RUNTIME_DIR, run_id: str | None = None) -> SingleInstanceGuard:
+    runtime_dir.mkdir(exist_ok=True)
+    lock_file = runtime_dir / LOCK_FILE.name
+    pid_file = runtime_dir / PID_FILE.name
+    run_id = run_id or uuid.uuid4().hex
+    pid = os.getpid()
+    payload = {
+        "run_id": run_id,
+        "pid": pid,
+        "started_at": STARTED_AT_TEXT,
+        "script": str(Path(__file__).resolve()),
+        "cwd": str(ROOT),
+    }
+
+    while True:
+        try:
+            fd = os.open(str(lock_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+            write_json_atomic(pid_file, payload)
+            guard = SingleInstanceGuard(runtime_dir, lock_file, pid_file, run_id, pid)
+            atexit.register(guard.release)
+            return guard
+        except FileExistsError:
+            lock_info = read_json_file(lock_file)
+            existing_pid = int(lock_info.get("pid") or 0)
+            if pid_is_running(existing_pid) and process_looks_like_bridge(existing_pid):
+                raise AlreadyRunningError(
+                    f"bridge is already running with pid {existing_pid}",
+                    lock_info,
+                )
+            try:
+                lock_file.unlink(missing_ok=True)
+                pid_file.unlink(missing_ok=True)
+                log_event("stale_lock_removed", pid=existing_pid, lock=display_path(lock_file))
+            except OSError as exc:
+                raise AlreadyRunningError(f"could not remove stale lock: {exc}", lock_info) from exc
+
+
+def lock_status(guard: SingleInstanceGuard | None) -> str:
+    if guard and guard.active and guard.lock_file.exists():
+        return "held"
+    if LOCK_FILE.exists():
+        info = read_json_file(LOCK_FILE)
+        pid = int(info.get("pid") or 0)
+        if pid_is_running(pid):
+            return f"held_by_pid_{pid}"
+        return "stale"
+    return "none"
+
+
+def stop_requested() -> bool:
+    return STOP_FILE.exists()
+
+
+def clear_stop_request() -> None:
+    try:
+        STOP_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def build_heartbeat(
+    runtime_info: dict,
+    state: dict,
+    last_seq: int,
+    registered: bool,
+    robot_id: str = "",
+    owner_channel_id: str = "",
+) -> dict:
+    processed = state.get(PROCESSED_STATE_KEY) or []
+    return {
+        "run_id": runtime_info.get("run_id", ""),
+        "pid": runtime_info.get("pid", os.getpid()),
+        "started_at": runtime_info.get("started_at", STARTED_AT_TEXT),
+        "updated_at": iso_now(),
+        "registered": bool(registered),
+        "robot_id_masked": short_id(robot_id),
+        "owner_channel_id": owner_channel_id,
+        "last_seq": last_seq,
+        "processed_count": len(processed),
+        "mode": "consultation",
+        "startup_method": runtime_info.get("startup_method", startup_method()),
+        "lock_status": runtime_info.get("lock_status", "unknown"),
+        "last_error": safe_preview(str(state.get("last_error") or ""), 160),
+    }
+
+
+def write_heartbeat(
+    runtime_info: dict,
+    state: dict,
+    last_seq: int,
+    registered: bool,
+    robot_id: str = "",
+    owner_channel_id: str = "",
+    heartbeat_file: Path = HEARTBEAT_FILE,
+) -> dict:
+    heartbeat = build_heartbeat(runtime_info, state, last_seq, registered, robot_id, owner_channel_id)
+    write_json_atomic(heartbeat_file, heartbeat)
+    return heartbeat
+
+
 def load_env() -> None:
     if not ENV_FILE.exists():
         raise SystemExit(f"Missing .env: {ENV_FILE}")
@@ -113,9 +366,7 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
-    tmp_file = STATE_FILE.with_suffix(".json.tmp")
-    tmp_file.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp_file, STATE_FILE)
+    write_json_atomic(STATE_FILE, state)
 
 
 def processed_limit() -> int:
@@ -213,6 +464,8 @@ def build_consultation_prompt(user_text: str) -> str:
 4. 如果用户要求执行动作，只输出给执行端的工作单，等待用户确认。
 5. 没有用户提供的可验证证据时，不要声称任务已经完成。
 6. 工作单必须包含：目标、范围、执行边界、验收标准、风险点。
+7. 审查返回报告时，必须区分：已验证、未验证、风险、下一步决策。
+8. 给出下一步时要明确决策：通过、补证据、继续、回滚或暂停。
 
 用户消息：
 {user_text}
@@ -290,6 +543,56 @@ def safe_preview(text: str, limit: int = 180) -> str:
     return redact(compact)
 
 
+def read_template(name: str) -> str:
+    path = TEMPLATES_DIR / name
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return f"模板缺失：templates/{name}"
+
+
+def template_reply(kind: str) -> str:
+    aliases = {
+        "wo": "work_order.md",
+        "work_order": "work_order.md",
+        "report": "codex_return_report.md",
+        "codex": "codex_return_report.md",
+        "kiro": "codex_return_report.md",
+        "review": "review_checklist.md",
+        "checklist": "review_checklist.md",
+        "daily": "daily_brief.md",
+        "brief": "daily_brief.md",
+    }
+    filename = aliases.get(kind.strip().lower())
+    if not filename:
+        return """可用模板
+- /template wo：工作单模板
+- /template report：Codex/Kiro 回传模板
+- /template review：审查清单模板"""
+    return read_template(filename)
+
+
+def build_workflow_reply() -> str:
+    return """Atlas 工作流闭环
+
+1. 用户发目标
+- 说清楚想达成什么、当前上下文、限制条件和验收方式。
+
+2. Atlas 生成工作单
+- 把自然语言目标整理成目标、范围、执行边界、验收标准、风险点和回传证据。
+- Atlas/Bridge 只做咨询和调度，不运行命令、不修改文件。
+
+3. Codex/Kiro 回传报告
+- 回传修改文件、执行命令、测试结果、证据、未解决风险。
+
+4. Atlas 审查结果
+- 必须区分已验证、未验证、风险、下一步。
+- 没有证据时不能说完成。
+
+5. 用户最终确认
+- 用户决定通过、补证据、继续下一步、回滚或暂停。"""
+
+
 def build_work_order_reply(user_text: str) -> str:
     goal = safe_preview(user_text) or "根据用户最新请求完成任务拆解"
     return f"""咨询模式工作单
@@ -314,7 +617,126 @@ def build_work_order_reply(user_text: str) -> str:
 风险点：
 - 用户请求可能包含隐含范围，需要执行端先核对工作目录和边界。
 - 执行命令、写文件、提交或发布都有副作用，需要确认后再做。
-- 证据不足时只能给出建议或计划，不能报告完成。"""
+- 证据不足时只能给出建议或计划，不能报告完成。
+
+回传证据：
+- 修改文件：
+- 执行命令：
+- 测试结果：
+- 关键日志或截图：
+- 未解决风险：
+- 下一步建议："""
+
+
+def strip_intent_prefix(user_text: str, prefixes: list[str]) -> str:
+    text = user_text.strip()
+    lowered = text.lower()
+    for prefix in prefixes:
+        if lowered.startswith(prefix.lower()):
+            return text[len(prefix):].lstrip(" ：:，,")
+    return text
+
+
+def is_work_order_request(user_text: str) -> bool:
+    text = user_text.strip().lower()
+    prefixes = [
+        "生成工作单",
+        "创建工作单",
+        "整理成工作单",
+        "把这个报错整理成 kiro/codex 可执行任务",
+        "把这个报错整理成 codex/kiro 可执行任务",
+        "把这个报错整理成 codex 可执行任务",
+        "把这个报错整理成 kiro 可执行任务",
+    ]
+    return any(text.startswith(prefix.lower()) for prefix in prefixes)
+
+
+def is_review_request(user_text: str) -> bool:
+    text = user_text.strip().lower()
+    prefixes = [
+        "审查这份 codex 返回报告",
+        "审查这份 kiro 返回报告",
+        "审查这份返回报告",
+        "根据以下证据判断是否完成",
+        "判断以下证据是否完成",
+    ]
+    return any(text.startswith(prefix.lower()) for prefix in prefixes)
+
+
+def is_priority_request(user_text: str) -> bool:
+    text = user_text.strip().lower()
+    return text.startswith("判断下一步优先级") or text.startswith("判断下一步")
+
+
+def build_review_reply(user_text: str) -> str:
+    evidence = strip_intent_prefix(
+        user_text,
+        [
+            "审查这份 Codex 返回报告",
+            "审查这份 Kiro 返回报告",
+            "审查这份返回报告",
+            "根据以下证据判断是否完成",
+            "判断以下证据是否完成",
+        ],
+    )
+    evidence_preview = safe_preview(evidence, 260) or "未提供可审查证据"
+    has_evidence_markers = any(
+        marker in evidence
+        for marker in ("修改文件", "执行命令", "测试结果", "通过", "日志", "截图", "路径", "输出")
+    )
+    decision = "待补证据" if not has_evidence_markers else "需要逐项核对后再确认"
+    return f"""Atlas 审查结论：{decision}
+
+已验证：
+- 当前输入中可见证据摘要：{evidence_preview if has_evidence_markers else "未看到足够的文件、命令、测试或日志证据。"}
+
+未验证：
+- 是否完全满足原工作单验收标准仍需逐条对照。
+- 若缺少修改文件、命令输出、测试结果或日志位置，不能判定完成。
+
+风险：
+- 只有结论但没有证据时，可能误判为完成。
+- 若执行范围、回滚方式或敏感信息处理未说明，需要补充。
+
+下一步决策：
+- {decision}。
+- 请执行端补充：修改文件、执行命令、测试结果、关键日志或截图、未解决风险。
+- 用户确认前，不进入下一阶段。"""
+
+
+def build_priority_reply(user_text: str) -> str:
+    target = strip_intent_prefix(user_text, ["判断下一步优先级", "判断下一步"])
+    target = safe_preview(target, 240) or "未提供候选事项"
+    return f"""Atlas 下一步决策
+
+当前事项：
+- {target}
+
+优先级判断：
+- 先处理能解除阻塞、能补齐验收证据、或能降低安全/回滚风险的事项。
+- 暂缓没有证据、边界不清、或需要用户确认的执行动作。
+
+下一步：
+- 若目标尚未形成工作单：先生成工作单。
+- 若已有执行报告：先审查已验证、未验证、风险和下一步。
+- 若证据不足：要求补证据，不声称完成。"""
+
+
+def build_work_order_from_intent(user_text: str) -> str:
+    target = strip_intent_prefix(
+        user_text,
+        [
+            "生成工作单",
+            "创建工作单",
+            "整理成工作单",
+            "把这个报错整理成 Kiro/Codex 可执行任务",
+            "把这个报错整理成 Codex/Kiro 可执行任务",
+            "把这个报错整理成 Codex 可执行任务",
+            "把这个报错整理成 Kiro 可执行任务",
+        ],
+    )
+    return build_work_order_reply(target)
+
 
 
 def format_uptime(seconds: float) -> str:
@@ -331,16 +753,24 @@ def format_uptime(seconds: float) -> str:
 def build_status_reply(context: dict) -> str:
     state = context.get("state") or {}
     processed = state.get(PROCESSED_STATE_KEY) or []
+    runtime_info = context.get("runtime_info") or {}
+    heartbeat = context.get("heartbeat") or {}
     registered = "已注册" if context.get("registered") else "未注册"
-    last_error = state.get("last_error")
+    last_error = state.get("last_error") or heartbeat.get("last_error")
     lines = [
         "Octo-Hermes Bridge 状态",
-        f"- 模式：咨询/调度",
+        "- 模式：咨询/调度",
         f"- 注册：{registered}",
+        f"- run_id：{runtime_info.get('run_id') or heartbeat.get('run_id') or 'unknown'}",
+        f"- pid：{runtime_info.get('pid') or heartbeat.get('pid') or os.getpid()}",
+        f"- 启动方式：{runtime_info.get('startup_method') or heartbeat.get('startup_method') or startup_method()}",
         f"- 运行时长：{format_uptime(time.time() - STARTED_AT)}",
+        f"- heartbeat 更新时间：{heartbeat.get('updated_at') or 'not_written'}",
+        f"- 单实例锁：{runtime_info.get('lock_status') or heartbeat.get('lock_status') or 'unknown'}",
         f"- last_seq：{context.get('last_seq', 0)}",
         f"- 去重缓存：{len(processed)} 条",
         f"- 日志：logs/bridge.log",
+        "- heartbeat：runtime/heartbeat.json",
         "- 安全边界：Bridge 只生成咨询回复或工作单，不执行命令、不修改文件。",
     ]
     if context.get("robot_id"):
@@ -349,23 +779,48 @@ def build_status_reply(context: dict) -> str:
         lines.append(f"- owner_channel_id：{short_id(context.get('owner_channel_id'))}")
     if last_error:
         lines.append(f"- 最近错误：{safe_preview(str(last_error), 120)}")
+    else:
+        lines.append("- 最近错误：无")
     return "\n".join(lines)
 
 
 def build_help_reply() -> str:
     return """Octo-Hermes Bridge 使用说明
-- /status：查看 bridge 注册、last_seq、去重缓存、日志路径和安全边界。
+- /status：查看 bridge 注册、last_seq、去重缓存、日志路径、heartbeat 和安全边界。
 - /help：查看本说明。
+- /workflow：查看 Atlas 工作流闭环说明。
+- /template wo：返回工作单模板。
+- /template report：返回 Codex/Kiro 回传模板。
+- /template review：返回审查清单模板。
 - 普通消息：进入 Atlas 咨询/调度模式，用于理解目标、拆解任务、审查方案。
+- 推荐用法：生成工作单：检查 Kiro 反代当前状态
+- 推荐用法：审查这份 Codex 返回报告：<粘贴报告>
+- 推荐用法：判断下一步优先级：<粘贴候选事项>
+- 推荐用法：把这个报错整理成 Kiro/Codex 可执行任务：<粘贴报错>
+- 推荐用法：根据以下证据判断是否完成：<粘贴证据>
 - 执行类请求：只生成工作单和验收标准，不运行命令、不修改文件、不提交或发布。"""
 
 
+def build_template_help_reply() -> str:
+    return """模板命令
+- /template wo：工作单模板
+- /template report：Codex/Kiro 回传模板
+- /template review：审查清单模板"""
+
+
 def handle_local_command(user_text: str, context: dict) -> str | None:
-    command = user_text.strip().split(maxsplit=1)[0].lower() if user_text.strip() else ""
+    parts = user_text.strip().split(maxsplit=1)
+    command = parts[0].lower() if parts else ""
     if command == "/status":
         return build_status_reply(context)
     if command == "/help":
         return build_help_reply()
+    if command == "/workflow":
+        return build_workflow_reply()
+    if command == "/template":
+        if len(parts) == 1:
+            return build_template_help_reply()
+        return template_reply(parts[1])
     return None
 
 
@@ -373,6 +828,12 @@ def prepare_reply(user_text: str, context: dict) -> tuple[str, str]:
     local_reply = handle_local_command(user_text, context)
     if local_reply is not None:
         return local_reply, "local_command"
+    if is_work_order_request(user_text):
+        return build_work_order_from_intent(user_text), "work_order"
+    if is_review_request(user_text):
+        return build_review_reply(user_text), "review"
+    if is_priority_request(user_text):
+        return build_priority_reply(user_text), "decision"
     if is_execution_request(user_text):
         return build_work_order_reply(user_text), "work_order"
     return call_hermes(user_text), "hermes"
@@ -393,78 +854,98 @@ def send_text(headers: dict, channel_id: str, channel_type: int, content: str, c
 
 def main() -> int:
     setup_logging()
-    log_event("startup", cwd=ROOT, log_file=LOG_FILE.relative_to(ROOT), mode="consultation")
+    guard: SingleInstanceGuard | None = None
+    state = {PROCESSED_STATE_KEY: []}
+    last_seq = 0
+    robot_id = ""
+    owner_channel_id = ""
+    registered = False
+    heartbeat: dict = {}
+    runtime_info: dict = {}
 
     try:
-        load_env()
-    except BaseException as exc:
-        log_error("startup_failed", exc)
-        raise
+        try:
+            guard = acquire_single_instance()
+        except AlreadyRunningError as exc:
+            existing_pid = exc.lock_info.get("pid", "unknown")
+            log_event("already_running", pid=existing_pid, lock=LOCK_FILE.relative_to(ROOT))
+            print(f"[bridge] {exc}")
+            return 2
 
-    token = os.environ.get("OCTO_BOT_TOKEN", "").strip()
-    if not token.startswith("bf_"):
-        log_error("startup_failed", reason="OCTO_BOT_TOKEN missing or invalid")
-        raise SystemExit("OCTO_BOT_TOKEN missing or invalid. It should start with bf_.")
+        clear_stop_request()
 
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
+        runtime_info = {
+            "run_id": guard.run_id,
+            "pid": guard.pid,
+            "started_at": STARTED_AT_TEXT,
+            "startup_method": startup_method(),
+            "lock_status": lock_status(guard),
+        }
 
-    reg = post_json(
-        "/v1/bot/register",
-        {
-            "agent_platform": "hermes-bridge",
-            "agent_version": "local",
-            "plugin_version": "mvp-0.1",
-        },
-        headers,
-    )
+        log_event(
+            "startup",
+            cwd=ROOT,
+            log_file=LOG_FILE.relative_to(ROOT),
+            run_id=guard.run_id,
+            pid=guard.pid,
+            startup_method=runtime_info["startup_method"],
+            mode="consultation",
+        )
 
-    robot_id = str(reg["robot_id"])
-    owner_channel_id = str(reg["owner_channel_id"])
-    poll_seconds = float(os.environ.get("POLL_SECONDS", "2"))
+        state = load_state()
+        last_seq = int(state.get("last_seq", 0))
+        state["last_seq"] = last_seq
+        heartbeat = write_heartbeat(runtime_info, state, last_seq, registered)
 
-    state = load_state()
-    last_seq = int(state.get("last_seq", 0))
-    state["last_seq"] = last_seq
-    limit = processed_limit()
-    processed_set = set(state.get(PROCESSED_STATE_KEY, []))
+        try:
+            load_env()
+        except BaseException as exc:
+            state["last_error"] = f"startup {type(exc).__name__}: {redact(exc)}"
+            save_state(state)
+            write_heartbeat(runtime_info, state, last_seq, registered)
+            log_error("startup_failed", exc)
+            raise
 
-    log_event(
-        "registered",
-        robot_id=short_id(robot_id),
-        owner_channel_id=short_id(owner_channel_id),
-        last_seq=last_seq,
-    )
+        token = os.environ.get("OCTO_BOT_TOKEN", "").strip()
+        if not token.startswith("bf_"):
+            state["last_error"] = "startup: OCTO_BOT_TOKEN missing or invalid"
+            save_state(state)
+            write_heartbeat(runtime_info, state, last_seq, registered)
+            log_error("startup_failed", reason="OCTO_BOT_TOKEN missing or invalid")
+            raise SystemExit("OCTO_BOT_TOKEN missing or invalid. It should start with bf_.")
 
-    if last_seq == 0:
-        log_event("baseline_start", limit=50)
-        sync = post_json(
-            "/v1/bot/messages/sync",
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+
+        reg = post_json(
+            "/v1/bot/register",
             {
-                "channel_id": owner_channel_id,
-                "channel_type": 1,
-                "limit": 50,
-                "start_message_seq": 0,
-                "end_message_seq": 0,
-                "pull_mode": 1,
+                "agent_platform": "hermes-bridge",
+                "agent_version": "local",
+                "plugin_version": "mvp-0.1",
             },
             headers,
         )
-        messages = sync.get("messages") or []
-        if messages:
-            last_seq = max(int(m.get("message_seq") or 0) for m in messages)
-            state["last_seq"] = last_seq
-            for msg in messages:
-                remember_processed(state, message_key(msg), limit)
-            save_state(state)
-            processed_set = set(state.get(PROCESSED_STATE_KEY, []))
-        log_event("baseline_set", last_seq=last_seq, seen=len(messages))
-        log_event("ready", poll_seconds=poll_seconds)
 
-    while True:
-        try:
+        robot_id = str(reg["robot_id"])
+        owner_channel_id = str(reg["owner_channel_id"])
+        registered = True
+        poll_seconds = float(os.environ.get("POLL_SECONDS", "2"))
+        limit = processed_limit()
+        processed_set = set(state.get(PROCESSED_STATE_KEY, []))
+        heartbeat = write_heartbeat(runtime_info, state, last_seq, registered, robot_id, owner_channel_id)
+
+        log_event(
+            "registered",
+            robot_id=short_id(robot_id),
+            owner_channel_id=short_id(owner_channel_id),
+            last_seq=last_seq,
+        )
+
+        if last_seq == 0:
+            log_event("baseline_start", limit=50)
             sync = post_json(
                 "/v1/bot/messages/sync",
                 {
@@ -477,76 +958,130 @@ def main() -> int:
                 },
                 headers,
             )
-
             messages = sync.get("messages") or []
-            messages = sorted(messages, key=lambda m: int(m.get("message_seq") or 0))
-
-            for msg in messages:
-                seq = int(msg.get("message_seq") or 0)
-                key = message_key(msg)
-                if seq <= last_seq or key in processed_set:
-                    continue
-
-                last_seq = seq
+            if messages:
+                last_seq = max(int(m.get("message_seq") or 0) for m in messages)
                 state["last_seq"] = last_seq
-                remember_processed(state, key, limit)
+                for msg in messages:
+                    remember_processed(state, message_key(msg), limit)
                 save_state(state)
                 processed_set = set(state.get(PROCESSED_STATE_KEY, []))
+            heartbeat = write_heartbeat(runtime_info, state, last_seq, registered, robot_id, owner_channel_id)
+            log_event("baseline_set", last_seq=last_seq, seen=len(messages))
+            log_event("ready", poll_seconds=poll_seconds)
 
-                from_uid = str(msg.get("from_uid") or "")
-                channel_type = int(msg.get("channel_type") or 1)
+        while True:
+            try:
+                if stop_requested():
+                    clear_stop_request()
+                    log_event("stop_requested")
+                    return 0
 
-                if from_uid == robot_id:
-                    log_event("inbound_skip_self", seq=seq)
-                    continue
+                sync = post_json(
+                    "/v1/bot/messages/sync",
+                    {
+                        "channel_id": owner_channel_id,
+                        "channel_type": 1,
+                        "limit": 50,
+                        "start_message_seq": 0,
+                        "end_message_seq": 0,
+                        "pull_mode": 1,
+                    },
+                    headers,
+                )
 
-                user_text = decode_content(msg.get("payload"))
-                if not user_text:
-                    log_event("inbound_empty", seq=seq, from_uid=short_id(from_uid))
-                    continue
+                messages = sync.get("messages") or []
+                messages = sorted(messages, key=lambda m: int(m.get("message_seq") or 0))
 
-                log_event("inbound", seq=seq, from_uid=short_id(from_uid), channel_type=channel_type, content_len=len(user_text))
-                if channel_type == 1:
-                    reply_channel_id = from_uid
-                else:
-                    reply_channel_id = str(msg.get("channel_id") or owner_channel_id)
+                for msg in messages:
+                    seq = int(msg.get("message_seq") or 0)
+                    key = message_key(msg)
+                    if seq <= last_seq or key in processed_set:
+                        continue
 
-                context = {
-                    "registered": True,
-                    "robot_id": robot_id,
-                    "owner_channel_id": owner_channel_id,
-                    "last_seq": last_seq,
-                    "state": state,
-                }
-
-                try:
-                    reply, route = prepare_reply(user_text, context)
-                    client_msg_no = stable_client_msg_no(key)
-                    send_text(headers, reply_channel_id, channel_type, reply, client_msg_no)
-                    log_event(
-                        "outbound",
-                        seq=seq,
-                        route=route,
-                        channel_id=short_id(reply_channel_id),
-                        channel_type=channel_type,
-                        content_len=len(reply),
-                        client_msg_no=short_id(client_msg_no),
-                    )
-                except Exception as exc:
-                    state["last_error"] = f"seq={seq} {type(exc).__name__}: {redact(exc)}"
+                    last_seq = seq
+                    state["last_seq"] = last_seq
+                    remember_processed(state, key, limit)
                     save_state(state)
-                    log_error("message_failed", exc, seq=seq)
+                    processed_set = set(state.get(PROCESSED_STATE_KEY, []))
+                    heartbeat = write_heartbeat(runtime_info, state, last_seq, registered, robot_id, owner_channel_id)
 
-            time.sleep(poll_seconds)
+                    from_uid = str(msg.get("from_uid") or "")
+                    channel_type = int(msg.get("channel_type") or 1)
 
-        except KeyboardInterrupt:
-            log_event("stopped")
-            return 0
-        except Exception as exc:
-            state["last_error"] = f"loop {type(exc).__name__}: {redact(exc)}"
-            save_state(state)
-            log_error("loop_error", exc)
-            time.sleep(5)
+                    if from_uid == robot_id:
+                        log_event("inbound_skip_self", seq=seq)
+                        continue
+
+                    user_text = decode_content(msg.get("payload"))
+                    if not user_text:
+                        log_event("inbound_empty", seq=seq, from_uid=short_id(from_uid))
+                        continue
+
+                    log_event("inbound", seq=seq, from_uid=short_id(from_uid), channel_type=channel_type, content_len=len(user_text))
+                    if channel_type == 1:
+                        reply_channel_id = from_uid
+                    else:
+                        reply_channel_id = str(msg.get("channel_id") or owner_channel_id)
+
+                    runtime_info["lock_status"] = lock_status(guard)
+                    heartbeat = write_heartbeat(runtime_info, state, last_seq, registered, robot_id, owner_channel_id)
+                    context = {
+                        "registered": registered,
+                        "robot_id": robot_id,
+                        "owner_channel_id": owner_channel_id,
+                        "last_seq": last_seq,
+                        "state": state,
+                        "runtime_info": runtime_info,
+                        "heartbeat": heartbeat,
+                    }
+
+                    try:
+                        reply, route = prepare_reply(user_text, context)
+                        client_msg_no = stable_client_msg_no(key)
+                        send_text(headers, reply_channel_id, channel_type, reply, client_msg_no)
+                        log_event(
+                            "outbound",
+                            seq=seq,
+                            route=route,
+                            channel_id=short_id(reply_channel_id),
+                            channel_type=channel_type,
+                            content_len=len(reply),
+                            client_msg_no=short_id(client_msg_no),
+                        )
+                    except Exception as exc:
+                        state["last_error"] = f"seq={seq} {type(exc).__name__}: {redact(exc)}"
+                        save_state(state)
+                        heartbeat = write_heartbeat(runtime_info, state, last_seq, registered, robot_id, owner_channel_id)
+                        log_error("message_failed", exc, seq=seq)
+
+                runtime_info["lock_status"] = lock_status(guard)
+                heartbeat = write_heartbeat(runtime_info, state, last_seq, registered, robot_id, owner_channel_id)
+                if stop_requested():
+                    clear_stop_request()
+                    log_event("stop_requested")
+                    return 0
+                time.sleep(poll_seconds)
+
+            except KeyboardInterrupt:
+                log_event("stopped")
+                return 0
+            except Exception as exc:
+                state["last_error"] = f"loop {type(exc).__name__}: {redact(exc)}"
+                save_state(state)
+                runtime_info["lock_status"] = lock_status(guard)
+                heartbeat = write_heartbeat(runtime_info, state, last_seq, registered, robot_id, owner_channel_id)
+                log_error("loop_error", exc)
+                time.sleep(5)
+    finally:
+        if guard:
+            guard.release()
+            if runtime_info:
+                runtime_info["lock_status"] = lock_status(None)
+                try:
+                    write_heartbeat(runtime_info, state, last_seq, registered, robot_id, owner_channel_id)
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":
