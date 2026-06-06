@@ -64,6 +64,95 @@ User makes the final confirmation:
 
 No evidence means no completion claim.
 
+## Task Ledger
+
+OHB-LOOP-004 adds a local task ledger under:
+
+```text
+workbench/
+  tasks/
+  decisions/
+  daily/
+  archive/
+```
+
+The `workbench/` directory is local runtime state and is ignored by git.
+
+Task ids use this shape:
+
+```text
+OHB-YYYYMMDD-HHMMSS
+```
+
+Example loop in Octo:
+
+```text
+/task new 检查 Kiro 反代当前状态
+```
+
+Atlas returns a `task_id` and a work order. The user copies that work order to Codex or Kiro for manual execution.
+
+After Codex or Kiro returns evidence, paste it back:
+
+```text
+/task report <task_id>
+<粘贴 Codex/Kiro 返回报告>
+```
+
+Ask Atlas to review:
+
+```text
+/task review <task_id>
+```
+
+Atlas review must distinguish verified, unverified, risk, missing evidence, and next step.
+
+Then record the user decision:
+
+```text
+/task decide <task_id> needs_evidence 需要补 Octo UI live 回归证据
+```
+
+or:
+
+```text
+/task decide <task_id> pass 验收通过
+```
+
+Close only after `passed` or `cancelled`:
+
+```text
+/task close <task_id>
+```
+
+Daily brief:
+
+```text
+/daily brief
+```
+
+Ledger commands:
+
+```text
+/task help
+/task new <标题>
+/task list
+/task show <task_id>
+/task report <task_id>
+/task review <task_id>
+/task decide <task_id> <pass|needs_evidence|blocked|cancelled> <说明>
+/task close <task_id>
+/daily brief
+```
+
+Security notes:
+
+- Task commands only write inside `workbench/`.
+- Task commands do not execute shell commands.
+- Task commands do not call Codex/Kiro/OpenClaw.
+- Task commands do not read `.env`.
+- Reports are sanitized before saving common sensitive values such as `bf_` tokens, `sk-` keys, `Authorization:`, `Cookie:`, `password:`, `api_key:`, and `secret:`.
+
 ## Manual Start
 
 Double-click `start_bridge.cmd`, or run:
@@ -164,6 +253,8 @@ It includes `run_id`, `pid`, `started_at`, `updated_at`, `registered`, `robot_id
 - `/status` returns registration state, run id, pid, startup method, heartbeat time, lock state, `last_seq`, dedupe cache size, log path, heartbeat path, and safety boundary.
 - `/help` returns bridge usage notes.
 - `/workflow` returns the Atlas workbench loop.
+- `/task help` returns task ledger commands.
+- `/daily brief` returns today's active task summary.
 - `/template wo` returns the work order template.
 - `/template report` returns the Codex/Kiro return report template.
 - `/template review` returns the Atlas review checklist.
@@ -198,4 +289,5 @@ python -m py_compile smoke_consultation.py
 python smoke_consultation.py
 python smoke_runtime.py
 python smoke_workflow.py
+python smoke_task_loop.py
 ```

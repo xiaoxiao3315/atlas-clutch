@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -30,10 +31,17 @@ PID_FILE = RUNTIME_DIR / "bridge.pid"
 HEARTBEAT_FILE = RUNTIME_DIR / "heartbeat.json"
 STOP_FILE = RUNTIME_DIR / "stop.request"
 TEMPLATES_DIR = ROOT / "templates"
+WORKBENCH_DIR = ROOT / "workbench"
+TASKS_DIR = WORKBENCH_DIR / "tasks"
+DECISIONS_DIR = WORKBENCH_DIR / "decisions"
+DAILY_DIR = WORKBENCH_DIR / "daily"
+ARCHIVE_DIR = WORKBENCH_DIR / "archive"
 PROCESSED_STATE_KEY = "processed_message_keys"
 DEFAULT_PROCESSED_LIMIT = 500
 STARTED_AT = time.time()
 STARTED_AT_TEXT = datetime.now().astimezone().isoformat(timespec="seconds")
+OPEN_TASK_STATUSES = {"draft", "open", "reported", "reviewed", "needs_evidence"}
+DECISION_STATUSES = {"pass", "needs_evidence", "blocked", "cancelled"}
 
 LOGGER = logging.getLogger("octo-hermes-bridge")
 
@@ -114,6 +122,7 @@ def redact(value) -> str:
     text = str(value)
     for secret in secret_values():
         text = text.replace(secret, "[REDACTED]")
+    text = sanitize_sensitive_text(text)
     return text
 
 
@@ -543,6 +552,510 @@ def safe_preview(text: str, limit: int = 180) -> str:
     return redact(compact)
 
 
+def sanitize_sensitive_text(text: str) -> str:
+    sanitized = str(text or "")
+    sanitized = re.sub(r"bf_[A-Za-z0-9._-]+", "[REDACTED_BF_TOKEN]", sanitized)
+    sanitized = re.sub(r"sk-[A-Za-z0-9._-]+", "[REDACTED_SK_KEY]", sanitized)
+    sanitized = re.sub(r"(?im)^(\s*Authorization\s*:\s*).*$", r"\1[REDACTED]", sanitized)
+    sanitized = re.sub(r"(?im)^(\s*Cookie\s*:\s*).*$", r"\1[REDACTED]", sanitized)
+    sanitized = re.sub(r"(?im)^(\s*password\s*[:=]\s*).*$", r"\1[REDACTED]", sanitized)
+    sanitized = re.sub(r"(?im)^(\s*api_key\s*[:=]\s*).*$", r"\1[REDACTED]", sanitized)
+    sanitized = re.sub(r"(?im)^(\s*secret\s*[:=]\s*).*$", r"\1[REDACTED]", sanitized)
+    return sanitized
+
+
+def ensure_workbench_dirs() -> None:
+    for path in (WORKBENCH_DIR, TASKS_DIR, DECISIONS_DIR, DAILY_DIR, ARCHIVE_DIR):
+        path.mkdir(exist_ok=True)
+
+
+def ensure_inside_workbench(path: Path) -> Path:
+    resolved = path.resolve()
+    base = WORKBENCH_DIR.resolve()
+    if resolved != base and base not in resolved.parents:
+        raise ValueError(f"refusing to write outside workbench: {path}")
+    return resolved
+
+
+def normalize_task_id(task_id: str) -> str:
+    value = task_id.strip()
+    if not re.fullmatch(r"OHB-\d{8}-\d{6}(?:-\d{2})?", value):
+        raise ValueError("invalid task_id")
+    return value
+
+
+def task_path(task_id: str) -> Path:
+    ensure_workbench_dirs()
+    return ensure_inside_workbench(TASKS_DIR / f"{normalize_task_id(task_id)}.md")
+
+
+def decision_path(task_id: str) -> Path:
+    ensure_workbench_dirs()
+    return ensure_inside_workbench(DECISIONS_DIR / f"{normalize_task_id(task_id)}.md")
+
+
+def generate_task_id() -> str:
+    ensure_workbench_dirs()
+    base = datetime.now().strftime("OHB-%Y%m%d-%H%M%S")
+    if not task_path(base).exists():
+        return base
+    for index in range(1, 100):
+        candidate = f"{base}-{index:02d}"
+        if not task_path(candidate).exists():
+            return candidate
+    raise RuntimeError("could not generate unique task_id")
+
+
+def sanitize_title(title: str) -> str:
+    text = sanitize_sensitive_text(str(title or "")).strip()
+    text = " ".join(text.split())
+    return text[:120] or "未命名任务"
+
+
+def build_task_markdown(task_id: str, title: str) -> str:
+    now = iso_now()
+    clean_title = sanitize_title(title)
+    return f"""# {task_id} {clean_title}
+
+status: open
+created_at: {now}
+updated_at: {now}
+source: octo
+mode: consultation
+
+## Goal
+- {clean_title}
+
+## Scope
+- 仅围绕本任务目标生成人工执行工作单。
+- 不扩展到未授权项目、服务、群聊、多用户或 WebSocket。
+
+## Execution Boundary
+- Bridge/Atlas 只写本地 workbench 账本，不执行命令。
+- 不自动调用 Codex/Kiro/OpenClaw。
+- 不修改用户项目文件，不改 Octo Docker 部署，不改 Hermes 主体代码。
+- 不读取、不记录、不提交 `.env`、token、密钥、cookie。
+
+## Acceptance Criteria
+- 执行端回传修改文件、执行命令、测试结果和未解决风险。
+- Atlas 审查区分已验证、未验证、风险、待补证据、下一步建议。
+- 用户做出 pass、needs_evidence、blocked 或 cancelled 决策。
+
+## Risks
+- 缺少证据时不能判定完成。
+- 执行范围不清时需要补充边界。
+- 任意真实执行动作必须由用户另行交给执行端处理。
+
+## Evidence Required
+- 修改文件：
+- 执行命令：
+- 测试结果：
+- 关键日志或截图：
+- 未解决风险：
+
+## Execution Report
+- 尚未回传。
+
+## Atlas Review
+- 尚未审查。
+
+## User Decision
+- 尚未决策。
+
+## Timeline
+- {now} task created with status open.
+"""
+
+
+def read_task(task_id: str) -> str:
+    path = task_path(task_id)
+    if not path.exists():
+        raise FileNotFoundError(f"task not found: {task_id}")
+    return path.read_text(encoding="utf-8")
+
+
+def write_task(task_id: str, text: str) -> None:
+    path = task_path(task_id)
+    write_json_atomic(path.with_suffix(".lock.json"), {"task_id": task_id, "updated_at": iso_now()})
+    path.write_text(sanitize_sensitive_text(text), encoding="utf-8")
+    try:
+        path.with_suffix(".lock.json").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def task_title_from_text(task_id: str, text: str) -> str:
+    first_line = text.splitlines()[0] if text.splitlines() else ""
+    prefix = f"# {task_id} "
+    if first_line.startswith(prefix):
+        return first_line[len(prefix):].strip()
+    return "未命名任务"
+
+
+def task_metadata(text: str) -> dict:
+    meta: dict[str, str] = {}
+    for line in text.splitlines()[1:20]:
+        if line.startswith("## "):
+            break
+        if ":" in line:
+            key, value = line.split(":", 1)
+            meta[key.strip()] = value.strip()
+    return meta
+
+
+def task_section(text: str, heading: str) -> str:
+    pattern = re.compile(rf"^## {re.escape(heading)}\s*$", re.MULTILINE)
+    match = pattern.search(text)
+    if not match:
+        return ""
+    next_match = re.search(r"^## .+$", text[match.end():], re.MULTILINE)
+    end = match.end() + next_match.start() if next_match else len(text)
+    return text[match.end():end].strip()
+
+
+def replace_task_field(text: str, field: str, value: str) -> str:
+    replacement = f"{field}: {sanitize_sensitive_text(value)}"
+    pattern = re.compile(rf"^{re.escape(field)}:.*$", re.MULTILINE)
+    if pattern.search(text):
+        return pattern.sub(replacement, text, count=1)
+    return text.replace("\n\n## Goal", f"\n{replacement}\n\n## Goal", 1)
+
+
+def append_to_section(text: str, heading: str, addition: str) -> str:
+    clean_addition = sanitize_sensitive_text(addition).strip()
+    if not clean_addition:
+        clean_addition = "- 无正文。"
+    heading_line = f"## {heading}"
+    if heading_line not in text:
+        return text.rstrip() + f"\n\n{heading_line}\n{clean_addition}\n"
+    pattern = re.compile(rf"(^## {re.escape(heading)}\s*$)", re.MULTILINE)
+    match = pattern.search(text)
+    if not match:
+        return text.rstrip() + f"\n\n{heading_line}\n{clean_addition}\n"
+    next_match = re.search(r"^## .+$", text[match.end():], re.MULTILINE)
+    insert_at = match.end() + next_match.start() if next_match else len(text)
+    before = text[:insert_at].rstrip()
+    after = text[insert_at:]
+    return before + "\n\n" + clean_addition + "\n" + after
+
+
+def update_task_status(text: str, status: str) -> str:
+    text = replace_task_field(text, "status", status)
+    text = replace_task_field(text, "updated_at", iso_now())
+    return text
+
+
+def create_task(title: str) -> tuple[str, str]:
+    ensure_workbench_dirs()
+    task_id = generate_task_id()
+    text = build_task_markdown(task_id, title)
+    write_task(task_id, text)
+    log_event("task_created", task_id=task_id)
+    return task_id, text
+
+
+def task_records() -> list[dict]:
+    ensure_workbench_dirs()
+    records = []
+    for path in sorted(TASKS_DIR.glob("OHB-*.md")):
+        task_id = path.stem
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        meta = task_metadata(text)
+        records.append(
+            {
+                "task_id": task_id,
+                "title": task_title_from_text(task_id, text),
+                "status": meta.get("status", "unknown"),
+                "created_at": meta.get("created_at", ""),
+                "updated_at": meta.get("updated_at", ""),
+                "path": path,
+            }
+        )
+    return sorted(records, key=lambda item: item.get("updated_at", ""), reverse=True)
+
+
+def workbench_counts() -> dict:
+    counts = {
+        "open_tasks": 0,
+        "reported_tasks": 0,
+        "needs_evidence_tasks": 0,
+        "recent_task_id": "",
+    }
+    records = task_records()
+    if records:
+        counts["recent_task_id"] = records[0]["task_id"]
+    for record in records:
+        status = record.get("status")
+        if status in OPEN_TASK_STATUSES:
+            counts["open_tasks"] += 1
+        if status == "reported":
+            counts["reported_tasks"] += 1
+        if status == "needs_evidence":
+            counts["needs_evidence_tasks"] += 1
+    return counts
+
+
+def build_task_help_reply() -> str:
+    return """Atlas 任务账本命令
+- /task help：查看本说明。
+- /task new <标题>：创建任务工作单，只写 workbench，不执行。
+- /task list：列出最近 10 个任务。
+- /task show <task_id>：查看任务摘要、状态和下一步。
+- /task report <task_id>：下一行粘贴 Codex/Kiro 回传报告，状态改为 reported。
+- /task review <task_id>：读取任务与回传报告，生成 Atlas 审查。
+- /task decide <task_id> <pass|needs_evidence|blocked|cancelled> <说明>：记录用户决策。
+- /task close <task_id>：仅 passed/cancelled 可关闭，状态改为 archived。
+- /daily brief：汇总今日 open/reported/reviewed/needs_evidence 任务。"""
+
+
+def build_task_new_reply(title: str) -> str:
+    task_id, text = create_task(title)
+    return f"""任务已创建：{task_id}
+
+状态：open
+路径：workbench/tasks/{task_id}.md
+
+工作单：
+{text}
+
+下一步：
+- 把上面的工作单交给 Codex/Kiro 人工执行。
+- 执行端回传后，在 Octo 发送：/task report {task_id}
+  <粘贴报告>"""
+
+
+def build_task_list_reply() -> str:
+    records = task_records()[:10]
+    if not records:
+        return "最近任务：暂无。"
+    lines = ["最近 10 个任务："]
+    for record in records:
+        lines.append(
+            f"- {record['task_id']} | {record['status']} | {record['updated_at']} | {record['title']}"
+        )
+    return "\n".join(lines)
+
+
+def build_task_show_reply(task_id: str) -> str:
+    text = read_task(task_id)
+    meta = task_metadata(text)
+    goal = safe_preview(task_section(text, "Goal"), 220) or "未填写"
+    review = safe_preview(task_section(text, "Atlas Review"), 220)
+    decision = safe_preview(task_section(text, "User Decision"), 220)
+    next_step = "等待 Codex/Kiro 回传报告"
+    status = meta.get("status", "unknown")
+    if status == "reported":
+        next_step = f"发送 /task review {task_id}"
+    elif status == "reviewed":
+        next_step = f"发送 /task decide {task_id} needs_evidence|pass <说明>"
+    elif status == "needs_evidence":
+        next_step = "补充证据后再次 /task report"
+    elif status == "passed":
+        next_step = f"发送 /task close {task_id}"
+    elif status == "cancelled":
+        next_step = f"发送 /task close {task_id}"
+    return f"""任务摘要：{task_id}
+- status：{status}
+- title：{task_title_from_text(task_id, text)}
+- updated_at：{meta.get('updated_at', '')}
+- goal：{goal}
+- atlas_review：{review or '尚未审查'}
+- user_decision：{decision or '尚未决策'}
+- 下一步：{next_step}"""
+
+
+def build_task_report_reply(task_id: str, report: str) -> str:
+    text = read_task(task_id)
+    clean_report = sanitize_sensitive_text(report).strip() or "- 空报告：需要补充执行证据。"
+    now = iso_now()
+    addition = f"### Report at {now}\n{clean_report}"
+    text = append_to_section(text, "Execution Report", addition)
+    text = append_to_section(text, "Timeline", f"- {now} report appended; status reported.")
+    text = update_task_status(text, "reported")
+    write_task(task_id, text)
+    log_event("task_reported", task_id=task_id)
+    return f"""任务已记录回传：{task_id}
+- status：reported
+- 已追加到：workbench/tasks/{task_id}.md
+- 下一步：发送 /task review {task_id}"""
+
+
+def evidence_markers_present(text: str) -> bool:
+    return any(marker in text for marker in ("修改文件", "执行命令", "测试结果", "通过", "日志", "截图", "路径", "输出"))
+
+
+def build_atlas_review_for_task(task_id: str, text: str) -> str:
+    report = task_section(text, "Execution Report")
+    acceptance = task_section(text, "Acceptance Criteria")
+    has_report = "尚未回传" not in report and bool(report.strip())
+    has_markers = evidence_markers_present(report)
+    verified = "未发现足够证据。" if not has_markers else "回传中出现了文件、命令、测试或日志类证据，需要按验收标准逐项核对。"
+    unverified = "缺少回传报告。" if not has_report else "仍需确认每条验收标准是否有对应证据。"
+    if not has_markers:
+        unverified = "缺少修改文件、执行命令、测试结果或日志位置，不能判定完成。"
+    next_step = "补充证据" if not has_markers else "用户确认是否 pass，或要求补充缺口证据"
+    return f"""### Review at {iso_now()}
+
+已验证：
+- {verified}
+- 验收标准摘要：{safe_preview(acceptance, 220) or '未读取到验收标准。'}
+
+未验证：
+- {unverified}
+
+风险：
+- 没有证据时不能声称完成。
+- 若执行范围、回滚方式、敏感信息处理未说明，需要补充。
+
+待补证据：
+- 修改文件。
+- 执行命令。
+- 测试结果。
+- 关键日志或截图。
+- 未解决风险说明。
+
+下一步建议：
+- {next_step}。
+- 用户确认前不关闭任务。"""
+
+
+def build_task_review_reply(task_id: str) -> str:
+    text = read_task(task_id)
+    review = build_atlas_review_for_task(task_id, text)
+    now = iso_now()
+    text = append_to_section(text, "Atlas Review", review)
+    text = append_to_section(text, "Timeline", f"- {now} Atlas review generated; status reviewed.")
+    text = update_task_status(text, "reviewed")
+    write_task(task_id, text)
+    log_event("task_reviewed", task_id=task_id)
+    return f"""Atlas 审查已生成：{task_id}
+
+{review}
+
+状态：reviewed
+下一步：
+- /task decide {task_id} needs_evidence <说明>
+- 或 /task decide {task_id} pass <说明>"""
+
+
+def build_task_decide_reply(task_id: str, decision: str, note: str) -> str:
+    normalized = decision.strip().lower()
+    if normalized not in DECISION_STATUSES:
+        return "决策无效。可用：pass、needs_evidence、blocked、cancelled。"
+    status = "passed" if normalized == "pass" else normalized
+    clean_note = sanitize_sensitive_text(note).strip() or "未填写说明。"
+    now = iso_now()
+    text = read_task(task_id)
+    decision_text = f"### Decision at {now}\n- decision：{normalized}\n- status：{status}\n- note：{clean_note}"
+    text = append_to_section(text, "User Decision", decision_text)
+    text = append_to_section(text, "Timeline", f"- {now} user decision {normalized}; status {status}.")
+    text = update_task_status(text, status)
+    write_task(task_id, text)
+    decision_record = f"# {task_id} decision\n\n{decision_text}\n"
+    decision_path(task_id).write_text(sanitize_sensitive_text(decision_record), encoding="utf-8")
+    log_event("task_decided", task_id=task_id, decision=normalized)
+    return f"""用户决策已记录：{task_id}
+- decision：{normalized}
+- status：{status}
+- 下一步：{('/task close ' + task_id) if status in {'passed', 'cancelled'} else '按决策补证据、处理阻塞或暂停'}"""
+
+
+def build_task_close_reply(task_id: str) -> str:
+    text = read_task(task_id)
+    status = task_metadata(text).get("status", "unknown")
+    if status not in {"passed", "cancelled"}:
+        return f"不能关闭：{task_id} 当前 status={status}。只有 passed/cancelled 可以关闭。"
+    now = iso_now()
+    text = append_to_section(text, "Timeline", f"- {now} task archived from status {status}.")
+    text = update_task_status(text, "archived")
+    write_task(task_id, text)
+    log_event("task_archived", task_id=task_id)
+    return f"""任务已关闭：{task_id}
+- status：archived
+- 文件保留：workbench/tasks/{task_id}.md"""
+
+
+def build_daily_brief_reply() -> str:
+    ensure_workbench_dirs()
+    today = datetime.now().strftime("%Y-%m-%d")
+    records = [
+        record for record in task_records()
+        if record.get("status") in OPEN_TASK_STATUSES and (record.get("created_at", "").startswith(today) or record.get("updated_at", "").startswith(today))
+    ]
+    lines = [f"Atlas 今日简报：{today}"]
+    if not records:
+        lines.append("- 今日暂无 open/reported/reviewed/needs_evidence 任务。")
+    else:
+        for record in records[:20]:
+            lines.append(f"- {record['task_id']} | {record['status']} | {record['title']}")
+    lines.extend(
+        [
+            "",
+            "今日决策建议：",
+            "- reported：优先 /task review。",
+            "- reviewed：等待用户 /task decide。",
+            "- needs_evidence：补证据后再报告。",
+        ]
+    )
+    brief = "\n".join(lines)
+    (DAILY_DIR / f"{datetime.now().strftime('%Y%m%d')}.md").write_text(sanitize_sensitive_text(brief), encoding="utf-8")
+    return brief
+
+
+def handle_task_command(user_text: str) -> str | None:
+    lines = user_text.strip().splitlines()
+    first_line = lines[0] if lines else ""
+    parts = first_line.split(maxsplit=2)
+    if len(parts) < 2 or parts[0].lower() != "/task":
+        return None
+    subcommand = parts[1].lower()
+    tail = parts[2] if len(parts) > 2 else ""
+    try:
+        if subcommand == "help":
+            return build_task_help_reply()
+        if subcommand == "new":
+            return build_task_new_reply(tail)
+        if subcommand == "list":
+            return build_task_list_reply()
+        if subcommand == "show":
+            return build_task_show_reply(tail)
+        if subcommand == "report":
+            report_parts = tail.split(maxsplit=1)
+            if not report_parts:
+                return "用法：/task report <task_id>\\n<粘贴 Codex/Kiro 回传报告>"
+            task_id = report_parts[0]
+            inline = report_parts[1] if len(report_parts) > 1 else ""
+            body = "\n".join(lines[1:]).strip()
+            report = body or inline
+            return build_task_report_reply(task_id, report)
+        if subcommand == "review":
+            return build_task_review_reply(tail)
+        if subcommand == "decide":
+            decision_parts = tail.split(maxsplit=2)
+            if len(decision_parts) < 2:
+                return "用法：/task decide <task_id> <pass|needs_evidence|blocked|cancelled> <说明>"
+            note = decision_parts[2] if len(decision_parts) > 2 else ""
+            return build_task_decide_reply(decision_parts[0], decision_parts[1], note)
+        if subcommand == "close":
+            return build_task_close_reply(tail)
+        return build_task_help_reply()
+    except Exception as exc:
+        return f"任务账本操作失败：{safe_preview(str(exc), 180)}"
+
+
+def handle_daily_command(user_text: str) -> str | None:
+    parts = user_text.strip().split(maxsplit=1)
+    if len(parts) == 2 and parts[0].lower() == "/daily" and parts[1].strip().lower() == "brief":
+        try:
+            return build_daily_brief_reply()
+        except Exception as exc:
+            return f"今日简报生成失败：{safe_preview(str(exc), 180)}"
+    return None
+
+
 def read_template(name: str) -> str:
     path = TEMPLATES_DIR / name
     try:
@@ -755,6 +1268,7 @@ def build_status_reply(context: dict) -> str:
     processed = state.get(PROCESSED_STATE_KEY) or []
     runtime_info = context.get("runtime_info") or {}
     heartbeat = context.get("heartbeat") or {}
+    counts = workbench_counts()
     registered = "已注册" if context.get("registered") else "未注册"
     last_error = state.get("last_error") or heartbeat.get("last_error")
     lines = [
@@ -769,8 +1283,13 @@ def build_status_reply(context: dict) -> str:
         f"- 单实例锁：{runtime_info.get('lock_status') or heartbeat.get('lock_status') or 'unknown'}",
         f"- last_seq：{context.get('last_seq', 0)}",
         f"- 去重缓存：{len(processed)} 条",
+        f"- open_tasks：{counts['open_tasks']}",
+        f"- reported_tasks：{counts['reported_tasks']}",
+        f"- needs_evidence_tasks：{counts['needs_evidence_tasks']}",
+        f"- 最近 task_id：{counts['recent_task_id'] or 'none'}",
         f"- 日志：logs/bridge.log",
         "- heartbeat：runtime/heartbeat.json",
+        "- workbench：workbench/",
         "- 安全边界：Bridge 只生成咨询回复或工作单，不执行命令、不修改文件。",
     ]
     if context.get("robot_id"):
@@ -789,6 +1308,8 @@ def build_help_reply() -> str:
 - /status：查看 bridge 注册、last_seq、去重缓存、日志路径、heartbeat 和安全边界。
 - /help：查看本说明。
 - /workflow：查看 Atlas 工作流闭环说明。
+- /task help：查看本地任务账本命令。
+- /daily brief：汇总今日待处理任务。
 - /template wo：返回工作单模板。
 - /template report：返回 Codex/Kiro 回传模板。
 - /template review：返回审查清单模板。
@@ -811,6 +1332,10 @@ def build_template_help_reply() -> str:
 def handle_local_command(user_text: str, context: dict) -> str | None:
     parts = user_text.strip().split(maxsplit=1)
     command = parts[0].lower() if parts else ""
+    if command == "/task":
+        return handle_task_command(user_text)
+    if command == "/daily":
+        return handle_daily_command(user_text)
     if command == "/status":
         return build_status_reply(context)
     if command == "/help":
@@ -873,6 +1398,7 @@ def main() -> int:
             return 2
 
         clear_stop_request()
+        ensure_workbench_dirs()
 
         runtime_info = {
             "run_id": guard.run_id,
