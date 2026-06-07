@@ -49,7 +49,9 @@ PLAYBOOKS_DIR = WORKBENCH_DIR / "playbooks"
 PROJECT_PLAYBOOKS_DIR = PLAYBOOKS_DIR / "projects"
 CONTEXT_PACKS_DIR = WORKBENCH_DIR / "context_packs"
 DISPATCHES_DIR = WORKBENCH_DIR / "dispatches"
+EXECUTIONS_DIR = WORKBENCH_DIR / "executions"
 PILOTS_DIR = WORKBENCH_DIR / "pilots"
+COLLECTIONS_DIR = WORKBENCH_DIR / "collections"
 DECISIONS_DIR = WORKBENCH_DIR / "decisions"
 DAILY_DIR = WORKBENCH_DIR / "daily"
 ARCHIVE_DIR = WORKBENCH_DIR / "archive"
@@ -72,6 +74,7 @@ EVIDENCE_TYPES = {
     "live",
     "smoke",
     "report",
+    "collection",
     "decision",
     "other",
 }
@@ -90,11 +93,61 @@ DISPATCH_STATUSES = {
     "cancelled",
     "closed",
 }
+EXEC_STATUSES = {
+    "prepared",
+    "opened",
+    "copied",
+    "returned",
+    "cancelled",
+    "failed",
+}
 PILOT_STATUSES = {"active", "completed", "paused", "cancelled"}
 APPLICATION_ENABLED = False
 RUNTIME_INJECTION_ENABLED = False
 EXTERNAL_APPLICATION_ENABLED = False
 EXTERNAL_EXECUTION_ENABLED = False
+HUMAN_CONFIRM_REQUIRED = True
+AUTO_EXECUTE_ENABLED = False
+COLLECT_ENABLED = True
+COLLECT_MODE = "read_only_whitelist"
+ARBITRARY_COMMAND_ENABLED = False
+COLLECT_OUTPUT_LIMIT = 6000
+COLLECT_TAIL_LINES = 80
+COLLECT_COMMAND_TIMEOUT = 20
+COLLECT_SMOKE_TIMEOUT = 60
+OCTO_BRIDGE_SMOKE_ALLOWLIST = [
+    "smoke_consultation.py",
+    "smoke_runtime.py",
+    "smoke_workflow.py",
+    "smoke_task_loop.py",
+    "smoke_handoff.py",
+    "smoke_project.py",
+    "smoke_evidence.py",
+    "smoke_retro.py",
+    "smoke_learn.py",
+    "smoke_apply.py",
+    "smoke_context.py",
+    "smoke_dispatch.py",
+    "smoke_pilot.py",
+    "smoke_auto_evidence.py",
+]
+COLLECT_PROFILES = {
+    "octo-bridge": {
+        "root": ROOT,
+        "logs": [ROOT / "logs" / "bridge.log"],
+        "runtime": [ROOT / "runtime" / "heartbeat.json"],
+        "smokes": OCTO_BRIDGE_SMOKE_ALLOWLIST,
+    },
+    "kiro-gateway": {
+        "root": Path("E:/ai/kiro-gateway-mvp"),
+        "logs": [
+            Path("E:/ai/kiro-gateway-mvp/logs/gateway.log"),
+            Path("E:/ai/kiro-gateway-mvp/logs/acp_raw.log"),
+        ],
+        "runtime": [],
+        "smokes": [],
+    },
+}
 
 LOGGER = logging.getLogger("octo-hermes-bridge")
 
@@ -988,7 +1041,7 @@ def build_auto_evidence_body(report: str, intake: dict) -> str:
 
 
 def ensure_workbench_dirs() -> None:
-    global APPLICATIONS_DIR, PLAYBOOKS_DIR, PROJECT_PLAYBOOKS_DIR, CONTEXT_PACKS_DIR, DISPATCHES_DIR, PILOTS_DIR
+    global APPLICATIONS_DIR, PLAYBOOKS_DIR, PROJECT_PLAYBOOKS_DIR, CONTEXT_PACKS_DIR, DISPATCHES_DIR, EXECUTIONS_DIR, PILOTS_DIR, COLLECTIONS_DIR
     if WORKBENCH_DIR.resolve() not in APPLICATIONS_DIR.resolve().parents:
         APPLICATIONS_DIR = WORKBENCH_DIR / "applications"
     if WORKBENCH_DIR.resolve() not in PLAYBOOKS_DIR.resolve().parents:
@@ -999,8 +1052,12 @@ def ensure_workbench_dirs() -> None:
         CONTEXT_PACKS_DIR = WORKBENCH_DIR / "context_packs"
     if WORKBENCH_DIR.resolve() not in DISPATCHES_DIR.resolve().parents:
         DISPATCHES_DIR = WORKBENCH_DIR / "dispatches"
+    if WORKBENCH_DIR.resolve() not in EXECUTIONS_DIR.resolve().parents:
+        EXECUTIONS_DIR = WORKBENCH_DIR / "executions"
     if WORKBENCH_DIR.resolve() not in PILOTS_DIR.resolve().parents:
         PILOTS_DIR = WORKBENCH_DIR / "pilots"
+    if WORKBENCH_DIR.resolve() not in COLLECTIONS_DIR.resolve().parents:
+        COLLECTIONS_DIR = WORKBENCH_DIR / "collections"
     for path in (
         WORKBENCH_DIR,
         TASKS_DIR,
@@ -1020,7 +1077,9 @@ def ensure_workbench_dirs() -> None:
         PROJECT_PLAYBOOKS_DIR,
         CONTEXT_PACKS_DIR,
         DISPATCHES_DIR,
+        EXECUTIONS_DIR,
         PILOTS_DIR,
+        COLLECTIONS_DIR,
         DECISIONS_DIR,
         DAILY_DIR,
         ARCHIVE_DIR,
@@ -1114,10 +1173,24 @@ def normalize_dispatch_id(dispatch_id: str) -> str:
     return value
 
 
+def normalize_exec_id(exec_id: str) -> str:
+    value = str(exec_id or "").strip()
+    if not re.fullmatch(r"EXEC-\d{8}-\d{6}(?:-\d{2})?", value):
+        raise ValueError("invalid exec_id")
+    return value
+
+
 def normalize_pilot_id(pilot_id: str) -> str:
     value = str(pilot_id or "").strip()
     if not re.fullmatch(r"PILOT-\d{8}-\d{6}(?:-\d{2})?", value):
         raise ValueError("invalid pilot_id")
+    return value
+
+
+def normalize_collection_id(collection_id: str) -> str:
+    value = str(collection_id or "").strip()
+    if not re.fullmatch(r"COLLECT-\d{8}-\d{6}(?:-\d{2})?", value):
+        raise ValueError("invalid collection_id")
     return value
 
 
@@ -1136,9 +1209,19 @@ def dispatch_path(dispatch_id: str) -> Path:
     return ensure_inside_workbench(DISPATCHES_DIR / f"{normalize_dispatch_id(dispatch_id)}.md")
 
 
+def exec_path(exec_id: str) -> Path:
+    ensure_workbench_dirs()
+    return ensure_inside_workbench(EXECUTIONS_DIR / f"{normalize_exec_id(exec_id)}.md")
+
+
 def pilot_path(pilot_id: str) -> Path:
     ensure_workbench_dirs()
     return ensure_inside_workbench(PILOTS_DIR / f"{normalize_pilot_id(pilot_id)}.md")
+
+
+def collection_path(collection_id: str) -> Path:
+    ensure_workbench_dirs()
+    return ensure_inside_workbench(COLLECTIONS_DIR / f"{normalize_collection_id(collection_id)}.md")
 
 
 def global_playbook_path() -> Path:
@@ -1527,7 +1610,7 @@ def detect_evidence_type_from_report(report: str) -> str:
 
 
 def evidence_support_state(body: str, evidence_type: str) -> str:
-    if evidence_markers_present(body) or evidence_type in {"file", "command", "log", "api", "http", "process", "git", "screenshot", "ui", "live", "smoke"}:
+    if evidence_markers_present(body) or evidence_type in {"file", "command", "log", "api", "http", "process", "git", "screenshot", "ui", "live", "smoke", "collection"}:
         return "observed"
     if report_has_claim(body):
         return "claimed"
@@ -1976,6 +2059,18 @@ def workbench_counts() -> dict:
         "dispatch_ready_count": 0,
         "dispatch_failed_count": 0,
         "dispatch_stale_count": 0,
+        "execution_count": 0,
+        "execution_returned": 0,
+        "execution_prepared_count": 0,
+        "execution_opened_count": 0,
+        "execution_copied_count": 0,
+        "execution_failed_count": 0,
+        "execution_stale_count": 0,
+        "latest_exec_id": "",
+        "collection_count": 0,
+        "latest_collection_id": "",
+        "smoke_collection_count": 0,
+        "failed_collection_count": 0,
     }
     records = task_records()
     if records:
@@ -2015,6 +2110,20 @@ def workbench_counts() -> dict:
     counts["dispatch_ready_count"] = dispatch_view["dispatch_ready_count"]
     counts["dispatch_failed_count"] = dispatch_view["dispatch_failed_count"]
     counts["dispatch_stale_count"] = dispatch_view["dispatch_stale_count"]
+    exec_view = exec_counts()
+    counts["execution_count"] = exec_view["execution_count"]
+    counts["execution_returned"] = exec_view["execution_returned_count"]
+    counts["execution_prepared_count"] = exec_view["execution_prepared_count"]
+    counts["execution_opened_count"] = exec_view["execution_opened_count"]
+    counts["execution_copied_count"] = exec_view["execution_copied_count"]
+    counts["execution_failed_count"] = exec_view["execution_failed_count"]
+    counts["execution_stale_count"] = exec_view["execution_stale_count"]
+    counts["latest_exec_id"] = exec_view["latest_exec_id"]
+    collect_view = collection_counts()
+    counts["collection_count"] = collect_view["collection_count"]
+    counts["latest_collection_id"] = collect_view["latest_collection_id"]
+    counts["smoke_collection_count"] = collect_view["smoke_collection_count"]
+    counts["failed_collection_count"] = collect_view["failed_collection_count"]
     return counts
 
 
@@ -2115,8 +2224,15 @@ def build_task_next_advice(task_id: str, status: str, latest_dispatch: dict | No
         return f"create manual dispatch: /dispatch create {task_id} codex --with-context"
     dispatch_id = dispatch.get("dispatch_id", "")
     dispatch_status_value = dispatch.get("status", "unknown")
+    latest_exec = latest_exec_for_dispatch(dispatch_id) if dispatch_id else None
+    if latest_exec and latest_exec.get("status") == "prepared":
+        return f"show semi-auto payload: /exec package {latest_exec.get('exec_id')}; then manually copy it"
+    if latest_exec and latest_exec.get("status") in {"opened", "copied"}:
+        return f"wait for executor return; when ready use /exec receive {latest_exec.get('exec_id')}"
+    if latest_exec and latest_exec.get("status") == "returned" and dispatch_status_value in {"returned", "sent", "ready"}:
+        return f"run /dispatch qa {dispatch_id}, then /task review {task_id}"
     if dispatch_status_value == "ready":
-        return f"package and manually copy: /dispatch package {dispatch_id}; then /dispatch mark {dispatch_id} sent <note>"
+        return f"prepare semi-auto execution session: /exec prepare {dispatch_id}"
     if dispatch_status_value == "sent":
         return f"wait for manual return; when available use /dispatch receive {dispatch_id}"
     if dispatch_status_value == "returned":
@@ -2180,6 +2296,9 @@ def build_task_show_reply(task_id: str) -> str:
     dispatch_id = latest_dispatch.get("dispatch_id") if latest_dispatch else "none"
     dispatch_status = latest_dispatch.get("status") if latest_dispatch else "none"
     target_executor = latest_dispatch.get("target_executor") if latest_dispatch else "none"
+    latest_exec = latest_exec_for_dispatch(dispatch_id) if latest_dispatch else None
+    exec_id = latest_exec.get("exec_id") if latest_exec else "none"
+    exec_status = latest_exec.get("status") if latest_exec else "none"
     project_line = f"- project: {project_id}\n- project：{project_id}\n" if project_id else ""
     legacy_next = "等待 Codex/Kiro 回传报告" if status == "open" else next_step
     return f"""任务摘要 / Task summary: {normalized_task_id}
@@ -2190,6 +2309,8 @@ def build_task_show_reply(task_id: str) -> str:
 - latest_dispatch_id: {dispatch_id}
 - dispatch_status: {dispatch_status}
 - target_executor: {target_executor}
+- latest_exec_id: {exec_id}
+- exec_status: {exec_status}
 - goal: {goal}
 - atlas_review: {review or 'not reviewed'}
 - user_decision: {decision or 'not decided'}
@@ -2541,6 +2662,10 @@ def build_task_qa_reply(task_id: str) -> str:
         for record in analysis["observed"]
     ] or ["- 无。"]
     chain_missing_lines = [f"- {item}" for item in analysis["missing"]] or ["- 无。"]
+    collection_items = collections_for_task(normalized_task_id)
+    latest_collection_id = collection_items[0]["collection_id"] if collection_items else "none"
+    collection_smoke_count = sum(1 for item in collection_items if item.get("kind") == "smoke")
+    collection_failed_count = sum(1 for item in collection_items if item.get("smoke_failed"))
     return f"""回传质检：{task_id}
 
 质检结论：{conclusion}
@@ -2560,6 +2685,10 @@ sensitive_risk_reason: {intake.get('sensitive_risk_reason', 'none')}
 read_only_mode: {str(bool(intake.get('read_only_mode'))).lower()}
 no_modification_ok: {str(bool(intake.get('no_modification_ok'))).lower()}
 evidence_type: {intake.get('evidence_type', 'report')}
+collection_count: {len(collection_items)}
+latest_collection_id: {latest_collection_id}
+smoke_collection_count: {collection_smoke_count}
+failed_collection_count: {collection_failed_count}
 
 intake_observed_items:
 {chr(10).join('- ' + item.get('name', 'unknown') + ': ' + item.get('value', '') for item in intake.get('observed_items', [])[:8]) if intake.get('observed_items') else '- none'}
@@ -2615,12 +2744,15 @@ def build_task_next_reply(task_id: str) -> str:
     text = read_task(normalized_task_id)
     status = task_metadata(text).get("status", "unknown")
     latest_dispatch = latest_dispatch_for_task(normalized_task_id)
-    dispatch_line = "- latest_dispatch_id: none\n- dispatch_status: none\n- target_executor: none"
+    dispatch_line = "- latest_dispatch_id: none\n- dispatch_status: none\n- target_executor: none\n- latest_exec_id: none\n- exec_status: none"
     if latest_dispatch:
+        latest_exec = latest_exec_for_dispatch(latest_dispatch.get("dispatch_id", ""))
         dispatch_line = (
             f"- latest_dispatch_id: {latest_dispatch.get('dispatch_id')}\n"
             f"- dispatch_status: {latest_dispatch.get('status')}\n"
-            f"- target_executor: {latest_dispatch.get('target_executor')}"
+            f"- target_executor: {latest_dispatch.get('target_executor')}\n"
+            f"- latest_exec_id: {(latest_exec or {}).get('exec_id', 'none')}\n"
+            f"- exec_status: {(latest_exec or {}).get('status', 'none')}"
         )
     advice = build_task_next_advice(normalized_task_id, status, latest_dispatch)
     legacy_map = {
@@ -5762,6 +5894,12 @@ def build_dispatch_show_reply(dispatch_id: str) -> str:
         "created_at": meta.get("created_at", ""),
     }
     stale = dispatch_is_stale_record(record)
+    latest_exec = latest_exec_for_dispatch(normalized_dispatch_id)
+    exec_id = latest_exec.get("exec_id") if latest_exec else "none"
+    exec_status = latest_exec.get("status") if latest_exec else "none"
+    exec_opened_at = latest_exec.get("opened_at") if latest_exec else "none"
+    exec_copied_at = latest_exec.get("copied_at") if latest_exec else "none"
+    exec_returned_at = latest_exec.get("returned_at") if latest_exec else "none"
     return f"""Dispatch summary: {normalized_dispatch_id}
 - status: {meta.get('status', 'unknown')}
 - task_id: {task_id or 'none'}
@@ -5769,6 +5907,11 @@ def build_dispatch_show_reply(dispatch_id: str) -> str:
 - project_id: {meta.get('project_id') or 'unassigned'}
 - target_executor: {meta.get('target_executor') or 'unknown'}
 - context_id: {meta.get('context_id') or 'none'}
+- latest_exec_id: {exec_id}
+- exec_status: {exec_status}
+- exec_opened_at: {exec_opened_at or 'none'}
+- exec_copied_at: {exec_copied_at or 'none'}
+- exec_returned_at: {exec_returned_at or 'none'}
 - updated_at: {meta.get('updated_at', '')}
 - stale: {str(stale).lower()}
 - return_report: {safe_preview(task_section(text, 'Return Report'), 240)}
@@ -5786,6 +5929,10 @@ def build_dispatch_package_reply(dispatch_id: str) -> str:
         return "Dispatch target is invalid. Expected codex or kiro."
     task_text = read_task(task_id)
     display_target = "Codex" if target == "codex" else "Kiro"
+    latest_exec = latest_exec_for_dispatch(normalized_dispatch_id)
+    latest_exec_id = latest_exec.get("exec_id") if latest_exec else "none"
+    exec_status = latest_exec.get("status") if latest_exec else "none"
+    exec_next = exec_next_action(latest_exec) if latest_exec else f"prepare semi-auto session: /exec prepare {normalized_dispatch_id}"
     return sanitize_sensitive_text(f"""# Manual Dispatch Package for {display_target}
 
 dispatch_id: {normalized_dispatch_id}
@@ -5796,6 +5943,13 @@ external_execution_enabled: false
 runtime_injection_enabled: false
 
 This package is for manual copy only. Atlas/Bridge has not sent it and will not call {display_target}.
+
+## Execution Session
+- latest_exec_id: {latest_exec_id}
+- exec_status: {exec_status}
+- next_action: {exec_next}
+- human_confirm_required: true
+- auto_execute_enabled: false
 
 ## Task Title
 {task_title_from_text(task_id, task_text)}
@@ -6085,7 +6239,7 @@ def build_dispatch_dashboard_reply() -> str:
     lines.append("")
     lines.append("Suggested next actions:")
     if ready:
-        lines.append(f"- Package and manually copy: /dispatch package {ready[0]['dispatch_id']}")
+        lines.append(f"- Prepare semi-auto execution session: /exec prepare {ready[0]['dispatch_id']}")
     if sent:
         lines.append(f"- If report is back, record it: /dispatch receive {sent[0]['dispatch_id']}")
     if returned:
@@ -6157,6 +6311,554 @@ def handle_dispatch_command(user_text: str) -> str | None:
         return f"dispatch operation refused: {safe_preview(str(exc), 220)}"
     except Exception as exc:
         return f"dispatch operation failed: {safe_preview(str(exc), 180)}"
+
+
+def generate_exec_id() -> str:
+    ensure_workbench_dirs()
+    base = datetime.now().strftime("EXEC-%Y%m%d-%H%M%S")
+    if not exec_path(base).exists():
+        return base
+    for index in range(1, 100):
+        candidate = f"{base}-{index:02d}"
+        if not exec_path(candidate).exists():
+            return candidate
+    raise RuntimeError("could not generate unique exec_id")
+
+
+def read_exec(exec_id: str) -> str:
+    path = exec_path(exec_id)
+    if not path.exists():
+        raise FileNotFoundError(f"execution session not found: {exec_id}")
+    return path.read_text(encoding="utf-8")
+
+
+def write_exec(exec_id: str, text: str) -> None:
+    exec_path(exec_id).write_text(sanitize_sensitive_text(text), encoding="utf-8")
+
+
+def exec_title_from_text(exec_id: str, text: str) -> str:
+    first_line = text.splitlines()[0] if text.splitlines() else ""
+    prefix = f"# {exec_id} "
+    if first_line.startswith(prefix):
+        return first_line[len(prefix):].strip()
+    return "untitled execution"
+
+
+def exec_is_stale_record(record: dict, now: datetime | None = None) -> bool:
+    if record.get("status") not in {"prepared", "opened", "copied"}:
+        return False
+    timestamp = record.get("updated_at") or record.get("created_at")
+    if not timestamp:
+        return False
+    try:
+        baseline = datetime.fromisoformat(timestamp)
+    except ValueError:
+        return False
+    current = now or datetime.now().astimezone()
+    if baseline.tzinfo is None:
+        baseline = baseline.astimezone()
+    return current - baseline > timedelta(hours=24)
+
+
+def exec_records() -> list[dict]:
+    ensure_workbench_dirs()
+    records = []
+    for path in sorted(EXECUTIONS_DIR.glob("EXEC-*.md")):
+        exec_id = path.stem
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        meta = task_metadata(text)
+        record = {
+            "exec_id": exec_id,
+            "title": exec_title_from_text(exec_id, text),
+            "status": meta.get("status", "unknown"),
+            "created_at": meta.get("created_at", ""),
+            "updated_at": meta.get("updated_at", ""),
+            "opened_at": meta.get("opened_at", ""),
+            "copied_at": meta.get("copied_at", ""),
+            "returned_at": meta.get("returned_at", ""),
+            "dispatch_id": meta.get("dispatch_id", ""),
+            "task_id": meta.get("task_id", ""),
+            "project_id": meta.get("project_id", ""),
+            "target_executor": meta.get("target_executor", ""),
+            "path": path,
+            "text": text,
+        }
+        record["stale"] = exec_is_stale_record(record)
+        records.append(record)
+    return sorted(records, key=lambda item: item.get("updated_at", ""), reverse=True)
+
+
+def latest_exec_for_dispatch(dispatch_id: str) -> dict | None:
+    normalized_dispatch_id = normalize_dispatch_id(dispatch_id)
+    matches = [record for record in exec_records() if record.get("dispatch_id") == normalized_dispatch_id]
+    status_rank = {
+        "returned": 80,
+        "copied": 70,
+        "opened": 65,
+        "prepared": 60,
+        "failed": 20,
+        "cancelled": 10,
+    }
+    matches = sorted(
+        matches,
+        key=lambda item: (item.get("updated_at", ""), status_rank.get(item.get("status", ""), 0)),
+        reverse=True,
+    )
+    return matches[0] if matches else None
+
+
+def latest_exec_for_task(task_id: str) -> dict | None:
+    normalized_task_id = normalize_task_id(task_id)
+    matches = [record for record in exec_records() if record.get("task_id") == normalized_task_id]
+    return matches[0] if matches else None
+
+
+def execs_for_project(project_id: str) -> list[dict]:
+    clean_project_id = validate_project_id(project_id)
+    return [record for record in exec_records() if record.get("project_id") == clean_project_id]
+
+
+def exec_counts(records: list[dict] | None = None) -> dict:
+    items = records if records is not None else exec_records()
+    return {
+        "execution_count": len(items),
+        "execution_prepared_count": sum(1 for item in items if item.get("status") == "prepared"),
+        "execution_opened_count": sum(1 for item in items if item.get("status") == "opened"),
+        "execution_copied_count": sum(1 for item in items if item.get("status") == "copied"),
+        "execution_returned_count": sum(1 for item in items if item.get("status") == "returned"),
+        "execution_failed_count": sum(1 for item in items if item.get("status") == "failed"),
+        "execution_cancelled_count": sum(1 for item in items if item.get("status") == "cancelled"),
+        "execution_stale_count": sum(1 for item in items if item.get("stale")),
+        "latest_exec_id": items[0]["exec_id"] if items else "",
+    }
+
+
+def build_exec_payload(exec_id: str, dispatch_id: str) -> str:
+    normalized_exec_id = normalize_exec_id(exec_id)
+    normalized_dispatch_id = normalize_dispatch_id(dispatch_id)
+    package = build_dispatch_package_reply(normalized_dispatch_id)
+    text = read_dispatch(normalized_dispatch_id)
+    meta = task_metadata(text)
+    target = meta.get("target_executor", "unknown")
+    display_target = "Codex" if target == "codex" else "Kiro" if target == "kiro" else target
+    return sanitize_sensitive_text(f"""# Semi-Auto Execution Package for {display_target}
+
+exec_id: {normalized_exec_id}
+dispatch_id: {normalized_dispatch_id}
+task_id: {meta.get('task_id', '')}
+target_executor: {target}
+human_confirm_required: true
+external_execution_enabled: false
+runtime_injection_enabled: false
+auto_execute_enabled: false
+
+This package is for manual copy only. Atlas/Bridge has not sent it, has not called {display_target}, and will not run the task.
+
+## Manual Confirmation Required
+- Copy this payload into {display_target} manually.
+- Confirm any action inside {display_target} manually.
+- Paste the return report back with /exec receive {normalized_exec_id}.
+
+## Dispatch Package
+{package}
+""")
+
+
+def build_exec_markdown(exec_id: str, dispatch_id: str) -> str:
+    normalized_exec_id = normalize_exec_id(exec_id)
+    normalized_dispatch_id = normalize_dispatch_id(dispatch_id)
+    dispatch_text = read_dispatch(normalized_dispatch_id)
+    meta = task_metadata(dispatch_text)
+    task_id = normalize_task_id(meta.get("task_id", ""))
+    target = meta.get("target_executor", "").strip().lower()
+    if target not in {"codex", "kiro"}:
+        raise ValueError("dispatch target_executor must be codex or kiro")
+    title = dispatch_title_from_text(normalized_dispatch_id, dispatch_text)
+    now = iso_now()
+    payload = build_exec_payload(normalized_exec_id, normalized_dispatch_id)
+    return sanitize_sensitive_text(f"""# {normalized_exec_id} {sanitize_title(title)}
+
+exec_id: {normalized_exec_id}
+dispatch_id: {normalized_dispatch_id}
+task_id: {task_id}
+project_id: {meta.get('project_id', '')}
+target_executor: {target}
+status: prepared
+created_at: {now}
+updated_at: {now}
+opened_at:
+copied_at:
+returned_at:
+mode: semi_auto
+human_confirm_required: true
+external_execution_enabled: false
+runtime_injection_enabled: false
+auto_execute_enabled: false
+manual_copy_required: true
+
+## Dispatch Summary
+- dispatch_id: {normalized_dispatch_id}
+- dispatch_status: {meta.get('status', 'unknown')}
+- task_id: {task_id}
+- project_id: {meta.get('project_id', '') or 'unassigned'}
+- target_executor: {target}
+- context_id: {meta.get('context_id', '') or 'none'}
+
+## Executor Target
+- target_executor: {target}
+- semi_auto_only: true
+- user_confirms_in_executor: true
+
+## Prepared Command Or Instructions
+- No command is executed by Atlas/Bridge.
+- Use /exec package {normalized_exec_id} to show the copy payload.
+- Manually copy the payload into {target}.
+- After the executor returns a report, paste it with /exec receive {normalized_exec_id}.
+
+## Manual Confirmation Required
+- human_confirm_required: true
+- The user must open or select the executor.
+- The user must paste the payload.
+- The user must confirm any executor-side action.
+
+## Copy Payload
+{payload}
+
+## Open Record
+- not opened.
+
+## Return Record
+- not returned.
+
+## Safety Boundary
+- This execution session writes only workbench/executions and syncs return reports through existing dispatch/task ledgers.
+- It does not read .env.
+- It does not print tokens, cookies, Authorization headers, passwords, api keys, or secrets.
+- It does not modify user project files.
+- It does not change Octo Docker, Hermes, Memory, SkillRepo, or runtime prompts.
+
+## Do Not Auto-Execute
+- This session does not call Codex/Kiro.
+- This session does not run the dispatch package.
+- This session does not inject prompts into any runtime.
+- Actual execution happens only after the user manually confirms inside the chosen executor.
+
+## Status Timeline
+- {now} execution session prepared; no external call made.
+""")
+
+
+def create_exec_session(dispatch_id: str) -> tuple[str, str]:
+    normalized_dispatch_id = normalize_dispatch_id(dispatch_id)
+    dispatch_text = read_dispatch(normalized_dispatch_id)
+    dispatch_status_value = task_metadata(dispatch_text).get("status", "unknown")
+    if dispatch_status_value not in {"ready", "sent"}:
+        raise ValueError("dispatch status must be ready or sent")
+    exec_id = generate_exec_id()
+    markdown = build_exec_markdown(exec_id, normalized_dispatch_id)
+    write_exec(exec_id, markdown)
+    log_event("exec_prepared", exec_id=exec_id, dispatch_id=normalized_dispatch_id)
+    return exec_id, markdown
+
+
+def update_exec_status(exec_id: str, status: str, timeline: str, extra_fields: dict[str, str] | None = None) -> str:
+    if status not in EXEC_STATUSES:
+        raise ValueError("invalid execution status")
+    normalized_exec_id = normalize_exec_id(exec_id)
+    text = read_exec(normalized_exec_id)
+    now = iso_now()
+    text = replace_task_field(text, "status", status)
+    text = replace_task_field(text, "updated_at", now)
+    if extra_fields:
+        for key, value in extra_fields.items():
+            text = replace_task_field(text, key, value)
+    text = append_to_section(text, "Status Timeline", f"- {now} {timeline}")
+    write_exec(normalized_exec_id, text)
+    return text
+
+
+def exec_next_action(record: dict | None) -> str:
+    if not record:
+        return "prepare execution session: /exec prepare <dispatch_id>"
+    exec_id = record.get("exec_id", "")
+    status = record.get("status", "unknown")
+    if status == "prepared":
+        return f"show payload: /exec package {exec_id}; then manually copy it"
+    if status in {"opened", "copied"}:
+        return f"wait for executor return; when ready use /exec receive {exec_id}"
+    if status == "returned":
+        dispatch_id = record.get("dispatch_id", "")
+        return f"run /dispatch qa {dispatch_id}, then /task review {record.get('task_id', '')}"
+    if status in {"failed", "cancelled"}:
+        return f"inspect {exec_id}; prepare a new session if the dispatch still needs execution"
+    return "inspect /exec show and /dispatch show first"
+
+
+def build_exec_help_reply() -> str:
+    return """Atlas semi-auto execution commands
+- /exec help
+- /exec prepare <dispatch_id>
+- /exec package <exec_id>
+- /exec mark <exec_id> copied <note>
+- /exec mark <exec_id> opened <note>
+- /exec receive <exec_id>
+  <pasted Codex/Kiro return report>
+- /exec cancel <exec_id> <note>
+- /exec fail <exec_id> <note>
+- /exec show <exec_id>
+- /exec list
+- /exec dashboard
+- /exec stale
+
+Boundary:
+- semi-auto only
+- human_confirm_required: true
+- external_execution_enabled: false
+- auto_execute_enabled: false
+- does not automatically call Codex/Kiro
+- does not run user tasks or package content
+- does not read .env or print tokens/cookies/secrets
+- writes only workbench execution/dispatch/task records"""
+
+
+def build_exec_prepare_reply(dispatch_id: str) -> str:
+    parts = str(dispatch_id or "").strip().split()
+    if len(parts) != 1:
+        return "Usage: /exec prepare <dispatch_id>"
+    exec_id, text = create_exec_session(parts[0])
+    meta = task_metadata(text)
+    return f"""Execution session prepared: {exec_id}
+- status: prepared
+- dispatch_id: {normalize_dispatch_id(parts[0])}
+- task_id: {meta.get('task_id', '')}
+- target_executor: {meta.get('target_executor', '')}
+- human_confirm_required: true
+- external_execution_enabled: false
+- auto_execute_enabled: false
+- path: workbench/executions/{exec_id}.md
+- next: /exec package {exec_id}"""
+
+
+def build_exec_package_reply(exec_id: str) -> str:
+    normalized_exec_id = normalize_exec_id(exec_id)
+    text = read_exec(normalized_exec_id)
+    meta = task_metadata(text)
+    return build_exec_payload(normalized_exec_id, meta.get("dispatch_id", ""))
+
+
+def build_exec_mark_reply(tail: str) -> str:
+    parts = str(tail or "").strip().split(maxsplit=2)
+    if len(parts) < 2 or parts[1].lower() not in {"copied", "opened"}:
+        return "Usage: /exec mark <exec_id> copied|opened <note>"
+    exec_id = normalize_exec_id(parts[0])
+    action = parts[1].lower()
+    note = sanitize_sensitive_text(parts[2] if len(parts) > 2 else "").strip() or f"manual {action} recorded"
+    now = iso_now()
+    section = "Copy Payload" if action == "copied" else "Open Record"
+    section_body = f"- {action}_at: {now}\n- note: {note}\n- manual_only: true\n- human_confirm_required: true"
+    text = update_exec_status(exec_id, action, f"marked {action}: {note}", {f"{action}_at": now})
+    text = append_to_section(text, section, f"### {action} at {now}\n{section_body}")
+    write_exec(exec_id, text)
+    meta = task_metadata(text)
+    dispatch_id = meta.get("dispatch_id", "")
+    if action == "copied" and dispatch_id:
+        try:
+            dispatch_text = read_dispatch(dispatch_id)
+            if task_metadata(dispatch_text).get("status") == "ready":
+                update_dispatch_status(dispatch_id, "sent", f"execution session {exec_id} copied: {note}", {"sent_at": now})
+        except Exception:
+            pass
+    log_event(f"exec_{action}", exec_id=exec_id)
+    return f"""Execution session marked {action}: {exec_id}
+- status: {action}
+- {action}_at: {now}
+- note: {note}
+- human_confirm_required: true
+- next: {exec_next_action(task_metadata_record(exec_id))}"""
+
+
+def task_metadata_record(exec_id: str) -> dict:
+    text = read_exec(exec_id)
+    meta = task_metadata(text)
+    meta["exec_id"] = normalize_exec_id(exec_id)
+    return meta
+
+
+def build_exec_receive_reply(exec_id: str, report: str) -> str:
+    normalized_exec_id = normalize_exec_id(exec_id)
+    text = read_exec(normalized_exec_id)
+    meta = task_metadata(text)
+    dispatch_id = normalize_dispatch_id(meta.get("dispatch_id", ""))
+    clean_report = sanitize_sensitive_text(report).strip() or "- empty return report; needs evidence."
+    dispatch_reply = build_dispatch_receive_reply(dispatch_id, clean_report)
+    now = iso_now()
+    text = read_exec(normalized_exec_id)
+    text = replace_task_field(text, "status", "returned")
+    text = replace_task_field(text, "updated_at", now)
+    text = replace_task_field(text, "returned_at", now)
+    text = append_to_section(text, "Return Record", f"### Return at {now}\n{clean_report}\n\nDispatch sync:\n{safe_preview(dispatch_reply, 500)}")
+    text = append_to_section(text, "Status Timeline", f"- {now} return report received; synced through dispatch {dispatch_id}.")
+    write_exec(normalized_exec_id, text)
+    log_event("exec_returned", exec_id=normalized_exec_id, dispatch_id=dispatch_id)
+    return f"""Execution return recorded: {normalized_exec_id}
+- status: returned
+- dispatch_id: {dispatch_id}
+- synced_dispatch_receive: true
+- human_confirm_required: true
+- external_execution_enabled: false
+- next: /dispatch qa {dispatch_id}
+
+Dispatch sync:
+{safe_preview(dispatch_reply, 520)}"""
+
+
+def build_exec_terminal_reply(tail: str, status: str) -> str:
+    parts = str(tail or "").strip().split(maxsplit=1)
+    if not parts:
+        return f"Usage: /exec {status} <exec_id> <note>"
+    exec_id = normalize_exec_id(parts[0])
+    note = sanitize_sensitive_text(parts[1] if len(parts) > 1 else "").strip() or f"manual {status}"
+    update_exec_status(exec_id, status, f"marked {status}: {note}")
+    log_event(f"exec_{status}", exec_id=exec_id)
+    return f"""Execution session marked {status}: {exec_id}
+- status: {status}
+- note: {note}
+- manual ledger only: true
+- auto_execute_enabled: false"""
+
+
+def build_exec_show_reply(exec_id: str) -> str:
+    normalized_exec_id = normalize_exec_id(exec_id)
+    text = read_exec(normalized_exec_id)
+    meta = task_metadata(text)
+    record = dict(meta)
+    record["exec_id"] = normalized_exec_id
+    record["stale"] = exec_is_stale_record(record)
+    return f"""Execution session summary: {normalized_exec_id}
+- status: {meta.get('status', 'unknown')}
+- dispatch_id: {meta.get('dispatch_id', '')}
+- task_id: {meta.get('task_id', '')}
+- project_id: {meta.get('project_id', '') or 'unassigned'}
+- target_executor: {meta.get('target_executor', '')}
+- created_at: {meta.get('created_at', '')}
+- updated_at: {meta.get('updated_at', '')}
+- opened_at: {meta.get('opened_at', '') or 'none'}
+- copied_at: {meta.get('copied_at', '') or 'none'}
+- returned_at: {meta.get('returned_at', '') or 'none'}
+- stale: {str(bool(record.get('stale'))).lower()}
+- human_confirm_required: {meta.get('human_confirm_required', 'true')}
+- external_execution_enabled: {meta.get('external_execution_enabled', 'false')}
+- auto_execute_enabled: {meta.get('auto_execute_enabled', 'false')}
+- return_record: {safe_preview(task_section(text, 'Return Record'), 240)}
+- next: {exec_next_action(record)}"""
+
+
+def build_exec_list_reply() -> str:
+    records = exec_records()[:10]
+    if not records:
+        return "Execution sessions:\n- none."
+    lines = ["Execution sessions:"]
+    for record in records:
+        stale = " stale" if record.get("stale") else ""
+        lines.append(
+            f"- {record['exec_id']} | {record.get('status')}{stale} | dispatch={record.get('dispatch_id')} | task={record.get('task_id')} | target={record.get('target_executor')} | updated={record.get('updated_at')} | {record.get('title')}"
+        )
+    return "\n".join(lines)
+
+
+def build_exec_dashboard_reply() -> str:
+    records = exec_records()
+    counts = exec_counts(records)
+    by_executor: dict[str, int] = {}
+    by_project: dict[str, int] = {}
+    for record in records:
+        by_executor[record.get("target_executor") or "unknown"] = by_executor.get(record.get("target_executor") or "unknown", 0) + 1
+        by_project[record.get("project_id") or "unassigned"] = by_project.get(record.get("project_id") or "unassigned", 0) + 1
+    lines = [
+        "Atlas Execution Dashboard",
+        f"- execution_count: {counts['execution_count']}",
+        f"- prepared_count: {counts['execution_prepared_count']}",
+        f"- opened_count: {counts['execution_opened_count']}",
+        f"- copied_count: {counts['execution_copied_count']}",
+        f"- returned_count: {counts['execution_returned_count']}",
+        f"- failed_count: {counts['execution_failed_count']}",
+        f"- stale_count: {counts['execution_stale_count']}",
+        "- human_confirm_required: true",
+        "- external_execution_enabled: false",
+        "- auto_execute_enabled: false",
+        "",
+        "by_executor:",
+    ]
+    lines.extend([f"- {name}: {count}" for name, count in sorted(by_executor.items())] or ["- none"])
+    lines.append("")
+    lines.append("by_project:")
+    lines.extend([f"- {name}: {count}" for name, count in sorted(by_project.items())] or ["- none"])
+    lines.append("")
+    lines.append("Recent pending:")
+    pending = [record for record in records if record.get("status") in {"prepared", "opened", "copied"}][:10]
+    lines.extend([f"- {record['exec_id']} | {record.get('status')} | next={exec_next_action(record)}" for record in pending] or ["- none"])
+    return "\n".join(lines)
+
+
+def build_exec_stale_reply() -> str:
+    stale = [record for record in exec_records() if record.get("stale")]
+    if not stale:
+        return "Stale execution sessions:\n- none. Rule: status=prepared/opened/copied and updated time older than 24 hours."
+    lines = ["Stale execution sessions (> 24h):"]
+    for record in stale[:20]:
+        lines.append(
+            f"- {record['exec_id']} | status={record.get('status')} | dispatch={record.get('dispatch_id')} | updated={record.get('updated_at')} | next=/exec receive {record['exec_id']} OR /exec fail {record['exec_id']} <note>"
+        )
+    return "\n".join(lines)
+
+
+def handle_exec_command(user_text: str) -> str | None:
+    lines = user_text.strip().splitlines()
+    first_line = lines[0] if lines else ""
+    parts = first_line.split(maxsplit=2)
+    if len(parts) < 2 or parts[0].lower() != "/exec":
+        return None
+    subcommand = parts[1].lower()
+    tail = parts[2] if len(parts) > 2 else ""
+    try:
+        if subcommand == "help":
+            return build_exec_help_reply()
+        if subcommand == "prepare":
+            return build_exec_prepare_reply(tail)
+        if subcommand == "package":
+            return build_exec_package_reply(tail)
+        if subcommand == "mark":
+            return build_exec_mark_reply(tail)
+        if subcommand == "receive":
+            receive_parts = tail.split(maxsplit=1)
+            if not receive_parts:
+                return "Usage: /exec receive <exec_id>\n<pasted return report>"
+            exec_id = receive_parts[0]
+            inline = receive_parts[1] if len(receive_parts) > 1 else ""
+            body = "\n".join(lines[1:]).strip()
+            return build_exec_receive_reply(exec_id, body or inline)
+        if subcommand == "cancel":
+            return build_exec_terminal_reply(tail, "cancelled")
+        if subcommand == "fail":
+            return build_exec_terminal_reply(tail, "failed")
+        if subcommand == "show":
+            return build_exec_show_reply(tail)
+        if subcommand == "list":
+            return build_exec_list_reply()
+        if subcommand == "dashboard":
+            return build_exec_dashboard_reply()
+        if subcommand == "stale":
+            return build_exec_stale_reply()
+        return build_exec_help_reply()
+    except FileNotFoundError as exc:
+        return f"exec source not found: {safe_preview(str(exc), 180)}"
+    except ValueError as exc:
+        return f"exec operation refused: {safe_preview(str(exc), 220)}"
+    except Exception as exc:
+        return f"exec operation failed: {safe_preview(str(exc), 180)}"
 
 
 def generate_pilot_id() -> str:
@@ -6396,6 +7098,28 @@ def pilot_metrics_data(pilot_id: str) -> dict:
         if item["meta"].get("status") in {"sent", "returned", "qa_ready", "reviewed", "needs_evidence", "closed"}
         or "manual_copy_only: true" in task_section(item["text"], "Sent Record")
     )
+    linked_collections = [
+        record for record in collection_records()
+        if record.get("task_id") in set(task_ids) or (project_id and record.get("project_id") == project_id)
+    ]
+    smoke_collection_count = sum(1 for record in linked_collections if record.get("kind") == "smoke")
+    failed_collection_count = sum(1 for record in linked_collections if record.get("smoke_failed"))
+    auto_evidence_count = len(linked_collections)
+    linked_executions = [
+        record for record in exec_records()
+        if record.get("dispatch_id") in set(dispatch_ids)
+        or record.get("task_id") in set(task_ids)
+        or (project_id and record.get("project_id") == project_id)
+    ]
+    copied_execution_count = sum(1 for record in linked_executions if record.get("status") in {"copied", "returned"})
+    returned_execution_count = sum(1 for record in linked_executions if record.get("status") == "returned")
+    stale_execution_count = sum(1 for record in linked_executions if record.get("stale"))
+    manual_evidence_count = 0
+    for task_id in task_ids:
+        try:
+            manual_evidence_count += sum(1 for record in evidence_records(task_id) if record.get("source") != "collector")
+        except Exception:
+            continue
     estimated_minutes = len(task_ids) * 15 + len(dispatch_ids) * 10 + context_pack_count * 5 + returned_count * 5
     friction = last_meaningful_line(task_section(text, "Friction Log")) or "none recorded"
     return {
@@ -6413,6 +7137,15 @@ def pilot_metrics_data(pilot_id: str) -> dict:
         "evidence_gap_count": evidence_gap_count,
         "context_pack_count": context_pack_count,
         "manual_copy_count": manual_copy_count,
+        "collection_count": len(linked_collections),
+        "smoke_collection_count": smoke_collection_count,
+        "failed_collection_count": failed_collection_count,
+        "auto_evidence_count": auto_evidence_count,
+        "manual_evidence_count": manual_evidence_count,
+        "execution_count": len(linked_executions),
+        "copied_count": copied_execution_count,
+        "returned_execution_count": returned_execution_count,
+        "stale_execution_count": stale_execution_count,
         "estimated_minutes": estimated_minutes,
         "estimated_time_saved": f"{estimated_minutes} min",
         "main_friction": safe_preview(friction, 220),
@@ -6429,6 +7162,15 @@ def build_pilot_metrics_body(data: dict) -> str:
 - evidence_gap_count: {data['evidence_gap_count']}
 - context_pack_count: {data['context_pack_count']}
 - manual_copy_count: {data['manual_copy_count']}
+- collection_count: {data.get('collection_count', 0)}
+- smoke_collection_count: {data.get('smoke_collection_count', 0)}
+- failed_collection_count: {data.get('failed_collection_count', 0)}
+- auto_evidence_count: {data.get('auto_evidence_count', 0)}
+- manual_evidence_count: {data.get('manual_evidence_count', 0)}
+- execution_count: {data.get('execution_count', 0)}
+- copied_count: {data.get('copied_count', 0)}
+- returned_execution_count: {data.get('returned_execution_count', 0)}
+- stale_execution_count: {data.get('stale_execution_count', 0)}
 - estimated_time_saved: {data['estimated_time_saved']}
 - main_friction: {data['main_friction']}"""
 
@@ -6705,6 +7447,781 @@ def handle_pilot_command(user_text: str) -> str | None:
         return f"pilot operation refused: {safe_preview(str(exc), 220)}"
     except Exception as exc:
         return f"pilot operation failed: {safe_preview(str(exc), 180)}"
+
+
+def generate_collection_id() -> str:
+    ensure_workbench_dirs()
+    base = datetime.now().strftime("COLLECT-%Y%m%d-%H%M%S")
+    if not collection_path(base).exists():
+        return base
+    for index in range(1, 100):
+        candidate = f"{base}-{index:02d}"
+        if not collection_path(candidate).exists():
+            return candidate
+    raise RuntimeError("could not generate unique collection_id")
+
+
+def read_collection(collection_id: str) -> str:
+    path = collection_path(collection_id)
+    if not path.exists():
+        raise FileNotFoundError(f"collection not found: {collection_id}")
+    return path.read_text(encoding="utf-8")
+
+
+def write_collection(collection_id: str, text: str) -> None:
+    path = collection_path(collection_id)
+    path.write_text(collect_clean_text(text), encoding="utf-8")
+
+
+def collection_title_from_text(collection_id: str, text: str) -> str:
+    first_line = text.splitlines()[0] if text.splitlines() else ""
+    prefix = f"# {collection_id} "
+    if first_line.startswith(prefix):
+        return first_line[len(prefix):].strip()
+    return "read-only evidence collection"
+
+
+def collection_records() -> list[dict]:
+    ensure_workbench_dirs()
+    records = []
+    for path in sorted(COLLECTIONS_DIR.glob("COLLECT-*.md")):
+        collection_id = path.stem
+        try:
+            text = path.read_text(encoding="utf-8")
+            normalize_collection_id(collection_id)
+        except (OSError, ValueError):
+            continue
+        meta = task_metadata(text)
+        records.append(
+            {
+                "collection_id": collection_id,
+                "title": collection_title_from_text(collection_id, text),
+                "created_at": meta.get("created_at", ""),
+                "task_id": meta.get("task_id", ""),
+                "project_id": meta.get("project_id", ""),
+                "profile": meta.get("profile", ""),
+                "kind": meta.get("kind", "snapshot"),
+                "status": meta.get("status", "observed"),
+                "smoke_failed": meta.get("smoke_failed", "false") == "true",
+                "path": path,
+                "text": text,
+            }
+        )
+    return sorted(records, key=lambda item: item.get("created_at", ""), reverse=True)
+
+
+def collections_for_task(task_id: str) -> list[dict]:
+    normalized_task_id = normalize_task_id(task_id)
+    return [record for record in collection_records() if record.get("task_id") == normalized_task_id]
+
+
+def collections_for_project(project_id: str) -> list[dict]:
+    clean_project_id = validate_project_id(project_id)
+    task_ids = {record["task_id"] for record in project_task_records(clean_project_id)}
+    return [
+        record for record in collection_records()
+        if record.get("project_id") == clean_project_id or record.get("task_id") in task_ids
+    ]
+
+
+def collection_counts() -> dict:
+    records = collection_records()
+    return {
+        "collection_count": len(records),
+        "latest_collection_id": records[0]["collection_id"] if records else "",
+        "smoke_collection_count": sum(1 for record in records if record.get("kind") == "smoke"),
+        "failed_collection_count": sum(1 for record in records if record.get("smoke_failed")),
+    }
+
+
+def collect_clean_text(text: str, limit: int | None = None) -> str:
+    cleaned = sanitize_sensitive_text(str(text or ""))
+    cleaned = re.sub(r"(?i)(^|[\\/\s])\.env(?:\.[A-Za-z0-9_-]+)?", r"\1[REDACTED_ENV_FILE]", cleaned)
+    cleaned = cleaned.replace("\x00", "")
+    if limit is not None and len(cleaned) > limit:
+        cleaned = cleaned[: max(0, limit - 60)] + "\n...[truncated by read-only collector]..."
+    return cleaned
+
+
+def collect_profile(profile_name: str) -> dict:
+    profile = str(profile_name or "").strip().lower()
+    if profile not in COLLECT_PROFILES:
+        raise ValueError("unknown collect profile; use /collect profiles")
+    data = dict(COLLECT_PROFILES[profile])
+    data["name"] = profile
+    data["root"] = Path(data["root"])
+    return data
+
+
+def collect_command_result(label: str, args: list[str], cwd: Path, timeout: int = COLLECT_COMMAND_TIMEOUT) -> dict:
+    started = iso_now()
+    try:
+        completed = subprocess.run(
+            args,
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            shell=False,
+        )
+        return {
+            "label": label,
+            "command": " ".join(args),
+            "returncode": completed.returncode,
+            "stdout": collect_clean_text(completed.stdout, COLLECT_OUTPUT_LIMIT),
+            "stderr": collect_clean_text(completed.stderr, COLLECT_OUTPUT_LIMIT),
+            "started_at": started,
+            "timed_out": False,
+        }
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "label": label,
+            "command": " ".join(args),
+            "returncode": "timeout",
+            "stdout": collect_clean_text(exc.stdout or "", COLLECT_OUTPUT_LIMIT),
+            "stderr": collect_clean_text(exc.stderr or "", COLLECT_OUTPUT_LIMIT),
+            "started_at": started,
+            "timed_out": True,
+        }
+    except Exception as exc:
+        return {
+            "label": label,
+            "command": " ".join(args),
+            "returncode": "error",
+            "stdout": "",
+            "stderr": collect_clean_text(f"{type(exc).__name__}: {exc}", 1000),
+            "started_at": started,
+            "timed_out": False,
+        }
+
+
+def collect_git_evidence(root: Path) -> list[dict]:
+    if not root.exists():
+        return [{
+            "label": "profile_root",
+            "command": "root_exists",
+            "returncode": "missing",
+            "stdout": "",
+            "stderr": f"profile root not found: {collect_clean_text(str(root), 400)}",
+            "started_at": iso_now(),
+            "timed_out": False,
+        }]
+    commands = [
+        ("git_branch", ["git", "branch", "--show-current"]),
+        ("git_head", ["git", "rev-parse", "HEAD"]),
+        ("git_status_short", ["git", "status", "--short"]),
+        ("git_log_last", ["git", "log", "-1", "--oneline"]),
+        ("git_diff_check", ["git", "diff", "--check"]),
+    ]
+    return [collect_command_result(label, args, root) for label, args in commands]
+
+
+def collect_file_tail(path: Path, root: Path, max_lines: int = COLLECT_TAIL_LINES) -> dict:
+    clean_path = Path(path)
+    if ".env" in clean_path.name.lower():
+        return {"path": "[REDACTED_ENV_FILE]", "exists": False, "summary": "refused to read env-like file"}
+    try:
+        resolved = clean_path.resolve()
+        root_resolved = root.resolve()
+        if resolved != root_resolved and root_resolved not in resolved.parents:
+            return {"path": collect_clean_text(str(clean_path), 400), "exists": False, "summary": "refused: outside profile root"}
+        if not resolved.exists():
+            return {"path": collect_clean_text(str(clean_path), 400), "exists": False, "summary": "not found"}
+        lines = resolved.read_text(encoding="utf-8", errors="replace").splitlines()
+        tail = "\n".join(lines[-max_lines:])
+        return {
+            "path": collect_clean_text(str(clean_path), 400),
+            "exists": True,
+            "line_count": len(lines),
+            "tail": collect_clean_text(tail, COLLECT_OUTPUT_LIMIT),
+        }
+    except Exception as exc:
+        return {"path": collect_clean_text(str(clean_path), 400), "exists": False, "summary": collect_clean_text(f"{type(exc).__name__}: {exc}", 1000)}
+
+
+def collect_runtime_evidence(paths: list[Path], root: Path) -> list[dict]:
+    return [collect_file_tail(path, root, 80) for path in paths]
+
+
+def collect_workbench_evidence() -> dict:
+    counts = workbench_counts()
+    collect_view = collection_counts()
+    recent_tasks = task_records()[:5]
+    recent_dispatches = dispatch_records()[:5]
+    recent_pilots = pilot_records()[:5]
+    return {
+        "counts": {**counts, **collect_view},
+        "recent_tasks": recent_tasks,
+        "recent_dispatches": recent_dispatches,
+        "recent_pilots": recent_pilots,
+    }
+
+
+def collect_process_port_evidence(profile_name: str) -> list[dict]:
+    if profile_name != "kiro-gateway":
+        return []
+    commands = [
+        (
+            "port_8080_listeners",
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-NetTCPConnection -LocalPort 8080 -State Listen -ErrorAction SilentlyContinue | Select-Object LocalAddress,LocalPort,State,OwningProcess | Format-Table -AutoSize | Out-String",
+            ],
+        ),
+        (
+            "python_process_summary",
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process | Where-Object { $_.Name -like '*python*' -or $_.CommandLine -like '*uvicorn*' } | Select-Object ProcessId,Name,CommandLine | Format-List | Out-String",
+            ],
+        ),
+    ]
+    return [collect_command_result(label, args, Path.cwd(), timeout=10) for label, args in commands]
+
+
+def collect_smoke_evidence(root: Path) -> list[dict]:
+    results = []
+    for script_name in OCTO_BRIDGE_SMOKE_ALLOWLIST:
+        script_path = root / script_name
+        if not script_path.exists():
+            results.append(
+                {
+                    "label": script_name,
+                    "command": f"{sys.executable} {script_name}",
+                    "returncode": "missing",
+                    "stdout": "",
+                    "stderr": "smoke script not found",
+                    "started_at": iso_now(),
+                    "timed_out": False,
+                }
+            )
+            continue
+        results.append(
+            collect_command_result(
+                script_name,
+                [sys.executable, script_name],
+                root,
+                timeout=COLLECT_SMOKE_TIMEOUT,
+            )
+        )
+    return results
+
+
+def collect_section_from_commands(results: list[dict]) -> str:
+    if not results:
+        return "- none"
+    lines = []
+    for item in results:
+        lines.append(f"- label: {item.get('label')}")
+        lines.append(f"  command: {item.get('command')}")
+        lines.append(f"  returncode: {item.get('returncode')}")
+        lines.append(f"  timed_out: {str(bool(item.get('timed_out'))).lower()}")
+        stdout = item.get("stdout") or ""
+        stderr = item.get("stderr") or ""
+        if stdout:
+            lines.append("  stdout:")
+            lines.extend(f"    {line}" for line in stdout.splitlines()[:80])
+        if stderr:
+            lines.append("  stderr:")
+            lines.extend(f"    {line}" for line in stderr.splitlines()[:80])
+    return "\n".join(lines)
+
+
+def git_status_changed_files(git_results: list[dict]) -> list[str]:
+    status_text = ""
+    for item in git_results:
+        if item.get("label") == "git_status_short":
+            status_text = item.get("stdout", "")
+            break
+    files = []
+    for line in status_text.splitlines():
+        value = line.strip()
+        if not value:
+            continue
+        path_part = value[3:].strip() if len(value) > 3 else value
+        if " -> " in path_part:
+            path_part = path_part.split(" -> ", 1)[1].strip()
+        files.append(collect_clean_text(path_part, 300))
+    return files[:50]
+
+
+def git_status_is_clean(git_results: list[dict]) -> bool:
+    for item in git_results:
+        if item.get("label") == "git_status_short":
+            return not str(item.get("stdout", "")).strip() and item.get("returncode") == 0
+    return False
+
+
+def git_diff_check_ok(git_results: list[dict]) -> bool:
+    for item in git_results:
+        if item.get("label") == "git_diff_check":
+            return item.get("returncode") == 0
+    return False
+
+
+def smoke_all_pass(smoke_results: list[dict]) -> bool:
+    return bool(smoke_results) and all(item.get("returncode") == 0 for item in smoke_results)
+
+
+def collect_sensitive_scan(*parts: object) -> dict:
+    text = "\n".join(str(part or "") for part in parts)
+    findings = detect_sensitive_findings(text)
+    return {
+        "sensitive_risk": bool(findings),
+        "finding_count": len(findings),
+        "findings": findings[:10],
+        "zero_hit_ok": detect_sensitive_zero_hit_ok(text),
+    }
+
+
+def build_standard_collection_report(task_id: str, collection_id: str, profile: str, kind: str, git_results: list[dict], smoke_results: list[dict], log_results: list[dict], runtime_results: list[dict], process_results: list[dict], workbench_data: dict, sensitive_scan: dict) -> str:
+    modified_files = git_status_changed_files(git_results)
+    modified_block = "\n".join(f"- {item}" for item in modified_files) if modified_files else "- none / read-only collection"
+    command_lines = [f"- {item.get('command')} | returncode={item.get('returncode')}" for item in git_results + smoke_results + process_results]
+    if not command_lines:
+        command_lines = ["- none"]
+    smoke_lines = [f"- {item.get('label')}: returncode={item.get('returncode')}" for item in smoke_results] or ["- no smoke run for this collection"]
+    git_clean = git_status_is_clean(git_results)
+    diff_ok = git_diff_check_ok(git_results)
+    log_lines = []
+    for item in log_results:
+        log_lines.append(f"- {item.get('path')}: exists={str(bool(item.get('exists'))).lower()} lines={item.get('line_count', 'n/a')}")
+    for item in runtime_results:
+        log_lines.append(f"- {item.get('path')}: exists={str(bool(item.get('exists'))).lower()} lines={item.get('line_count', 'n/a')}")
+    if not log_lines:
+        log_lines = ["- no log/runtime files collected"]
+    observed = [
+        f"- profile: {profile}",
+        f"- collection_kind: {kind}",
+        f"- git_clean: {str(git_clean).lower()}",
+        f"- git_diff_check_ok: {str(diff_ok).lower()}",
+        f"- smoke_all_pass: {str(smoke_all_pass(smoke_results)).lower() if smoke_results else 'not_run'}",
+        f"- workbench_collection_count: {workbench_data.get('counts', {}).get('collection_count', 0)}",
+    ]
+    risks = []
+    if sensitive_scan.get("sensitive_risk"):
+        risks.append("- sensitive-looking values were found and redacted; inspect collection before trusting it.")
+    if smoke_results and not smoke_all_pass(smoke_results):
+        risks.append("- one or more smoke scripts failed or timed out.")
+    if not diff_ok:
+        risks.append("- git diff --check returned non-zero or was unavailable.")
+    if not risks:
+        risks.append("- none observed in read-only collection output.")
+    return f"""Task id: {task_id}
+Collection id: {collection_id}
+
+Execution summary:
+- Read-only whitelist evidence collection completed for profile={profile}, kind={kind}.
+- No user-provided command was executed.
+- No files were modified by the collector except Workbench collection/evidence/task records.
+
+Modified files:
+{modified_block}
+
+Commands:
+{chr(10).join(command_lines)}
+
+Test results:
+{chr(10).join(smoke_lines)}
+- git_diff_check_ok: {str(diff_ok).lower()}
+
+Key logs or screenshots:
+{chr(10).join(log_lines)}
+
+Observed:
+{chr(10).join(observed)}
+
+Verified:
+- false; collection output is observed evidence only.
+
+Unverified:
+- Human verification is still required with /evidence mark <task_id> <evidence_id> verified <reason>.
+
+Unresolved risks:
+{chr(10).join(risks)}
+
+Rollback notes:
+- No project files were modified by the read-only collector; no rollback needed for target code.
+- Workbench records can be archived or superseded if the collection is not useful.
+
+Sensitive Information Handling:
+- Outputs were sanitized before writing.
+- Redaction labels avoid original token prefixes.
+- .env files were not read.
+"""
+
+
+def build_collection_markdown(collection_id: str, task_id: str, profile: str, kind: str, git_results: list[dict], smoke_results: list[dict], log_results: list[dict], runtime_results: list[dict], process_results: list[dict], workbench_data: dict, sensitive_scan: dict, standard_report: str) -> str:
+    task_text = read_task(task_id)
+    task_meta = task_metadata(task_text)
+    project_id = task_meta.get("project_id", "")
+    title = f"{profile} {kind} read-only evidence"
+    smoke_failed = bool(smoke_results) and not smoke_all_pass(smoke_results)
+    missing = []
+    if not git_results:
+        missing.append("- git evidence not collected")
+    if kind == "smoke" and not smoke_results:
+        missing.append("- smoke evidence not collected")
+    if sensitive_scan.get("sensitive_risk"):
+        missing.append("- sensitive risk requires inspection")
+    if not missing:
+        missing.append("- none")
+    risks = []
+    if smoke_failed:
+        risks.append("- smoke_failed: one or more allowlisted smoke scripts did not pass")
+    if sensitive_scan.get("sensitive_risk"):
+        risks.append("- sensitive_risk: output was redacted; inspect before verification")
+    if not git_diff_check_ok(git_results):
+        risks.append("- git_diff_check_nonzero_or_unavailable")
+    if not risks:
+        risks.append("- none observed")
+    command_results = git_results + smoke_results + process_results
+    log_lines = []
+    for item in log_results:
+        log_lines.append(f"- path: {item.get('path')} | exists={str(bool(item.get('exists'))).lower()} | lines={item.get('line_count', 'n/a')}")
+        if item.get("tail"):
+            log_lines.append("  tail:")
+            log_lines.extend(f"    {line}" for line in str(item.get("tail")).splitlines()[:80])
+    runtime_lines = []
+    for item in runtime_results:
+        runtime_lines.append(f"- path: {item.get('path')} | exists={str(bool(item.get('exists'))).lower()} | lines={item.get('line_count', 'n/a')}")
+        if item.get("tail"):
+            runtime_lines.append("  tail:")
+            runtime_lines.extend(f"    {line}" for line in str(item.get("tail")).splitlines()[:80])
+    workbench_lines = [
+        f"- {key}: {value}" for key, value in sorted((workbench_data.get("counts") or {}).items())
+    ]
+    observed = [
+        f"- git_clean: {str(git_status_is_clean(git_results)).lower()}",
+        f"- git_diff_check_ok: {str(git_diff_check_ok(git_results)).lower()}",
+        f"- smoke_all_pass: {str(smoke_all_pass(smoke_results)).lower() if smoke_results else 'not_run'}",
+        f"- profile_root: {collect_clean_text(str(COLLECT_PROFILES[profile]['root']), 400)}",
+    ]
+    finding_lines = [
+        f"- {item.get('finding')} severity={item.get('severity')} reason={item.get('reason')}"
+        for item in sensitive_scan.get("findings", [])
+    ] or ["- none"]
+    return f"""# {collection_id} {title}
+
+collection_id: {collection_id}
+status: observed
+kind: {kind}
+created_at: {iso_now()}
+task_id: {task_id}
+project_id: {project_id}
+profile: {profile}
+mode: read_only_collect
+executor: atlas-bridge
+verified: false
+smoke_failed: {str(smoke_failed).lower()}
+runtime_injection_enabled: false
+external_execution_enabled: false
+
+## Scope
+- Read-only whitelist collection for task {task_id}.
+- Profile root is fixed by code; user paths and user commands are not accepted.
+- This is observed evidence only and must not be treated as verified.
+
+## Commands Run
+{collect_section_from_commands(command_results)}
+
+## Git Evidence
+{collect_section_from_commands(git_results)}
+
+## Smoke Evidence
+{collect_section_from_commands(smoke_results) if smoke_results else '- not run for this collection.'}
+
+## Log Evidence
+{chr(10).join(log_lines) if log_lines else '- no logs collected.'}
+
+## Runtime Evidence
+{chr(10).join(runtime_lines) if runtime_lines else '- no runtime files collected.'}
+
+## Workbench Evidence
+{chr(10).join(workbench_lines) if workbench_lines else '- no workbench summary available.'}
+
+## Sensitive Scan
+- sensitive_risk: {str(bool(sensitive_scan.get('sensitive_risk'))).lower()}
+- finding_count: {sensitive_scan.get('finding_count', 0)}
+- zero_hit_ok: {str(bool(sensitive_scan.get('zero_hit_ok'))).lower()}
+{chr(10).join(finding_lines)}
+
+## Observed Facts
+{chr(10).join(observed)}
+
+## Missing Evidence
+{chr(10).join(missing)}
+
+## Risks
+{chr(10).join(risks)}
+
+## Standard Return Report
+{standard_report}
+
+## Do Not Treat As Verified
+- This collection is automatic observed evidence.
+- It is not verified evidence.
+- It does not prove task completion.
+- The user must run /evidence mark <task_id> <evidence_id> verified <reason> before Atlas Review treats it as verified.
+- The user must still decide with /task decide <task_id> pass|needs_evidence|blocked|cancelled <reason>.
+"""
+
+
+def create_collection(task_id: str, profile_name: str, kind: str = "snapshot") -> tuple[str, str, str]:
+    normalized_task_id = normalize_task_id(task_id)
+    read_task(normalized_task_id)
+    profile = collect_profile(profile_name)
+    profile_name = profile["name"]
+    if kind not in {"snapshot", "smoke"}:
+        raise ValueError("collection kind must be snapshot or smoke")
+    if kind == "smoke" and profile_name != "octo-bridge":
+        raise ValueError("/collect smoke currently supports octo-bridge only")
+    root = profile["root"]
+    git_results = collect_git_evidence(root)
+    smoke_results = collect_smoke_evidence(root) if kind == "smoke" else []
+    log_results = [collect_file_tail(path, root) for path in profile.get("logs", [])]
+    runtime_results = collect_runtime_evidence(profile.get("runtime", []), root)
+    process_results = collect_process_port_evidence(profile_name)
+    workbench_data = collect_workbench_evidence() if profile_name == "octo-bridge" else {"counts": {}, "recent_tasks": [], "recent_dispatches": [], "recent_pilots": []}
+    sensitive_scan = collect_sensitive_scan(
+        git_results,
+        smoke_results,
+        log_results,
+        runtime_results,
+        process_results,
+        workbench_data,
+    )
+    collection_id = generate_collection_id()
+    standard_report = build_standard_collection_report(
+        normalized_task_id,
+        collection_id,
+        profile_name,
+        kind,
+        git_results,
+        smoke_results,
+        log_results,
+        runtime_results,
+        process_results,
+        workbench_data,
+        sensitive_scan,
+    )
+    markdown = build_collection_markdown(
+        collection_id,
+        normalized_task_id,
+        profile_name,
+        kind,
+        git_results,
+        smoke_results,
+        log_results,
+        runtime_results,
+        process_results,
+        workbench_data,
+        sensitive_scan,
+        standard_report,
+    )
+    write_collection(collection_id, markdown)
+    evidence_id = attach_collection_to_task(normalized_task_id, collection_id)
+    log_event("collection_created", collection_id=collection_id, task_id=normalized_task_id, profile=profile_name, kind=kind)
+    return collection_id, evidence_id, standard_report
+
+
+def attach_collection_to_task(task_id: str, collection_id: str) -> str:
+    normalized_task_id = normalize_task_id(task_id)
+    normalized_collection_id = normalize_collection_id(collection_id)
+    task_text = read_task(normalized_task_id)
+    collection_text = read_collection(normalized_collection_id)
+    report = task_section(collection_text, "Standard Return Report")
+    if not report:
+        report = f"Collection id: {normalized_collection_id}\n- observed evidence only."
+    evidence_body = f"""Collection evidence attached.
+
+collection_id: {normalized_collection_id}
+collection_file: workbench/collections/{normalized_collection_id}.md
+verified: false
+
+{report}
+"""
+    evidence_id = create_evidence_entry(normalized_task_id, "collection", evidence_body, source="collector", verified="no", sync_task=False)
+    now = iso_now()
+    task_text = append_to_section(task_text, "Execution Report", f"### Collection {normalized_collection_id} at {now}\n{report}")
+    task_text = append_to_section(task_text, "Timeline", f"- {now} collection {normalized_collection_id} attached as evidence {evidence_id}.")
+    task_text = update_task_status(task_text, "reported")
+    write_task(normalized_task_id, task_text)
+    sync_task_evidence_state(normalized_task_id)
+    log_event("collection_attached", collection_id=normalized_collection_id, task_id=normalized_task_id, evidence_id=evidence_id)
+    return evidence_id
+
+
+def build_collect_help_reply() -> str:
+    return """Atlas read-only collection commands
+- /collect help
+- /collect profiles
+- /collect snapshot <task_id> <octo-bridge|kiro-gateway>
+- /collect smoke <task_id> octo-bridge
+- /collect list
+- /collect show <collection_id>
+- /collect report <collection_id>
+- /collect attach <task_id> <collection_id>
+
+Safety:
+- read-only collection only
+- runs only static allowlisted commands
+- does not accept user shell commands
+- does not read .env
+- does not call Codex/Kiro
+- does not mark evidence verified
+- does not decide pass"""
+
+
+def build_collect_profiles_reply() -> str:
+    lines = ["Collect profiles:"]
+    for name, profile in COLLECT_PROFILES.items():
+        smokes = ", ".join(profile.get("smokes", [])) if profile.get("smokes") else "none"
+        lines.append(f"- {name} | root={collect_clean_text(str(profile.get('root')), 400)} | smoke_allowlist={smokes}")
+    lines.append("- arbitrary_command_enabled: false")
+    lines.append("- collect_mode: read_only_whitelist")
+    return "\n".join(lines)
+
+
+def build_collect_snapshot_reply(tail: str) -> str:
+    parts = str(tail or "").strip().split()
+    if len(parts) != 2:
+        return "Usage: /collect snapshot <task_id> <profile>"
+    collection_id, evidence_id, report = create_collection(parts[0], parts[1], kind="snapshot")
+    return f"""Collection snapshot created: {collection_id}
+- task_id: {normalize_task_id(parts[0])}
+- profile: {parts[1].lower()}
+- evidence_id: {evidence_id}
+- path: workbench/collections/{collection_id}.md
+- verified: false
+- arbitrary_command_enabled: false
+
+Standard report preview:
+{safe_preview(report, 900)}
+
+Next:
+- /collect show {collection_id}
+- /collect report {collection_id}
+- /evidence mark {normalize_task_id(parts[0])} {evidence_id} verified <reason>"""
+
+
+def build_collect_smoke_reply(tail: str) -> str:
+    parts = str(tail or "").strip().split()
+    if len(parts) != 2:
+        return "Usage: /collect smoke <task_id> octo-bridge"
+    collection_id, evidence_id, report = create_collection(parts[0], parts[1], kind="smoke")
+    text = read_collection(collection_id)
+    meta = task_metadata(text)
+    return f"""Collection smoke created: {collection_id}
+- task_id: {normalize_task_id(parts[0])}
+- profile: {parts[1].lower()}
+- evidence_id: {evidence_id}
+- smoke_failed: {meta.get('smoke_failed', 'false')}
+- whitelist_count: {len(OCTO_BRIDGE_SMOKE_ALLOWLIST)}
+- path: workbench/collections/{collection_id}.md
+- verified: false
+- arbitrary_command_enabled: false
+
+Standard report preview:
+{safe_preview(report, 900)}
+
+Next:
+- /collect report {collection_id}
+- /task qa {normalize_task_id(parts[0])}"""
+
+
+def build_collect_list_reply() -> str:
+    records = collection_records()[:10]
+    if not records:
+        return "Collections:\n- none."
+    lines = ["Collections:"]
+    for record in records:
+        lines.append(
+            f"- {record['collection_id']} | {record.get('kind')} | profile={record.get('profile')} | task={record.get('task_id')} | smoke_failed={str(bool(record.get('smoke_failed'))).lower()} | {record.get('created_at')} | {record.get('title')}"
+        )
+    return "\n".join(lines)
+
+
+def build_collect_show_reply(collection_id: str) -> str:
+    normalized_collection_id = normalize_collection_id(collection_id)
+    text = read_collection(normalized_collection_id)
+    meta = task_metadata(text)
+    return f"""Collection summary: {normalized_collection_id}
+- title: {collection_title_from_text(normalized_collection_id, text)}
+- created_at: {meta.get('created_at', '')}
+- task_id: {meta.get('task_id', '')}
+- project_id: {meta.get('project_id', '') or 'unassigned'}
+- profile: {meta.get('profile', '')}
+- kind: {meta.get('kind', '')}
+- verified: {meta.get('verified', 'false')}
+- smoke_failed: {meta.get('smoke_failed', 'false')}
+- git: {safe_preview(task_section(text, 'Git Evidence'), 260)}
+- smoke: {safe_preview(task_section(text, 'Smoke Evidence'), 260)}
+- runtime: {safe_preview(task_section(text, 'Runtime Evidence'), 260)}
+- workbench: {safe_preview(task_section(text, 'Workbench Evidence'), 260)}
+- risks: {safe_preview(task_section(text, 'Risks'), 260)}
+- next: /collect report {normalized_collection_id}"""
+
+
+def build_collect_report_reply(collection_id: str) -> str:
+    normalized_collection_id = normalize_collection_id(collection_id)
+    text = read_collection(normalized_collection_id)
+    report = task_section(text, "Standard Return Report")
+    if not report:
+        report = f"Task id: {task_metadata(text).get('task_id', '')}\nCollection id: {normalized_collection_id}\n\nExecution summary:\n- collection report unavailable"
+    return report
+
+
+def build_collect_attach_reply(tail: str) -> str:
+    parts = str(tail or "").strip().split()
+    if len(parts) != 2:
+        return "Usage: /collect attach <task_id> <collection_id>"
+    evidence_id = attach_collection_to_task(parts[0], parts[1])
+    return f"""Collection attached: {normalize_collection_id(parts[1])}
+- task_id: {normalize_task_id(parts[0])}
+- evidence_id: {evidence_id}
+- verified: false
+- next: /evidence mark {normalize_task_id(parts[0])} {evidence_id} verified <reason>"""
+
+
+def handle_collect_command(user_text: str) -> str | None:
+    lines = user_text.strip().splitlines()
+    first_line = lines[0] if lines else ""
+    parts = first_line.split(maxsplit=2)
+    if len(parts) < 2 or parts[0].lower() != "/collect":
+        return None
+    subcommand = parts[1].lower()
+    tail = parts[2] if len(parts) > 2 else ""
+    try:
+        if subcommand == "help":
+            return build_collect_help_reply()
+        if subcommand == "profiles":
+            return build_collect_profiles_reply()
+        if subcommand == "snapshot":
+            return build_collect_snapshot_reply(tail)
+        if subcommand == "smoke":
+            return build_collect_smoke_reply(tail)
+        if subcommand == "list":
+            return build_collect_list_reply()
+        if subcommand == "show":
+            return build_collect_show_reply(tail)
+        if subcommand == "report":
+            return build_collect_report_reply(tail)
+        if subcommand == "attach":
+            return build_collect_attach_reply(tail)
+        return build_collect_help_reply()
+    except FileNotFoundError as exc:
+        return f"collection source not found: {safe_preview(str(exc), 180)}"
+    except ValueError as exc:
+        return f"collection operation refused: {safe_preview(str(exc), 220)}"
+    except Exception as exc:
+        return f"collection operation failed: {safe_preview(str(exc), 180)}"
 
 
 def build_project_help_reply() -> str:
@@ -7072,6 +8589,10 @@ def build_project_brief_reply(project_id: str) -> str:
     clean_project_id = validate_project_id(project_id)
     base = _build_project_brief_reply_base(clean_project_id)
     records = dispatches_for_project(clean_project_id)
+    project_collections = collections_for_project(clean_project_id)
+    latest_collection_id = project_collections[0]["collection_id"] if project_collections else "none"
+    smoke_collection_count = sum(1 for record in project_collections if record.get("kind") == "smoke")
+    failed_collection_count = sum(1 for record in project_collections if record.get("smoke_failed"))
     ready = [record for record in records if record.get("status") == "ready"]
     sent = [record for record in records if record.get("status") == "sent"]
     returned = [record for record in records if record.get("status") == "returned"]
@@ -7095,6 +8616,16 @@ def build_project_brief_reply(project_id: str) -> str:
         lines.append(f"- inspect or recreate dispatch: {failed[0]['dispatch_id']}")
     if not records:
         lines.append("- create dispatch for active task: /dispatch create <task_id> codex --with-context")
+    lines.extend(
+        [
+            "",
+            "Collection view:",
+            f"- latest_collection_id: {latest_collection_id}",
+            f"- collection_count: {len(project_collections)}",
+            f"- smoke_collection_count: {smoke_collection_count}",
+            f"- failed_collection_count: {failed_collection_count}",
+        ]
+    )
     return base + "\n" + "\n".join(lines)
 
 
@@ -7509,11 +9040,28 @@ def build_status_reply(context: dict) -> str:
         f"- dispatch_ready_count: {counts['dispatch_ready_count']}",
         f"- dispatch_failed_count: {counts['dispatch_failed_count']}",
         f"- dispatch_stale_count: {counts['dispatch_stale_count']}",
+        f"- execution_count: {counts['execution_count']}",
+        f"- execution_returned: {counts['execution_returned']}",
+        f"- execution_prepared_count: {counts['execution_prepared_count']}",
+        f"- execution_opened_count: {counts['execution_opened_count']}",
+        f"- execution_copied_count: {counts['execution_copied_count']}",
+        f"- execution_failed_count: {counts['execution_failed_count']}",
+        f"- execution_stale_count: {counts['execution_stale_count']}",
+        f"- latest_exec_id: {counts['latest_exec_id'] or 'none'}",
+        f"- collection_count: {counts['collection_count']}",
+        f"- latest_collection_id: {counts['latest_collection_id'] or 'none'}",
+        f"- smoke_collection_count: {counts['smoke_collection_count']}",
+        f"- failed_collection_count: {counts['failed_collection_count']}",
+        f"- collect_enabled: {str(COLLECT_ENABLED).lower()}",
+        f"- collect_mode: {COLLECT_MODE}",
+        f"- arbitrary_command_enabled: {str(ARBITRARY_COMMAND_ENABLED).lower()}",
         "- learning_dir：workbench/learning/",
         f"- application_enabled：{str(APPLICATION_ENABLED).lower()}",
         f"- runtime_injection_enabled: {str(RUNTIME_INJECTION_ENABLED).lower()}",
         f"- external_application_enabled: {str(EXTERNAL_APPLICATION_ENABLED).lower()}",
         f"- external_execution_enabled: {str(EXTERNAL_EXECUTION_ENABLED).lower()}",
+        f"- human_confirm_required: {str(HUMAN_CONFIRM_REQUIRED).lower()}",
+        f"- auto_execute_enabled: {str(AUTO_EXECUTE_ENABLED).lower()}",
         f"- 最近 task_id：{counts['recent_task_id'] or 'none'}",
         f"- 日志：logs/bridge.log",
         "- heartbeat：runtime/heartbeat.json",
@@ -7565,6 +9113,8 @@ def build_help_reply() -> str:
 - /project help: project index and cross-task dashboard.
 - /task help: local task ledger commands.
 - /dispatch help: manual dispatch queue and execution session ledger.
+- /exec help: semi-auto execution session ledger; human confirmation required.
+- /collect help: read-only whitelist evidence collection.
 - /pilot help: real-project pilot metrics and operating notes.
 - /context help: Context Pack commands.
 - /playbook help: local Playbook reference commands.
@@ -7610,8 +9160,12 @@ def handle_local_command(user_text: str, context: dict) -> str | None:
         return handle_context_command(user_text)
     if command == "/dispatch":
         return handle_dispatch_command(user_text)
+    if command == "/exec":
+        return handle_exec_command(user_text)
     if command == "/pilot":
         return handle_pilot_command(user_text)
+    if command == "/collect":
+        return handle_collect_command(user_text)
     if command == "/learn":
         return handle_learn_command(user_text)
     if command == "/retro":

@@ -192,7 +192,7 @@ Security notes:
 - Task commands do not execute shell commands.
 - Task commands do not call Codex/Kiro/OpenClaw.
 - Task commands do not read `.env`.
-- Reports are sanitized before saving common sensitive values such as `bf_` tokens, `sk-` keys, `Authorization:`, `Cookie:`, `password:`, `api_key:`, and `secret:`.
+- Reports are sanitized before saving common sensitive values such as bot tokens, API keys, authorization headers, cookie headers, passwords, api_key fields, and secret fields.
 
 ## Manual Dispatch Queue
 
@@ -260,6 +260,67 @@ Security notes:
 - `/dispatch receive` sanitizes pasted reports and also syncs the report into the task ledger.
 - Dispatch records keep `external_execution_enabled: false` and `runtime_injection_enabled: false`.
 - Do not paste `.env`, tokens, cookies, passwords, API keys, or secrets into reports.
+
+## Semi-Auto Execution
+
+OHB-EXEC-016 adds a semi-auto execution session ledger under:
+
+```text
+workbench/executions/
+```
+
+Execution ids use this shape:
+
+```text
+EXEC-YYYYMMDD-HHMMSS
+```
+
+This layer wraps an existing dispatch package into an execution session. It does not call Codex/Kiro, does not run the prompt, does not inject runtime content, does not read `.env`, and does not pass secrets. It only records whether the user prepared, opened, copied, returned, cancelled, or failed a manual executor handoff.
+
+Recommended flow:
+
+```text
+/dispatch create <task_id> codex --with-context
+/exec prepare <dispatch_id>
+/exec package <exec_id>
+manually copy the package to Codex
+/exec mark <exec_id> copied copied into Codex window
+
+Codex returns a report:
+/exec receive <exec_id>
+<paste report>
+/dispatch qa <dispatch_id>
+/task review <task_id>
+/task decide <task_id> pass|needs_evidence|blocked|cancelled <note>
+```
+
+Commands:
+
+```text
+/exec help
+/exec prepare <dispatch_id>
+/exec package <exec_id>
+/exec mark <exec_id> copied <note>
+/exec mark <exec_id> opened <note>
+/exec receive <exec_id>
+/exec cancel <exec_id> <note>
+/exec fail <exec_id> <note>
+/exec show <exec_id>
+/exec list
+/exec dashboard
+/exec stale
+```
+
+Safety notes:
+
+- `human_confirm_required` is always `true`.
+- `external_execution_enabled` is always `false`.
+- `auto_execute_enabled` is always `false`.
+- `/exec prepare` writes only `workbench/executions/<exec_id>.md`.
+- `/exec package` only displays a copy payload.
+- `/exec mark copied` can sync the dispatch status to `sent`, but it still does not send anything.
+- `/exec receive` syncs the pasted report through the existing `/dispatch receive` and `/task report` logic.
+- The bridge still waits for `/dispatch qa`, `/task review`, and the user's `/task decide`.
 
 ## Real Project Pilot
 
@@ -786,6 +847,10 @@ It includes `run_id`, `pid`, `started_at`, `updated_at`, `registered`, `robot_id
 - `/context help` returns Context Pack commands.
 - `/context pack task <task_id>` writes a Workbench context pack.
 - `/playbook advise task <task_id>` searches only `workbench/playbooks`.
+- `/exec help` returns semi-auto execution session commands.
+- `/collect help` returns read-only whitelist evidence collection commands.
+- `/collect snapshot <task_id> <octo-bridge|kiro-gateway>` writes a local collection record.
+- `/collect smoke <task_id> octo-bridge` runs the fixed octo-bridge smoke allowlist.
 - `/task handoff <task_id> codex|kiro` returns a copyable execution package.
 - `/task handoff <task_id> codex|kiro --with-context` appends context and advisory.
 - `/task qa <task_id>` checks whether the return report has enough evidence.
@@ -821,13 +886,13 @@ For read-only validation, missing modified files is treated as `not_applicable` 
 Sensitive scan results with zero hits are leak-check evidence, not leaks:
 
 ```text
-Authorization: 0 hits
-Cookie: 0 hits
-sk-: 0
-bf_: no hits
+authorization header: 0 hits
+cookie header: 0 hits
+api key prefix: 0 hits
+bot token prefix: no hits
 ```
 
-Actual sensitive-looking values are still redacted and flagged, including bearer authorization headers, cookies with values, password/api_key/secret fields, `bf_...`, and long `sk-...` keys. Redaction labels avoid the original token prefixes to reduce scan false positives.
+Actual sensitive-looking values are still redacted and flagged, including bearer authorization headers, cookies with values, password/api_key/secret fields, bot token prefixes, and long API-key prefixes. Redaction labels avoid the original token prefixes to reduce scan false positives.
 
 Parser-only preview:
 
@@ -837,6 +902,164 @@ Parser-only preview:
 ```
 
 Atlas Review still uses verified evidence as the stronger signal. Observed evidence from auto intake is useful for triage, but it is not proof of completion until a human marks it verified.
+
+## Auto Evidence Collection
+
+OHB-COLLECT-015 adds a read-only evidence collection layer under:
+
+```text
+workbench/collections/
+```
+
+Collection ids use this shape:
+
+```text
+COLLECT-YYYYMMDD-HHMMSS
+```
+
+This layer is for standardizing evidence packets. It does not accept shell commands from the user, does not call Codex/Kiro, does not restart services, does not read `.env`, and does not decide whether a task passed. A collection is observed evidence only until the user and Atlas review it.
+
+Supported profiles:
+
+```text
+octo-bridge
+kiro-gateway
+```
+
+`octo-bridge` is fixed to this repository. It can collect git state, bridge log tail, runtime heartbeat, Workbench summaries, and the fixed smoke allowlist. `kiro-gateway` is fixed to `E:\ai\kiro-gateway-mvp`. It can collect read-only git state, `logs/gateway.log`, `logs/acp_raw.log`, and a process/port summary. It does not send a real chat request and does not read `.env`.
+
+Commands:
+
+```text
+/collect help
+/collect profiles
+/collect snapshot <task_id> <octo-bridge|kiro-gateway>
+/collect smoke <task_id> octo-bridge
+/collect list
+/collect show <collection_id>
+/collect report <collection_id>
+/collect attach <task_id> <collection_id>
+```
+
+Recommended use:
+
+```text
+/task new Check Kiro proxy current state --project kiro_proxy
+/collect snapshot <task_id> kiro-gateway
+/collect show <collection_id>
+/collect report <collection_id>
+/collect attach <task_id> <collection_id>
+/task qa <task_id>
+/task review <task_id>
+/task decide <task_id> needs_evidence <reason>
+```
+
+For the bridge itself:
+
+```text
+/collect smoke <task_id> octo-bridge
+```
+
+Collection files include:
+
+- scope and fixed profile
+- commands run by the whitelist
+- git evidence
+- smoke evidence
+- log evidence
+- runtime evidence
+- Workbench evidence
+- sensitive scan summary
+- observed facts
+- missing evidence
+- risks
+- standard return report
+- a reminder that observed evidence is not verified completion
+
+Safety rules:
+
+- Fixed profile roots only; user-supplied paths are rejected.
+- No arbitrary command input is accepted.
+- Commands use static allowlists, no shell command string execution, timeouts, output limits, and sanitization.
+- `.env`, token, cookie, authorization, password, api_key, and secret values must not be printed or saved.
+- `/collect attach` writes only Workbench task/evidence/collection records.
+- `/task qa`, `/task review`, `/project brief`, `/pilot metrics`, and `/status` may summarize collection counts, but collection evidence is still not a pass decision.
+
+## Web Workbench Roadmap
+
+OHB-WEB-017A is a read-only research and design stage for a visual Atlas Workbench. It does not implement a dashboard, does not create HTML UI, does not modify `octo-web`, does not modify `octo-server`, and does not change Docker deployment.
+
+Roadmap:
+
+- 017A: read-only research and design. Output: `workbench/designs/OHB-WEB-017A-web-workbench-design.md`.
+- 017B: Bridge Local Dashboard MVP. Local read-only dashboard bound to localhost; still no `octo-web` changes.
+- 017C: dashboard plus Octo Bot deep links / copy package helpers.
+- 017D: evaluate whether an `octo-web` native Workbench page is justified.
+
+Rules:
+
+- 017A is design only.
+- 017B must remain local and read-only.
+- 017B must not modify `octo-web`.
+- Only 017D may consider an `octo-web` native page.
+- Official OCTO Web is an independent frontend. Do not change it before a dedicated source inspection and API boundary review.
+- Do not expose Workbench data publicly.
+- Do not read `.env`, tokens, cookies, authorization headers, passwords, api keys, or secrets.
+
+Useful design commands:
+
+```powershell
+python web_workbench_design_probe.py
+python smoke_web_design.py
+```
+
+## Bridge Local Dashboard MVP
+
+OHB-WEB-017B adds a local read-only Atlas Workbench dashboard inside this bridge repo.
+
+Start it from this directory:
+
+```powershell
+start_dashboard.cmd
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8765/
+```
+
+You can also run it directly:
+
+```powershell
+python dashboard_server.py --host 127.0.0.1 --port 8765
+```
+
+Safety boundary:
+
+- Dashboard mode is `read_only_dashboard`.
+- It binds only to `127.0.0.1`.
+- Do not expose it to a public network.
+- It does not modify `octo-web`.
+- It does not modify `octo-server`.
+- It does not modify `octo-deployment`.
+- It does not change Docker.
+- It does not read `.env`.
+- It does not show full logs.
+- It does not show full Workbench file bodies.
+- It does not execute commands.
+- It does not call Codex/Kiro.
+- It is not an automatic execution system.
+
+Read-only pages:
+
+- `/` shows the dashboard HTML.
+- `/api/summary` returns read-only summary JSON.
+- `/api/projects` returns read-only project summaries.
+- `/api/tasks` returns read-only task summaries.
+- `/api/dispatches` returns read-only dispatch summaries.
+
+Stop it with `Ctrl+C` in the dashboard terminal.
 
 Recommended Octo prompts:
 
@@ -857,7 +1080,7 @@ Recommended Octo prompts:
 - Confirm no token in logs:
 
 ```powershell
-Select-String -Path .\logs\bridge.log -Pattern 'bf_' -SimpleMatch
+Select-String -Path .\logs\bridge.log -Pattern '<bot-token-prefix>' -SimpleMatch
 ```
 
 ## Checks
@@ -871,6 +1094,12 @@ python -m py_compile smoke_retro.py
 python -m py_compile smoke_learn.py
 python -m py_compile smoke_apply.py
 python -m py_compile smoke_context.py
+python -m py_compile smoke_collect.py
+python -m py_compile smoke_exec.py
+python -m py_compile web_workbench_design_probe.py
+python -m py_compile smoke_web_design.py
+python -m py_compile dashboard_server.py
+python -m py_compile smoke_dashboard.py
 python smoke_consultation.py
 python smoke_runtime.py
 python smoke_workflow.py
@@ -882,4 +1111,11 @@ python smoke_retro.py
 python smoke_learn.py
 python smoke_apply.py
 python smoke_context.py
+python smoke_dispatch.py
+python smoke_pilot.py
+python smoke_auto_evidence.py
+python smoke_collect.py
+python smoke_exec.py
+python smoke_web_design.py
+python smoke_dashboard.py
 ```
