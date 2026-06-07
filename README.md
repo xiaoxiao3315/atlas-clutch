@@ -194,6 +194,131 @@ Security notes:
 - Task commands do not read `.env`.
 - Reports are sanitized before saving common sensitive values such as `bf_` tokens, `sk-` keys, `Authorization:`, `Cookie:`, `password:`, `api_key:`, and `secret:`.
 
+## Manual Dispatch Queue
+
+OHB-DISPATCH-012 adds a manual dispatch queue under:
+
+```text
+workbench/dispatches/
+```
+
+Dispatch ids use this shape:
+
+```text
+DISPATCH-YYYYMMDD-HHMMSS
+```
+
+Dispatch records are local runtime state and are ignored by git. They only record a manual copy / manual return workflow. They do not call Codex or Kiro, do not run commands, and do not modify user project files.
+
+Recommended flow in Octo:
+
+```text
+/task new 检查 Kiro 反代当前状态
+/dispatch create <task_id> codex --with-context
+/dispatch package <dispatch_id>
+```
+
+Copy the package manually to Codex or Kiro. After the executor returns a report:
+
+```text
+/dispatch mark <dispatch_id> sent 手工复制给 Codex
+/dispatch receive <dispatch_id>
+<paste Codex/Kiro return report>
+/dispatch qa <dispatch_id>
+/task review <task_id>
+/dispatch link-review <dispatch_id>
+/task decide <task_id> pass 验收通过
+/dispatch close <dispatch_id>
+/task close <task_id>
+```
+
+Useful commands:
+
+```text
+/dispatch help
+/dispatch create <task_id> codex|kiro [--with-context]
+/dispatch list
+/dispatch list --status sent
+/dispatch show <dispatch_id>
+/dispatch package <dispatch_id>
+/dispatch mark <dispatch_id> sent <note>
+/dispatch receive <dispatch_id>
+/dispatch qa <dispatch_id>
+/dispatch link-review <dispatch_id>
+/dispatch dashboard
+/dispatch stale
+/dispatch cancel <dispatch_id> <note>
+/dispatch fail <dispatch_id> <note>
+/dispatch close <dispatch_id>
+```
+
+`/task show`, `/task next`, `/project brief`, `/project dashboard`, and `/status` include dispatch status. Stale dispatches are `sent` dispatches older than 24 hours without a return record.
+
+Security notes:
+
+- Dispatch commands write only `workbench/dispatches/` and may create `workbench/context_packs/` when `--with-context` is requested.
+- `/dispatch receive` sanitizes pasted reports and also syncs the report into the task ledger.
+- Dispatch records keep `external_execution_enabled: false` and `runtime_injection_enabled: false`.
+- Do not paste `.env`, tokens, cookies, passwords, API keys, or secrets into reports.
+
+## Real Project Pilot
+
+OHB-PILOT-013 adds a minimal real-project pilot record under:
+
+```text
+workbench/pilots/
+```
+
+Pilot ids use this shape:
+
+```text
+PILOT-YYYYMMDD-HHMMSS
+```
+
+The pilot layer is only an operating record. It tracks whether the existing Workbench loop is useful in real work. It does not call Codex/Kiro, does not run commands, does not change Octo Docker, and does not modify Hermes or external project files.
+
+Recommended real trial flow:
+
+```text
+/project new kiro-proxy Kiro 反代项目
+/pilot start kiro-proxy Kiro 反代真实试运行
+/task new 检查 Kiro 反代当前状态 --project kiro-proxy
+/context pack task <task_id>
+/dispatch create <task_id> codex --with-context
+/dispatch package <dispatch_id>
+人工复制给 Codex/Kiro
+/dispatch mark <dispatch_id> sent 手工复制完成
+/dispatch receive <dispatch_id>
+<paste return report>
+/dispatch qa <dispatch_id>
+/task review <task_id>
+/task decide <task_id> needs_evidence 需要补真实上游请求证据
+/pilot add-task <pilot_id> <task_id>
+/pilot add-dispatch <pilot_id> <dispatch_id>
+/pilot note <pilot_id> 手工复制仍然需要来回切窗口
+/pilot metrics <pilot_id>
+/pilot complete <pilot_id> 本轮试运行结束
+```
+
+Pilot commands:
+
+```text
+/pilot help
+/pilot start <project_id> <title>
+/pilot list
+/pilot show <pilot_id>
+/pilot add-task <pilot_id> <task_id>
+/pilot add-dispatch <pilot_id> <dispatch_id>
+/pilot note <pilot_id> <single-line note>
+/pilot metrics <pilot_id>
+/pilot complete <pilot_id> <note>
+/pilot dashboard
+```
+
+Pilot metrics include task count, dispatch count, returned reports, QA pass count, needs-evidence count, closed count, evidence gaps, context pack count, manual copy count, a rough time-saved estimate, and main friction.
+
+Use pilot results to decide whether to run another real project trial, pay down Octo UI live debt, or improve one painful command. Do not use pilot results as permission to add automatic execution.
+
 ## Project Index
 
 OHB-PROJECT-006 adds a lightweight local project layer under:
@@ -353,6 +478,198 @@ Retro commands:
 
 If live validation was skipped or evidence gaps remain, the retro keeps those risks. A `passed` task can still produce a retro with unresolved evidence gaps; retro never rewrites missing evidence as verified.
 
+## Learning Loop
+
+OHB-LEARN-009 adds a controlled local learning proposal layer under:
+
+```text
+workbench/learning/
+  candidates/
+  proposals/
+  registry/
+  rejected/
+  deferred/
+  packages/
+  logs/
+```
+
+This is not model training. It does not automatically modify Hermes, does not write Memory, does not modify SkillRepo, does not change system prompts, and does not apply behavior changes to any project code. It only turns approved retros into reviewable learning proposals, then stores approved proposals in a local registry. Application is disabled:
+
+```text
+application_enabled: false
+```
+
+Learning workflow:
+
+```text
+/retro dashboard
+/learn scan retro <task_id>
+/learn propose retro <task_id>
+/learn list
+/learn show <learn_id>
+/learn review <learn_id>
+/learn approve <learn_id> 批准进入本地 learning registry，但不应用
+/learn registry
+/learn package <learn_id>
+/learn dashboard
+```
+
+Manual proposal:
+
+```text
+/learn propose manual <标题>
+/learn review <learn_id>
+/learn defer <learn_id> 等待更多证据
+```
+
+Learning commands:
+
+```text
+/learn help
+/learn scan retro <task_id>
+/learn propose retro <task_id>
+/learn propose manual <标题>
+/learn list
+/learn list --status <candidate|proposed|approved|rejected|deferred|packaged>
+/learn show <learn_id>
+/learn review <learn_id>
+/learn approve <learn_id> <说明>
+/learn reject <learn_id> <说明>
+/learn defer <learn_id> <说明>
+/learn package <learn_id>
+/learn dashboard
+/learn registry
+/learn status
+```
+
+Every proposal must keep evidence, an acceptance test, rollback plan, risks, approval record, application status, and a `Do Not Auto-Apply` section. A package is only a copyable manual application package for a future human-controlled phase.
+
+## Apply And Playbook
+
+OHB-APPLY-010 adds a Workbench-only apply layer under:
+
+```text
+workbench/applications/
+workbench/playbooks/
+workbench/playbooks/projects/
+```
+
+Apply means writing an approved learning into the local Workbench Playbook reference layer. It does not apply to Hermes, Memory, SkillRepo, system prompts, project code, or runtime prompts. It does not run commands, call Codex/Kiro, or perform model training.
+
+The Playbook is a readable reference layer, not a runtime layer:
+
+```text
+runtime_injection_enabled: false
+external_application_enabled: false
+```
+
+Standard flow:
+
+```text
+/learn registry
+/apply plan <learn_id> global
+/apply show <apply_id>
+/apply enact <apply_id> Confirm Workbench Playbook only; do not modify Hermes/Memory/SkillRepo
+/playbook show global
+/apply dashboard
+/apply revert <apply_id> Revert this Playbook entry by appending a Revert Note only
+/learn status
+```
+
+Project Playbook flow:
+
+```text
+/apply plan <learn_id> project <project_id>
+/apply show <apply_id>
+/apply enact <apply_id> Confirm project Playbook reference only
+/playbook show project <project_id>
+```
+
+Apply commands:
+
+```text
+/apply help
+/apply plan <learn_id> global
+/apply plan <learn_id> project <project_id>
+/apply show <apply_id>
+/apply list
+/apply list --status <planned|applied|reverted|cancelled>
+/apply enact <apply_id> <说明>
+/apply revert <apply_id> <说明>
+/apply cancel <apply_id> <说明>
+/apply dashboard
+```
+
+Playbook commands:
+
+```text
+/playbook help
+/playbook show global
+/playbook show project <project_id>
+/playbook list
+/playbook search <关键词>
+```
+
+Apply plans are stored in `workbench/applications/<apply_id>.md`. Enact appends one entry to a target playbook under `workbench/playbooks/`. Revert does not delete history; it appends a Revert Note and updates the learning registry to `reverted_from_workbench_playbook`.
+
+APPLY-010 never changes real Hermes behavior. A future stage that changes Hermes, Memory, SkillRepo, prompts, or project code must be separately authorized and reviewed.
+
+## Context Pack
+
+OHB-CONTEXT-011 adds a Workbench context packaging layer under:
+
+```text
+workbench/context_packs/
+```
+
+Context Pack reads Workbench materials only and writes context pack files only. It does not read `.env`, does not modify Hermes, Memory, SkillRepo, system prompts, or project code, does not perform runtime injection, and does not call Codex/Kiro automatically. Generated content is copy-only for a human to paste into an executor.
+
+```text
+runtime_injection_enabled: false
+external_execution_enabled: false
+```
+
+Task context flow:
+
+```text
+/context help
+/context pack task <task_id>
+/context show <context_id>
+/context handoff <task_id> codex
+/playbook advise task <task_id>
+/task handoff <task_id> codex --with-context
+```
+
+Project context flow:
+
+```text
+/context pack project <project_id>
+/playbook advise project <project_id>
+/context list
+/context archive <context_id>
+```
+
+Context commands:
+
+```text
+/context help
+/context pack task <task_id>
+/context pack project <project_id>
+/context show <context_id>
+/context list
+/context archive <context_id>
+/context handoff <task_id> codex|kiro
+```
+
+Playbook advisory commands:
+
+```text
+/playbook advise task <task_id>
+/playbook advise project <project_id>
+```
+
+`/task handoff <task_id> codex|kiro --with-context` appends a Context Pack summary and Playbook Advisory to the normal manual handoff. It still does not send anything automatically.
+
 ## Manual Start
 
 Double-click `start_bridge.cmd`, or run:
@@ -461,13 +778,65 @@ It includes `run_id`, `pid`, `started_at`, `updated_at`, `registered`, `robot_id
 - `/evidence gaps <task_id>` returns claimed / observed / verified / missing gaps.
 - `/retro help` returns task and project retrospective commands.
 - `/retro dashboard` returns the cross-project retro dashboard.
+- `/learn help` returns controlled learning loop commands.
+- `/learn dashboard` returns proposal, registry, and not-applied counts.
+- `/apply help` returns Workbench-only apply commands.
+- `/apply dashboard` returns apply and playbook counts.
+- `/playbook help` returns local Playbook commands.
+- `/context help` returns Context Pack commands.
+- `/context pack task <task_id>` writes a Workbench context pack.
+- `/playbook advise task <task_id>` searches only `workbench/playbooks`.
 - `/task handoff <task_id> codex|kiro` returns a copyable execution package.
+- `/task handoff <task_id> codex|kiro --with-context` appends context and advisory.
 - `/task qa <task_id>` checks whether the return report has enough evidence.
 - `/task next <task_id>` returns the next recommended action for the current status.
 - `/daily brief` returns today's active task summary.
 - `/template wo` returns the work order template.
 - `/template report` returns the Codex/Kiro return report template.
 - `/template review` returns the Atlas review checklist.
+
+## Auto Evidence Intake
+
+`/task report <task_id>` and `/dispatch receive <dispatch_id>` run a local evidence intake parser before writing the task evidence ledger.
+
+The parser only archives observed evidence. It does not mark evidence as verified, does not decide pass, and does not call Codex/Kiro. The user still needs:
+
+```text
+/evidence mark <task_id> <evidence_id> verified <reason>
+/task review <task_id>
+/task decide <task_id> pass|needs_evidence|blocked|cancelled <reason>
+```
+
+Read-only reports are valid when they clearly say no files were modified:
+
+```text
+Modified files: none
+Modified files: N/A
+修改文件：无
+无修改文件
+```
+
+For read-only validation, missing modified files is treated as `not_applicable` instead of a blocking gap when the report includes commands/checks, test or API results, logs/request ids, unverified items, and risks.
+
+Sensitive scan results with zero hits are leak-check evidence, not leaks:
+
+```text
+Authorization: 0 hits
+Cookie: 0 hits
+sk-: 0
+bf_: no hits
+```
+
+Actual sensitive-looking values are still redacted and flagged, including bearer authorization headers, cookies with values, password/api_key/secret fields, `bf_...`, and long `sk-...` keys. Redaction labels avoid the original token prefixes to reduce scan false positives.
+
+Parser-only preview:
+
+```text
+/evidence intake <task_id>
+<paste report>
+```
+
+Atlas Review still uses verified evidence as the stronger signal. Observed evidence from auto intake is useful for triage, but it is not proof of completion until a human marks it verified.
 
 Recommended Octo prompts:
 
@@ -499,6 +868,9 @@ python -m py_compile smoke_consultation.py
 python -m py_compile smoke_project.py
 python -m py_compile smoke_evidence.py
 python -m py_compile smoke_retro.py
+python -m py_compile smoke_learn.py
+python -m py_compile smoke_apply.py
+python -m py_compile smoke_context.py
 python smoke_consultation.py
 python smoke_runtime.py
 python smoke_workflow.py
@@ -507,4 +879,7 @@ python smoke_handoff.py
 python smoke_project.py
 python smoke_evidence.py
 python smoke_retro.py
+python smoke_learn.py
+python smoke_apply.py
+python smoke_context.py
 ```

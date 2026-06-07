@@ -68,6 +68,14 @@ def main() -> int:
         "PROJECTS_DIR": bridge.PROJECTS_DIR,
         "EVIDENCE_DIR": bridge.EVIDENCE_DIR,
         "RETROS_DIR": bridge.RETROS_DIR,
+        "LEARNING_DIR": bridge.LEARNING_DIR,
+        "LEARNING_CANDIDATES_DIR": bridge.LEARNING_CANDIDATES_DIR,
+        "LEARNING_PROPOSALS_DIR": bridge.LEARNING_PROPOSALS_DIR,
+        "LEARNING_REGISTRY_DIR": bridge.LEARNING_REGISTRY_DIR,
+        "LEARNING_REJECTED_DIR": bridge.LEARNING_REJECTED_DIR,
+        "LEARNING_DEFERRED_DIR": bridge.LEARNING_DEFERRED_DIR,
+        "LEARNING_PACKAGES_DIR": bridge.LEARNING_PACKAGES_DIR,
+        "LEARNING_LOGS_DIR": bridge.LEARNING_LOGS_DIR,
         "DECISIONS_DIR": bridge.DECISIONS_DIR,
         "DAILY_DIR": bridge.DAILY_DIR,
         "ARCHIVE_DIR": bridge.ARCHIVE_DIR,
@@ -85,6 +93,14 @@ def main() -> int:
             bridge.PROJECTS_DIR = bridge.WORKBENCH_DIR / "projects"
             bridge.EVIDENCE_DIR = bridge.WORKBENCH_DIR / "evidence"
             bridge.RETROS_DIR = bridge.WORKBENCH_DIR / "retros"
+            bridge.LEARNING_DIR = bridge.WORKBENCH_DIR / "learning"
+            bridge.LEARNING_CANDIDATES_DIR = bridge.LEARNING_DIR / "candidates"
+            bridge.LEARNING_PROPOSALS_DIR = bridge.LEARNING_DIR / "proposals"
+            bridge.LEARNING_REGISTRY_DIR = bridge.LEARNING_DIR / "registry"
+            bridge.LEARNING_REJECTED_DIR = bridge.LEARNING_DIR / "rejected"
+            bridge.LEARNING_DEFERRED_DIR = bridge.LEARNING_DIR / "deferred"
+            bridge.LEARNING_PACKAGES_DIR = bridge.LEARNING_DIR / "packages"
+            bridge.LEARNING_LOGS_DIR = bridge.LEARNING_DIR / "logs"
             bridge.DECISIONS_DIR = bridge.WORKBENCH_DIR / "decisions"
             bridge.DAILY_DIR = bridge.WORKBENCH_DIR / "daily"
             bridge.ARCHIVE_DIR = bridge.WORKBENCH_DIR / "archive"
@@ -243,6 +259,14 @@ secret: {secret}
         bridge.PROJECTS_DIR = old_paths["PROJECTS_DIR"]
         bridge.EVIDENCE_DIR = old_paths["EVIDENCE_DIR"]
         bridge.RETROS_DIR = old_paths["RETROS_DIR"]
+        bridge.LEARNING_DIR = old_paths["LEARNING_DIR"]
+        bridge.LEARNING_CANDIDATES_DIR = old_paths["LEARNING_CANDIDATES_DIR"]
+        bridge.LEARNING_PROPOSALS_DIR = old_paths["LEARNING_PROPOSALS_DIR"]
+        bridge.LEARNING_REGISTRY_DIR = old_paths["LEARNING_REGISTRY_DIR"]
+        bridge.LEARNING_REJECTED_DIR = old_paths["LEARNING_REJECTED_DIR"]
+        bridge.LEARNING_DEFERRED_DIR = old_paths["LEARNING_DEFERRED_DIR"]
+        bridge.LEARNING_PACKAGES_DIR = old_paths["LEARNING_PACKAGES_DIR"]
+        bridge.LEARNING_LOGS_DIR = old_paths["LEARNING_LOGS_DIR"]
         bridge.DECISIONS_DIR = old_paths["DECISIONS_DIR"]
         bridge.DAILY_DIR = old_paths["DAILY_DIR"]
         bridge.ARCHIVE_DIR = old_paths["ARCHIVE_DIR"]

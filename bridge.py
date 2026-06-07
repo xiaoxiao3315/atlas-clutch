@@ -16,7 +16,7 @@ import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -36,6 +36,20 @@ TASKS_DIR = WORKBENCH_DIR / "tasks"
 PROJECTS_DIR = WORKBENCH_DIR / "projects"
 EVIDENCE_DIR = WORKBENCH_DIR / "evidence"
 RETROS_DIR = WORKBENCH_DIR / "retros"
+LEARNING_DIR = WORKBENCH_DIR / "learning"
+LEARNING_CANDIDATES_DIR = LEARNING_DIR / "candidates"
+LEARNING_PROPOSALS_DIR = LEARNING_DIR / "proposals"
+LEARNING_REGISTRY_DIR = LEARNING_DIR / "registry"
+LEARNING_REJECTED_DIR = LEARNING_DIR / "rejected"
+LEARNING_DEFERRED_DIR = LEARNING_DIR / "deferred"
+LEARNING_PACKAGES_DIR = LEARNING_DIR / "packages"
+LEARNING_LOGS_DIR = LEARNING_DIR / "logs"
+APPLICATIONS_DIR = WORKBENCH_DIR / "applications"
+PLAYBOOKS_DIR = WORKBENCH_DIR / "playbooks"
+PROJECT_PLAYBOOKS_DIR = PLAYBOOKS_DIR / "projects"
+CONTEXT_PACKS_DIR = WORKBENCH_DIR / "context_packs"
+DISPATCHES_DIR = WORKBENCH_DIR / "dispatches"
+PILOTS_DIR = WORKBENCH_DIR / "pilots"
 DECISIONS_DIR = WORKBENCH_DIR / "decisions"
 DAILY_DIR = WORKBENCH_DIR / "daily"
 ARCHIVE_DIR = WORKBENCH_DIR / "archive"
@@ -45,8 +59,42 @@ STARTED_AT = time.time()
 STARTED_AT_TEXT = datetime.now().astimezone().isoformat(timespec="seconds")
 OPEN_TASK_STATUSES = {"draft", "open", "reported", "reviewed", "needs_evidence"}
 DECISION_STATUSES = {"pass", "needs_evidence", "blocked", "cancelled"}
-EVIDENCE_TYPES = {"file", "command", "log", "screenshot", "ui", "live", "smoke", "report", "decision", "other"}
+EVIDENCE_TYPES = {
+    "file",
+    "command",
+    "log",
+    "api",
+    "http",
+    "process",
+    "git",
+    "screenshot",
+    "ui",
+    "live",
+    "smoke",
+    "report",
+    "decision",
+    "other",
+}
 EVIDENCE_MARK_STATUSES = {"verified", "partial", "rejected"}
+LEARNING_STATUSES = {"candidate", "proposed", "approved", "rejected", "deferred", "packaged"}
+APPLY_STATUSES = {"planned", "applied", "reverted", "cancelled"}
+DISPATCH_STATUSES = {
+    "draft",
+    "ready",
+    "sent",
+    "returned",
+    "qa_ready",
+    "reviewed",
+    "needs_evidence",
+    "failed",
+    "cancelled",
+    "closed",
+}
+PILOT_STATUSES = {"active", "completed", "paused", "cancelled"}
+APPLICATION_ENABLED = False
+RUNTIME_INJECTION_ENABLED = False
+EXTERNAL_APPLICATION_ENABLED = False
+EXTERNAL_EXECUTION_ENABLED = False
 
 LOGGER = logging.getLogger("octo-hermes-bridge")
 
@@ -558,21 +606,425 @@ def safe_preview(text: str, limit: int = 180) -> str:
 
 
 def sanitize_sensitive_text(text: str) -> str:
-    sanitized = str(text or "")
-    sanitized = re.sub(r"bf_[A-Za-z0-9._-]+", "[REDACTED_BF_TOKEN]", sanitized)
-    sanitized = re.sub(r"sk-[A-Za-z0-9._-]+", "[REDACTED_SK_KEY]", sanitized)
-    sanitized = sanitized.replace("bf_", "[REDACTED_BF_PREFIX]")
-    sanitized = sanitized.replace("sk-", "[REDACTED_SK_PREFIX]")
-    sanitized = re.sub(r"(?im)^(\s*Authorization\s*:\s*).*$", r"\1[REDACTED]", sanitized)
-    sanitized = re.sub(r"(?im)^(\s*Cookie\s*:\s*).*$", r"\1[REDACTED]", sanitized)
-    sanitized = re.sub(r"(?im)^(\s*password\s*[:=]\s*).*$", r"\1[REDACTED]", sanitized)
-    sanitized = re.sub(r"(?im)^(\s*api_key\s*[:=]\s*).*$", r"\1[REDACTED]", sanitized)
-    sanitized = re.sub(r"(?im)^(\s*secret\s*[:=]\s*).*$", r"\1[REDACTED]", sanitized)
+    lines = []
+    for raw_line in str(text or "").splitlines(keepends=True):
+        line = raw_line
+        if is_sensitive_zero_hit_line(line):
+            line = re.sub(r"(?i)Authorization\s*:", "AUTH_HEADER_CHECK:", line)
+            line = re.sub(r"(?i)Cookie\s*:", "COOKIE_CHECK:", line)
+            line = re.sub(r"(?i)bf_", "TOKEN_PREFIX_CHECK", line)
+            line = re.sub(r"(?i)sk-", "KEY_PREFIX_CHECK", line)
+        lines.append(line)
+    sanitized = "".join(lines)
+    sanitized = re.sub(r"(?i)bf_[A-Za-z0-9._-]+", "[REDACTED_TOKEN]", sanitized)
+    sanitized = re.sub(r"(?i)sk-[A-Za-z0-9._-]+", "[REDACTED_KEY]", sanitized)
+    sanitized = re.sub(r"(?i)bf_", "[REDACTED_TOKEN_PREFIX]", sanitized)
+    sanitized = re.sub(r"(?i)sk-", "[REDACTED_KEY_PREFIX]", sanitized)
+    sanitized = re.sub(r"(?im)^\s*Authorization\s*:.*$", "[REDACTED_HEADER]", sanitized)
+    sanitized = re.sub(r"(?im)^\s*Cookie\s*:.*$", "[REDACTED_COOKIE]", sanitized)
+    sanitized = re.sub(r"(?im)^\s*password\s*[:=].*$", "[REDACTED_SECRET]", sanitized)
+    sanitized = re.sub(r"(?im)^\s*api_key\s*[:=].*$", "[REDACTED_SECRET]", sanitized)
+    sanitized = re.sub(r"(?im)^\s*secret\s*[:=].*$", "[REDACTED_SECRET]", sanitized)
     return sanitized
 
 
+def is_sensitive_zero_hit_line(line: str) -> bool:
+    raw = str(line or "")
+    lowered = raw.lower()
+    has_sensitive_word = any(
+        marker in lowered
+        for marker in ("bf_", "sk-", "authorization", "cookie", "password", "api_key", "secret")
+    )
+    if not has_sensitive_word:
+        return False
+    if re.search(r"(?i)Authorization\s*:\s*(Bearer|Basic)\s+\S+", raw):
+        return False
+    if re.search(r"(?i)Cookie\s*:\s*[^:\n=]+=", raw):
+        return False
+    zero_patterns = [
+        r"[:：]\s*0\b",
+        r"\b0\s*(hit|hits|match|matches|result|results)\b",
+        r"\b(no|zero)\s+(hit|hits|match|matches|result|results)\b",
+        r"命中数\s*为\s*0",
+        r"0\s*命中",
+        r"无命中",
+        r"无结果",
+        r"未命中",
+        r"no leak",
+        r"not found",
+        r"\bnone\b",
+    ]
+    return any(re.search(pattern, raw, re.IGNORECASE) for pattern in zero_patterns)
+
+
+def is_empty_sensitive_value(value: str) -> bool:
+    cleaned = str(value or "").strip()
+    lowered = cleaned.lower()
+    if not cleaned:
+        return True
+    if cleaned in {"0", "-", "—", "无", "无命中", "无结果"}:
+        return True
+    if lowered in {"none", "n/a", "na", "not applicable", "no hits", "no results", "[redacted]"}:
+        return True
+    if re.search(r"\b0\s*(hit|hits|match|matches|result|results)\b", lowered):
+        return True
+    if any(marker in cleaned for marker in ("0 命中", "无命中", "无结果")):
+        return True
+    return False
+
+
+def detect_sensitive_findings(text: str) -> list[dict]:
+    findings: list[dict] = []
+    seen: set[tuple[str, int]] = set()
+
+    def add(line_no: int, finding: str, severity: str, reason: str, source_line: str) -> None:
+        key = (finding, line_no)
+        if key in seen:
+            return
+        seen.add(key)
+        findings.append(
+            {
+                "finding": finding,
+                "severity": severity,
+                "reason": reason,
+                "source_line": safe_preview(sanitize_sensitive_text(source_line), 180),
+            }
+        )
+
+    for line_no, line in enumerate(str(text or "").splitlines(), 1):
+        if not line.strip() or is_sensitive_zero_hit_line(line):
+            continue
+        if re.search(r"(?i)bf_[A-Za-z0-9._-]{4,}", line):
+            add(line_no, "token_like_value", "high", f"line {line_no}: token-like value", line)
+        if re.search(r"(?i)sk-[A-Za-z0-9][A-Za-z0-9._-]{7,}", line):
+            add(line_no, "key_like_value", "high", f"line {line_no}: key-like value", line)
+        auth_match = re.search(r"(?i)^\s*Authorization\s*:\s*(.*)$", line)
+        if auth_match and not is_empty_sensitive_value(auth_match.group(1)):
+            add(line_no, "auth_header_value", "high", f"line {line_no}: auth header contains a value", line)
+        cookie_match = re.search(r"(?i)^\s*Cookie\s*:\s*(.*)$", line)
+        if cookie_match and not is_empty_sensitive_value(cookie_match.group(1)):
+            add(line_no, "cookie_value", "high", f"line {line_no}: cookie header contains a value", line)
+        secret_match = re.search(r"(?i)^\s*(password|api_key|secret)\s*[:=]\s*(.*)$", line)
+        if secret_match and not is_empty_sensitive_value(secret_match.group(2)):
+            add(line_no, "secret_field_value", "high", f"line {line_no}: secret-like field contains a value", line)
+    return findings
+
+
+def report_has_read_only_marker(report: str) -> bool:
+    text = str(report or "")
+    lowered = text.lower()
+    markers = [
+        "read-only",
+        "read only",
+        "readonly",
+        "no file changes",
+        "no files changed",
+        "no files modified",
+        "no code changes",
+        "not modify",
+        "not modified",
+        "no commit",
+        "did not commit",
+        "did not read .env",
+        "只读",
+        "只读检查",
+        "只读诊断",
+        "未修改文件",
+        "未改代码",
+        "未提交",
+        "未读取 .env",
+        "无修改文件",
+    ]
+    if any(marker in lowered for marker in markers[:12]) or any(marker in text for marker in markers[12:]):
+        return True
+    return report_has_no_modification_marker(text)
+
+
+def report_has_no_modification_marker(report: str) -> bool:
+    text = str(report or "")
+    lowered = text.lower()
+    direct_markers = [
+        "modified files: none",
+        "modified files: n/a",
+        "modified files: na",
+        "modified files: no",
+        "modified files: not applicable",
+        "changed files: none",
+        "no modified files",
+        "no files modified",
+        "no files changed",
+        "no code changes",
+        "未修改文件",
+        "未改代码",
+        "无修改文件",
+        "修改文件：无",
+        "修改文件: 无",
+        "修改文件：N/A",
+        "修改文件: N/A",
+    ]
+    if any(marker in lowered for marker in direct_markers[:10]) or any(marker in text for marker in direct_markers[10:]):
+        return True
+    return bool(
+        re.search(
+            r"(?is)(modified files|changed files|files changed|修改文件|变更文件)\s*[:：]?\s*(?:\n\s*[-*]?\s*)?(none|n/a|na|no|not applicable|无|无修改|未修改)",
+            text,
+        )
+    )
+
+
+def report_has_modified_files_field(report: str) -> bool:
+    text = str(report or "")
+    lowered = text.lower()
+    return (
+        "modified files" in lowered
+        or "changed files" in lowered
+        or any(marker in text for marker in ("修改文件", "变更文件"))
+    )
+
+
+def report_has_commands_field(report: str) -> bool:
+    text = str(report or "")
+    lowered = text.lower()
+    return (
+        any(marker in lowered for marker in ("commands", "executed commands", "command:", "powershell", "cmd ", "bash ", "curl ", "invoke-restmethod", "python ", "select-string", "get-process", "get-nettcpconnection", "git "))
+        or any(marker in text for marker in ("执行命令", "命令：", "命令输出", "测试命令"))
+    )
+
+
+def report_has_test_results_field(report: str) -> bool:
+    text = str(report or "")
+    lowered = text.lower()
+    return (
+        any(marker in lowered for marker in ("test results", "tests:", "passed", "failed", "py_compile", "status: 200", "status=200", "http 200", "response contains"))
+        or any(marker in text for marker in ("测试结果", "通过", "失败", "未运行", "验证通过"))
+    )
+
+
+def report_has_logs_field(report: str) -> bool:
+    text = str(report or "")
+    lowered = text.lower()
+    return (
+        any(marker in lowered for marker in ("key logs", "logs", "screenshots", "screenshot", "gateway.log", "acp_raw.log", "request_id", "evidence"))
+        or any(marker in text for marker in ("关键日志", "截图", "日志", "输出", "证据"))
+    )
+
+
+def report_has_risks_field(report: str) -> bool:
+    text = str(report or "")
+    lowered = text.lower()
+    return (
+        any(marker in lowered for marker in ("unresolved risks", "risks", "risk:", "blockers", "blocked", "none"))
+        or any(marker in text for marker in ("未解决风险", "风险", "待补"))
+    )
+
+
+def report_has_unverified_field(report: str) -> bool:
+    text = str(report or "")
+    lowered = text.lower()
+    return (
+        any(marker in lowered for marker in ("unverified", "not verified", "not run", "not covered", "not checked", "none"))
+        or any(marker in text for marker in ("未验证", "未运行", "未覆盖", "待补", "无"))
+    )
+
+
+def detect_sensitive_zero_hit_ok(report: str) -> bool:
+    text = str(report or "")
+    lowered = text.lower()
+    if "sensitive_zero_hit_ok: true" in lowered:
+        return True
+    if any(marker in text for marker in ("AUTH_HEADER_CHECK", "COOKIE_CHECK", "TOKEN_PREFIX_CHECK", "KEY_PREFIX_CHECK")):
+        return True
+    return any(is_sensitive_zero_hit_line(line) for line in text.splitlines())
+
+
+def add_observed_item(items: list[dict], name: str, value: str, confidence: str, source_line: str) -> None:
+    safe_value = safe_preview(sanitize_sensitive_text(value), 160)
+    safe_line = safe_preview(sanitize_sensitive_text(source_line), 220)
+    candidate = {
+        "name": name,
+        "value": safe_value,
+        "confidence": confidence,
+        "source_line": safe_line,
+    }
+    if candidate not in items:
+        items.append(candidate)
+
+
+def analyze_evidence_intake(report: str, acceptance: str = "") -> dict:
+    text = str(report or "")
+    lowered = text.lower()
+    evidence_type = detect_evidence_type_from_report(text)
+    read_only_mode = report_has_read_only_marker(text)
+    no_modification_ok = bool(read_only_mode and report_has_no_modification_marker(text))
+    sensitive_findings = detect_sensitive_findings(text)
+    sensitive_risk = bool(sensitive_findings)
+    sensitive_zero_hit_ok = detect_sensitive_zero_hit_ok(text)
+    observed_items: list[dict] = []
+
+    for line in text.splitlines():
+        lowered_line = line.lower()
+        if "/v1/chat/completions" in lowered_line:
+            add_observed_item(observed_items, "api_endpoint", "/v1/chat/completions", "high", line)
+        status_match = re.search(r"(?i)(?:http\s*)?status\s*[:=]?\s*(\d{3})", line)
+        if status_match:
+            add_observed_item(observed_items, "http_status", status_match.group(1), "high", line)
+        response_match = re.search(r"(?i)response\s+contains\s+([A-Za-z0-9._:-]+)", line)
+        if response_match:
+            add_observed_item(observed_items, "response_contains", response_match.group(1), "high", line)
+        request_match = re.search(r"\b(req_[A-Za-z0-9._-]+)\b", line)
+        if request_match:
+            add_observed_item(observed_items, "request_id", request_match.group(1), "high", line)
+        if "gateway.log" in lowered_line:
+            add_observed_item(observed_items, "gateway_log", "mentioned", "medium", line)
+        if "acp_raw.log" in lowered_line:
+            add_observed_item(observed_items, "acp_raw_log", "mentioned", "medium", line)
+        if re.search(r"(?i)\bpython\s+smoke_[A-Za-z0-9_-]+\.py\b", line):
+            add_observed_item(observed_items, "smoke_command", line.strip(), "high", line)
+        if re.search(r"(?i)\bPID\b|\bGet-Process\b|\bGet-NetTCPConnection\b", line):
+            add_observed_item(observed_items, "process_check", line.strip(), "medium", line)
+        if re.search(r"(?i)\bgit\s+(status|branch)\b", line):
+            add_observed_item(observed_items, "git_check", line.strip(), "medium", line)
+        if any(marker in lowered_line for marker in ("octo ui", "screenshot")) or any(marker in line for marker in ("截图",)):
+            add_observed_item(observed_items, "ui_evidence", line.strip(), "medium", line)
+        if is_sensitive_zero_hit_line(line):
+            add_observed_item(observed_items, "sensitive_zero_hit", line.strip(), "medium", line)
+
+    if no_modification_ok:
+        add_observed_item(observed_items, "modified_files", "not_applicable_read_only", "high", "read-only report says no files were modified")
+
+    modified_ok = report_has_modified_files_field(text) or no_modification_ok
+    commands_ok = report_has_commands_field(text)
+    tests_ok = report_has_test_results_field(text)
+    logs_ok = report_has_logs_field(text)
+    risks_ok = report_has_risks_field(text)
+    unverified_ok = report_has_unverified_field(text)
+    supports_acceptance = bool(text.strip()) and (
+        evidence_markers_present(text)
+        or bool(str(acceptance or "").strip())
+        or bool(observed_items)
+    )
+
+    missing_items = []
+    checks = [
+        ("modified_files", modified_ok, "return report should list changed files or state none/not applicable for read-only work"),
+        ("commands", commands_ok, "return report should include commands/checks performed"),
+        ("test_results", tests_ok, "return report should include test or validation results"),
+        ("key_logs_or_screenshots", logs_ok, "return report should include logs, screenshots, request ids, or equivalent evidence"),
+        ("unverified", unverified_ok, "return report should state what remains unverified, even if none"),
+        ("unresolved_risks", risks_ok, "return report should state unresolved risks, even if none"),
+        ("acceptance_support", supports_acceptance, "return report should contain observable support for acceptance criteria"),
+    ]
+    for item, ok, reason in checks:
+        if not ok:
+            missing_items.append({"item": item, "reason": reason})
+
+    live_skipped = detect_live_skipped(text)
+    if sensitive_risk:
+        recommendation = "blocked"
+    elif not text.strip():
+        recommendation = "blocked"
+    elif live_skipped or missing_items:
+        recommendation = "needs_evidence"
+    else:
+        recommendation = "pass_candidate"
+
+    return {
+        "evidence_type": evidence_type,
+        "observed_items": observed_items,
+        "missing_items": missing_items,
+        "read_only_mode": read_only_mode,
+        "no_modification_ok": no_modification_ok,
+        "sensitive_risk": sensitive_risk,
+        "sensitive_risk_reason": "actual sensitive-looking value found" if sensitive_risk else ("zero-hit checks only" if sensitive_zero_hit_ok else "none"),
+        "sensitive_findings": sensitive_findings,
+        "sensitive_zero_hit_ok": sensitive_zero_hit_ok,
+        "recommendation": recommendation,
+        "live_skipped": live_skipped,
+    }
+
+
+def format_intake_summary(intake: dict) -> str:
+    observed = intake.get("observed_items", [])
+    missing = intake.get("missing_items", [])
+    findings = intake.get("sensitive_findings", [])
+    observed_lines = [
+        f"- {item.get('name')}: {item.get('value')} | confidence={item.get('confidence')} | source={item.get('source_line')}"
+        for item in observed[:12]
+    ] or ["- none"]
+    missing_lines = [
+        f"- {item.get('item')}: {item.get('reason')}"
+        for item in missing[:12]
+    ] or ["- none"]
+    finding_lines = [
+        f"- {item.get('finding')} | severity={item.get('severity')} | reason={item.get('reason')} | source={item.get('source_line')}"
+        for item in findings[:8]
+    ] or ["- none"]
+    return f"""Auto Evidence Intake
+evidence_type: {intake.get('evidence_type', 'report')}
+read_only_mode: {str(bool(intake.get('read_only_mode'))).lower()}
+no_modification_ok: {str(bool(intake.get('no_modification_ok'))).lower()}
+sensitive_risk: {str(bool(intake.get('sensitive_risk'))).lower()}
+sensitive_risk_reason: {intake.get('sensitive_risk_reason', 'none')}
+sensitive_zero_hit_ok: {str(bool(intake.get('sensitive_zero_hit_ok'))).lower()}
+recommendation: {intake.get('recommendation', 'needs_evidence')}
+
+observed_items:
+{chr(10).join(observed_lines)}
+
+missing_items:
+{chr(10).join(missing_lines)}
+
+sensitive_findings:
+{chr(10).join(finding_lines)}"""
+
+
+def build_auto_evidence_body(report: str, intake: dict) -> str:
+    clean_report = sanitize_sensitive_text(report).strip() or "- empty report"
+    return f"""{clean_report}
+
+## Auto Evidence Summary
+{format_intake_summary(intake)}
+"""
+
+
 def ensure_workbench_dirs() -> None:
-    for path in (WORKBENCH_DIR, TASKS_DIR, PROJECTS_DIR, EVIDENCE_DIR, RETROS_DIR, DECISIONS_DIR, DAILY_DIR, ARCHIVE_DIR):
+    global APPLICATIONS_DIR, PLAYBOOKS_DIR, PROJECT_PLAYBOOKS_DIR, CONTEXT_PACKS_DIR, DISPATCHES_DIR, PILOTS_DIR
+    if WORKBENCH_DIR.resolve() not in APPLICATIONS_DIR.resolve().parents:
+        APPLICATIONS_DIR = WORKBENCH_DIR / "applications"
+    if WORKBENCH_DIR.resolve() not in PLAYBOOKS_DIR.resolve().parents:
+        PLAYBOOKS_DIR = WORKBENCH_DIR / "playbooks"
+    if PLAYBOOKS_DIR.resolve() not in PROJECT_PLAYBOOKS_DIR.resolve().parents:
+        PROJECT_PLAYBOOKS_DIR = PLAYBOOKS_DIR / "projects"
+    if WORKBENCH_DIR.resolve() not in CONTEXT_PACKS_DIR.resolve().parents:
+        CONTEXT_PACKS_DIR = WORKBENCH_DIR / "context_packs"
+    if WORKBENCH_DIR.resolve() not in DISPATCHES_DIR.resolve().parents:
+        DISPATCHES_DIR = WORKBENCH_DIR / "dispatches"
+    if WORKBENCH_DIR.resolve() not in PILOTS_DIR.resolve().parents:
+        PILOTS_DIR = WORKBENCH_DIR / "pilots"
+    for path in (
+        WORKBENCH_DIR,
+        TASKS_DIR,
+        PROJECTS_DIR,
+        EVIDENCE_DIR,
+        RETROS_DIR,
+        LEARNING_DIR,
+        LEARNING_CANDIDATES_DIR,
+        LEARNING_PROPOSALS_DIR,
+        LEARNING_REGISTRY_DIR,
+        LEARNING_REJECTED_DIR,
+        LEARNING_DEFERRED_DIR,
+        LEARNING_PACKAGES_DIR,
+        LEARNING_LOGS_DIR,
+        APPLICATIONS_DIR,
+        PLAYBOOKS_DIR,
+        PROJECT_PLAYBOOKS_DIR,
+        CONTEXT_PACKS_DIR,
+        DISPATCHES_DIR,
+        PILOTS_DIR,
+        DECISIONS_DIR,
+        DAILY_DIR,
+        ARCHIVE_DIR,
+    ):
         path.mkdir(exist_ok=True)
 
 
@@ -581,6 +1033,14 @@ def ensure_inside_workbench(path: Path) -> Path:
     base = WORKBENCH_DIR.resolve()
     if resolved != base and base not in resolved.parents:
         raise ValueError(f"refusing to write outside workbench: {path}")
+    return resolved
+
+
+def ensure_inside_playbooks(path: Path) -> Path:
+    resolved = ensure_inside_workbench(path)
+    base = PLAYBOOKS_DIR.resolve()
+    if resolved != base and base not in resolved.parents:
+        raise ValueError(f"refusing to write outside workbench/playbooks: {path}")
     return resolved
 
 
@@ -609,6 +1069,86 @@ def evidence_path(task_id: str) -> Path:
 def retro_path(task_id: str) -> Path:
     ensure_workbench_dirs()
     return ensure_inside_workbench(RETROS_DIR / f"{normalize_task_id(task_id)}.md")
+
+
+def normalize_learn_id(learn_id: str) -> str:
+    value = str(learn_id or "").strip()
+    if not re.fullmatch(r"LEARN-\d{8}-\d{6}(?:-\d{2})?", value):
+        raise ValueError("invalid learn_id")
+    return value
+
+
+def proposal_path(learn_id: str) -> Path:
+    ensure_workbench_dirs()
+    return ensure_inside_workbench(LEARNING_PROPOSALS_DIR / f"{normalize_learn_id(learn_id)}.md")
+
+
+def registry_path(learn_id: str) -> Path:
+    ensure_workbench_dirs()
+    return ensure_inside_workbench(LEARNING_REGISTRY_DIR / f"{normalize_learn_id(learn_id)}.md")
+
+
+def package_path(learn_id: str) -> Path:
+    ensure_workbench_dirs()
+    return ensure_inside_workbench(LEARNING_PACKAGES_DIR / f"{normalize_learn_id(learn_id)}.md")
+
+
+def normalize_apply_id(apply_id: str) -> str:
+    value = str(apply_id or "").strip()
+    if not re.fullmatch(r"APPLY-\d{8}-\d{6}(?:-\d{2})?", value):
+        raise ValueError("invalid apply_id")
+    return value
+
+
+def normalize_context_id(context_id: str) -> str:
+    value = str(context_id or "").strip()
+    if not re.fullmatch(r"CTX-\d{8}-\d{6}(?:-\d{2})?", value):
+        raise ValueError("invalid context_id")
+    return value
+
+
+def normalize_dispatch_id(dispatch_id: str) -> str:
+    value = str(dispatch_id or "").strip()
+    if not re.fullmatch(r"DISPATCH-\d{8}-\d{6}(?:-\d{2})?", value):
+        raise ValueError("invalid dispatch_id")
+    return value
+
+
+def normalize_pilot_id(pilot_id: str) -> str:
+    value = str(pilot_id or "").strip()
+    if not re.fullmatch(r"PILOT-\d{8}-\d{6}(?:-\d{2})?", value):
+        raise ValueError("invalid pilot_id")
+    return value
+
+
+def application_path(apply_id: str) -> Path:
+    ensure_workbench_dirs()
+    return ensure_inside_workbench(APPLICATIONS_DIR / f"{normalize_apply_id(apply_id)}.md")
+
+
+def context_pack_path(context_id: str) -> Path:
+    ensure_workbench_dirs()
+    return ensure_inside_workbench(CONTEXT_PACKS_DIR / f"{normalize_context_id(context_id)}.md")
+
+
+def dispatch_path(dispatch_id: str) -> Path:
+    ensure_workbench_dirs()
+    return ensure_inside_workbench(DISPATCHES_DIR / f"{normalize_dispatch_id(dispatch_id)}.md")
+
+
+def pilot_path(pilot_id: str) -> Path:
+    ensure_workbench_dirs()
+    return ensure_inside_workbench(PILOTS_DIR / f"{normalize_pilot_id(pilot_id)}.md")
+
+
+def global_playbook_path() -> Path:
+    ensure_workbench_dirs()
+    return ensure_inside_playbooks(PLAYBOOKS_DIR / "atlas_workbench_playbook.md")
+
+
+def project_playbook_path(project_id: str) -> Path:
+    ensure_workbench_dirs()
+    return ensure_inside_playbooks(PROJECT_PLAYBOOKS_DIR / f"{validate_project_id(project_id)}.md")
 
 
 def normalize_evidence_id(evidence_id: str) -> str:
@@ -961,6 +1501,18 @@ def report_has_claim(text: str) -> bool:
 
 def detect_evidence_type_from_report(report: str) -> str:
     value = str(report or "").lower()
+    if "/v1/chat/completions" in value and (
+        "status" in value or "response contains" in value or "http" in value
+    ):
+        return "api"
+    if any(marker in value for marker in ("gateway.log", "acp_raw.log", "request_id")):
+        return "log"
+    if any(marker in value for marker in ("pid", "get-process", "get-nettcpconnection")):
+        return "process"
+    if any(marker in value for marker in ("git status", "git branch")):
+        return "git"
+    if any(marker in value for marker in ("http status", "status: 200", "status=200", "http 200")):
+        return "http"
     if "smoke" in value or "smoke_" in value or "smoke 测试" in str(report or ""):
         return "smoke"
     if "live" in value or "octo ui" in value:
@@ -975,7 +1527,7 @@ def detect_evidence_type_from_report(report: str) -> str:
 
 
 def evidence_support_state(body: str, evidence_type: str) -> str:
-    if evidence_markers_present(body) or evidence_type in {"file", "command", "log", "screenshot", "ui", "live", "smoke"}:
+    if evidence_markers_present(body) or evidence_type in {"file", "command", "log", "api", "http", "process", "git", "screenshot", "ui", "live", "smoke"}:
         return "observed"
     if report_has_claim(body):
         return "claimed"
@@ -1078,6 +1630,29 @@ def required_evidence_missing(combined_text: str, has_report_or_evidence: bool) 
     if not has_report_or_evidence:
         return ["Execution Report 或 Evidence Ledger"]
     text = str(combined_text or "")
+    intake = analyze_evidence_intake(text)
+    label_map = {
+        "modified_files": "ä¿®æ”¹æ–‡ä»¶",
+        "commands": "æ‰§è¡Œå‘½ä»¤",
+        "test_results": "æµ‹è¯•ç»“æžœ",
+        "key_logs_or_screenshots": "å…³é”®æ—¥å¿—æˆ–æˆªå›¾",
+        "unresolved_risks": "æœªè§£å†³é£Žé™©",
+        "unverified": "æœªéªŒè¯è¯´æ˜Ž",
+        "acceptance_support": "æ”¯æ’‘éªŒæ”¶æ ‡å‡†",
+    }
+    label_map = {
+        "modified_files": "modified_files",
+        "commands": "commands",
+        "test_results": "test_results",
+        "key_logs_or_screenshots": "key_logs_or_screenshots",
+        "unresolved_risks": "unresolved_risks",
+        "unverified": "unverified",
+        "acceptance_support": "acceptance_support",
+    }
+    missing = [label_map.get(item.get("item", ""), item.get("item", "unknown")) for item in intake["missing_items"]]
+    if intake["sensitive_risk"]:
+        missing.append("sensitive_risk")
+    return [item for item in missing if item]
     lowered = text.lower()
     checks = [
         ("修改文件", any(marker in text for marker in ("修改文件", "文件：", ".py", ".md", ".json", ".cmd")) or "modified files" in lowered),
@@ -1099,6 +1674,7 @@ def evidence_analysis(task_id: str, text: str | None = None) -> dict:
         for record in records
     )
     combined = "\n".join([report, evidence_blob])
+    intake = analyze_evidence_intake(combined)
     has_report = bool(report.strip()) and "尚未回传" not in report
     has_evidence = bool(records)
     claimed = []
@@ -1163,6 +1739,9 @@ def evidence_analysis(task_id: str, text: str | None = None) -> dict:
         "evidence_ids": [record["evidence_id"] for record in records],
         "evidence_gap_count": len(missing) + (0 if verified_records else 1),
         "has_gaps": bool(missing or risks or not verified_records),
+        "intake": intake,
+        "read_only_no_modification_ok": bool(intake.get("read_only_mode") and intake.get("no_modification_ok")),
+        "sensitive_zero_hit_ok": bool(intake.get("sensitive_zero_hit_ok")),
     }
 
 
@@ -1175,6 +1754,8 @@ def build_evidence_gaps_text(task_id: str, analysis: dict | None = None) -> str:
     ] or ["- 无。"]
     missing_lines = [f"- {item}" for item in data["missing"]] or ["- 无。"]
     risk_lines = [f"- {item}" for item in data["risks"]] or ["- 无。"]
+    remaining_gaps = "none" if not data["missing"] and not data["risks"] and data["verified"] else ", ".join(data["missing"] or data["risks"])
+    gap_recommendation = "ready_for_review" if remaining_gaps == "none" else data.get("recommendation", "needs_evidence")
     next_step = "补充 evidence 或 mark verified 后再 review。"
     if data["live_skipped"]:
         next_step = "补 Octo UI live 验收证据；当前只能写本地通过，live 待补。"
@@ -1193,6 +1774,11 @@ missing：
 
 风险：
 {chr(10).join(risk_lines)}
+
+read_only_no_modification_ok: {str(bool(data.get('read_only_no_modification_ok'))).lower()}
+sensitive_zero_hit_ok: {str(bool(data.get('sensitive_zero_hit_ok'))).lower()}
+remaining_gaps: {remaining_gaps}
+recommendation: {gap_recommendation}
 
 下一步需要补：
 - {next_step}"""
@@ -1375,6 +1961,21 @@ def workbench_counts() -> dict:
         "active_projects": 0,
         "paused_projects": 0,
         "archived_projects": 0,
+        "learning_proposals": 0,
+        "learning_approved": 0,
+        "learning_not_applied": 0,
+        "apply_plans": 0,
+        "playbook_entries": 0,
+        "applied_to_workbench_playbook": 0,
+        "context_pack_count": 0,
+        "latest_context_id": "",
+        "dispatch_count": 0,
+        "dispatch_sent": 0,
+        "dispatch_returned": 0,
+        "dispatch_needs_evidence": 0,
+        "dispatch_ready_count": 0,
+        "dispatch_failed_count": 0,
+        "dispatch_stale_count": 0,
     }
     records = task_records()
     if records:
@@ -1395,6 +1996,25 @@ def workbench_counts() -> dict:
             counts["paused_projects"] += 1
         if status == "archived":
             counts["archived_projects"] += 1
+    learn_counts = learning_counts()
+    counts["learning_proposals"] = learn_counts["learning_proposals"]
+    counts["learning_approved"] = learn_counts["learning_approved"]
+    counts["learning_not_applied"] = learn_counts["learning_not_applied"]
+    apply_view = apply_counts()
+    counts["apply_plans"] = apply_view["apply_plans"]
+    counts["playbook_entries"] = apply_view["playbook_entries"]
+    counts["applied_to_workbench_playbook"] = apply_view["applied_to_workbench_playbook"]
+    context_view = context_counts()
+    counts["context_pack_count"] = context_view["context_pack_count"]
+    counts["latest_context_id"] = context_view["latest_context_id"]
+    dispatch_view = dispatch_counts()
+    counts["dispatch_count"] = dispatch_view["dispatch_count"]
+    counts["dispatch_sent"] = dispatch_view["dispatch_sent_count"]
+    counts["dispatch_returned"] = dispatch_view["dispatch_returned_count"]
+    counts["dispatch_needs_evidence"] = dispatch_view["dispatch_needs_evidence_count"]
+    counts["dispatch_ready_count"] = dispatch_view["dispatch_ready_count"]
+    counts["dispatch_failed_count"] = dispatch_view["dispatch_failed_count"]
+    counts["dispatch_stale_count"] = dispatch_view["dispatch_stale_count"]
     return counts
 
 
@@ -1406,6 +2026,7 @@ def build_task_help_reply() -> str:
 - /task list：列出最近 10 个任务。
 - /task show <task_id>：查看任务摘要、状态和下一步。
 - /task handoff <task_id> codex|kiro：生成可复制给执行端的标准交接包。
+- /task handoff <task_id> codex|kiro --with-context：追加 Context Pack 摘要和 Playbook Advisory。
 - /task report <task_id>：下一行粘贴 Codex/Kiro 回传报告，状态改为 reported。
 - /task qa <task_id>：检查回传报告是否满足最小证据要求，不替代 Atlas 审查。
 - /task review <task_id>：读取任务与回传报告，生成 Atlas 审查。
@@ -1414,6 +2035,30 @@ def build_task_help_reply() -> str:
 - /task close <task_id>：仅 passed/cancelled 可关闭，状态改为 archived。
 - /evidence add/list/show/mark/gaps：维护任务证据链。
 - /daily brief：汇总今日 open/reported/reviewed/needs_evidence 任务。"""
+
+
+def build_task_help_reply() -> str:
+    return """Atlas task ledger commands
+- /task help: show this help.
+- /task new <title>: create a work order in workbench only; no execution.
+- /task new <title> --project <project_id>: create and attach to a project.
+- /task list: list recent tasks.
+- /task show <task_id>: show task summary, latest dispatch, status, and next step.
+- /task handoff <task_id> codex|kiro [--with-context]: copy-only executor handoff.
+- /dispatch create <task_id> codex|kiro [--with-context]: create a manual dispatch record.
+- /dispatch package <dispatch_id>: show copy-only execution package.
+- /dispatch mark <dispatch_id> sent <note>: record manual send.
+- /dispatch receive <dispatch_id>: paste return report and sync the task report.
+- /dispatch qa <dispatch_id>: QA the returned report.
+- /dispatch link-review <dispatch_id>: link task review status.
+- /task report <task_id>: paste Codex/Kiro return report; status becomes reported.
+- /task qa <task_id>: check minimum report evidence; does not replace Atlas review.
+- /task review <task_id>: generate Atlas review.
+- /task next <task_id>: recommend the next manual step.
+- /task decide <task_id> <pass|needs_evidence|blocked|cancelled> <note>: record user decision.
+- /task close <task_id>: close only after passed/cancelled.
+- /evidence add/list/show/mark/gaps: maintain evidence chain.
+- /daily brief: summarize today's active task loop."""
 
 
 def parse_task_new_tail(tail: str) -> tuple[str, str]:
@@ -1464,6 +2109,33 @@ def build_task_list_reply() -> str:
     return "\n".join(lines)
 
 
+def build_task_next_advice(task_id: str, status: str, latest_dispatch: dict | None = None) -> str:
+    dispatch = latest_dispatch if latest_dispatch is not None else latest_dispatch_for_task(task_id)
+    if not dispatch:
+        return f"create manual dispatch: /dispatch create {task_id} codex --with-context"
+    dispatch_id = dispatch.get("dispatch_id", "")
+    dispatch_status_value = dispatch.get("status", "unknown")
+    if dispatch_status_value == "ready":
+        return f"package and manually copy: /dispatch package {dispatch_id}; then /dispatch mark {dispatch_id} sent <note>"
+    if dispatch_status_value == "sent":
+        return f"wait for manual return; when available use /dispatch receive {dispatch_id}"
+    if dispatch_status_value == "returned":
+        return f"run /dispatch qa {dispatch_id}, then /task review {task_id}"
+    if dispatch_status_value == "qa_ready":
+        return f"run /task review {task_id}, then /dispatch link-review {dispatch_id}"
+    if dispatch_status_value == "needs_evidence":
+        return f"supply more report evidence with /dispatch receive {dispatch_id} or create a new dispatch"
+    if dispatch_status_value == "reviewed":
+        return f"record decision: /task decide {task_id} pass|needs_evidence|blocked|cancelled <note>"
+    if dispatch_status_value in {"failed", "cancelled"}:
+        return f"inspect failed/cancelled dispatch {dispatch_id}; create a new dispatch if the task remains active"
+    if dispatch_status_value == "closed":
+        if status in {"passed", "cancelled", "archived"}:
+            return "task/dispatch are closed or ready to close"
+        return f"dispatch is closed; create a new manual dispatch if task status remains {status}"
+    return "status unknown; inspect /task show and /dispatch show first"
+
+
 def build_task_show_reply(task_id: str) -> str:
     text = read_task(task_id)
     meta = task_metadata(text)
@@ -1494,9 +2166,42 @@ def build_task_show_reply(task_id: str) -> str:
 - 下一步：{next_step}"""
 
 
+def build_task_show_reply(task_id: str) -> str:
+    text = read_task(task_id)
+    meta = task_metadata(text)
+    normalized_task_id = normalize_task_id(task_id)
+    latest_dispatch = latest_dispatch_for_task(normalized_task_id)
+    goal = safe_preview(task_section(text, "Goal"), 220) or "not filled"
+    review = safe_preview(task_section(text, "Atlas Review"), 220)
+    decision = safe_preview(task_section(text, "User Decision"), 220)
+    status = meta.get("status", "unknown")
+    project_id = meta.get("project_id", "").strip()
+    next_step = build_task_next_advice(normalized_task_id, status, latest_dispatch)
+    dispatch_id = latest_dispatch.get("dispatch_id") if latest_dispatch else "none"
+    dispatch_status = latest_dispatch.get("status") if latest_dispatch else "none"
+    target_executor = latest_dispatch.get("target_executor") if latest_dispatch else "none"
+    project_line = f"- project: {project_id}\n- project：{project_id}\n" if project_id else ""
+    legacy_next = "等待 Codex/Kiro 回传报告" if status == "open" else next_step
+    return f"""任务摘要 / Task summary: {normalized_task_id}
+- status: {status}
+- status：{status}
+- title: {task_title_from_text(normalized_task_id, text)}
+{project_line}- updated_at: {meta.get('updated_at', '')}
+- latest_dispatch_id: {dispatch_id}
+- dispatch_status: {dispatch_status}
+- target_executor: {target_executor}
+- goal: {goal}
+- atlas_review: {review or 'not reviewed'}
+- user_decision: {decision or 'not decided'}
+- next: {next_step}
+- 下一步：{legacy_next}
+- safety: Atlas/Bridge records the manual workflow only; it does not execute commands or call Codex/Kiro."""
+
+
 def build_task_report_reply(task_id: str, report: str) -> str:
     normalized_task_id = normalize_task_id(task_id)
     text = read_task(normalized_task_id)
+    intake = analyze_evidence_intake(report, task_section(text, "Acceptance Criteria"))
     clean_report = sanitize_sensitive_text(report).strip() or "- 空报告：需要补充执行证据。"
     now = iso_now()
     addition = f"### Report at {now}\n{clean_report}"
@@ -1505,11 +2210,12 @@ def build_task_report_reply(task_id: str, report: str) -> str:
     text = append_to_section(text, "Timeline", f"- {now} report appended; status reported.")
     text = update_task_status(text, "reported")
     write_task(normalized_task_id, text)
-    evidence_type = detect_evidence_type_from_report(clean_report)
+    evidence_type = intake["evidence_type"]
+    evidence_body = build_auto_evidence_body(report, intake)
     evidence_id = create_evidence_entry(
         normalized_task_id,
         evidence_type,
-        clean_report,
+        evidence_body,
         source="user",
         verified="no",
         sync_task=False,
@@ -1522,6 +2228,10 @@ def build_task_report_reply(task_id: str, report: str) -> str:
 - status：reported
 - 已追加到：workbench/tasks/{normalized_task_id}.md
 - 自动证据：{evidence_id} type={evidence_type} verified=no
+- auto_intake_recommendation: {intake['recommendation']}
+- read_only_mode: {str(bool(intake['read_only_mode'])).lower()}
+- no_modification_ok: {str(bool(intake['no_modification_ok'])).lower()}
+- sensitive_risk: {str(bool(intake['sensitive_risk'])).lower()}
 {gap_line}
 {live_line}
 - 下一步：发送 /task qa {normalized_task_id}，再发送 /task review {normalized_task_id}"""
@@ -1662,9 +2372,11 @@ def task_status(task_id: str) -> str:
 
 
 def build_task_handoff_reply(task_id: str, platform: str) -> str:
-    target = platform.strip().lower()
+    platform_parts = platform.strip().lower().split()
+    with_context = "--with-context" in platform_parts
+    target = " ".join(part for part in platform_parts if part != "--with-context").strip()
     if target not in {"codex", "kiro"}:
-        return "用法：/task handoff <task_id> codex|kiro"
+        return "用法：/task handoff <task_id> codex|kiro [--with-context]"
     text = read_task(task_id)
     title = task_title_from_text(task_id, text)
     display_platform = "Codex" if target == "codex" else "Kiro"
@@ -1674,7 +2386,7 @@ def build_task_handoff_reply(task_id: str, platform: str) -> str:
     acceptance = task_section(text, "Acceptance Criteria") or "- 未填写。"
     risks = task_section(text, "Risks") or "- 未填写。"
     evidence_required = task_section(text, "Evidence Required") or "- 未填写。"
-    return sanitize_sensitive_text(f"""# {display_platform} 执行交接包
+    reply = sanitize_sensitive_text(f"""# {display_platform} 执行交接包
 
 执行对象：{display_platform}
 task_id：{task_id}
@@ -1751,23 +2463,22 @@ task_id：{task_id}
 
 ## 证据要求
 {evidence_required}""")
+    if with_context:
+        reply += "\n\n" + build_copyable_handoff_context(task_id, target, create_file=False)
+    return reply
 
 
 def qa_report_items(report: str, acceptance: str) -> dict:
-    clean_report = sanitize_sensitive_text(report)
-    raw_sensitive = report != clean_report or any(
-        marker in report for marker in ("Authorization:", "Cookie:", "password:", "api_key:", "secret:")
-    )
-    lowered_report = report.lower()
+    intake = analyze_evidence_intake(report, acceptance)
     checks = {
-        "修改文件": any(marker in report for marker in ("修改文件", "文件：", ".py", ".md", ".ts", ".tsx", ".js", ".json")) or "modified files" in lowered_report,
-        "执行命令": any(marker in report for marker in ("执行命令", "命令：", "python ", "npm ", "pnpm ", "git ", "测试命令")) or any(marker in lowered_report for marker in ("commands", "executed commands")),
-        "测试结果": any(marker in report for marker in ("测试结果", "通过", "失败", "未运行", "OK", "pass")) or any(marker in lowered_report for marker in ("test results", "tests", "passed", "failed")),
-        "关键日志或截图": any(marker in report for marker in ("关键日志", "截图", "日志", "输出", "证据")) or any(marker in lowered_report for marker in ("logs", "screenshots", "evidence")),
-        "未解决风险": any(marker in report for marker in ("未解决风险", "风险", "blocked", "未完成")) or any(marker in lowered_report for marker in ("unresolved risks", "risks", "blockers")),
-        "未验证说明": any(marker in report for marker in ("未验证", "未运行", "未覆盖", "待补", "无法验证")) or any(marker in lowered_report for marker in ("unverified", "not verified", "not run")),
-        "敏感信息风险": not raw_sensitive,
-        "支撑验收标准": bool(report.strip()) and (evidence_markers_present(report) or bool(acceptance.strip())),
+        "修改文件": not any(item.get("item") == "modified_files" for item in intake["missing_items"]),
+        "执行命令": not any(item.get("item") == "commands" for item in intake["missing_items"]),
+        "测试结果": not any(item.get("item") == "test_results" for item in intake["missing_items"]),
+        "关键日志或截图": not any(item.get("item") == "key_logs_or_screenshots" for item in intake["missing_items"]),
+        "未解决风险": not any(item.get("item") == "unresolved_risks" for item in intake["missing_items"]),
+        "未验证说明": not any(item.get("item") == "unverified" for item in intake["missing_items"]),
+        "敏感信息风险": not intake["sensitive_risk"],
+        "支撑验收标准": not any(item.get("item") == "acceptance_support" for item in intake["missing_items"]),
     }
     return checks
 
@@ -1779,6 +2490,7 @@ def build_task_qa_reply(task_id: str) -> str:
     report = task_section(text, "Execution Report")
     acceptance = task_section(text, "Acceptance Criteria")
     has_report = bool(report.strip()) and "### Report at" in report
+    intake = analyze_evidence_intake(report, acceptance) if has_report else analyze_evidence_intake("")
     checks = qa_report_items(report, acceptance) if has_report else {
         "修改文件": False,
         "执行命令": False,
@@ -1790,6 +2502,8 @@ def build_task_qa_reply(task_id: str) -> str:
         "支撑验收标准": False,
     }
     analysis = evidence_analysis(normalized_task_id, text)
+    if has_report:
+        intake = analysis.get("intake", intake)
 
     required = ["修改文件", "执行命令", "测试结果", "关键日志或截图", "未解决风险", "未验证说明", "支撑验收标准"]
     satisfied = [name for name, ok in checks.items() if ok]
@@ -1804,11 +2518,21 @@ def build_task_qa_reply(task_id: str) -> str:
     if analysis["live_skipped"]:
         risks.append("live UI 验收跳过，不能完整封板。")
 
-    conclusion = "pass" if has_report and not missing and checks.get("敏感信息风险") and not analysis["live_skipped"] else "needs_evidence"
-    recommended = "pass" if conclusion == "pass" else ("blocked" if not has_report else "needs_evidence")
+    if not has_report:
+        conclusion = "needs_evidence"
+        recommended = "blocked"
+    elif intake.get("sensitive_risk"):
+        conclusion = "needs_evidence"
+        recommended = "blocked"
+    elif missing or analysis["live_skipped"]:
+        conclusion = "needs_evidence"
+        recommended = "needs_evidence"
+    else:
+        conclusion = "pass_candidate"
+        recommended = "pass_candidate"
     next_step = (
         f"建议继续 /task review {normalized_task_id}，再由用户按 review 结论决策。"
-        if conclusion == "pass"
+        if conclusion == "pass_candidate"
         else f"建议补齐缺失项后重新 /task report {normalized_task_id}，或 /evidence add {normalized_task_id} <type>。"
     )
     claimed_lines = [f"- {item}" for item in analysis["claimed"]] or ["- 无。"]
@@ -1831,6 +2555,17 @@ missing：
 {chr(10).join(chain_missing_lines)}
 
 sensitive_risk：{str(not checks.get('敏感信息风险')).lower()}
+sensitive_risk: {str(bool(intake.get('sensitive_risk'))).lower()}
+sensitive_risk_reason: {intake.get('sensitive_risk_reason', 'none')}
+read_only_mode: {str(bool(intake.get('read_only_mode'))).lower()}
+no_modification_ok: {str(bool(intake.get('no_modification_ok'))).lower()}
+evidence_type: {intake.get('evidence_type', 'report')}
+
+intake_observed_items:
+{chr(10).join('- ' + item.get('name', 'unknown') + ': ' + item.get('value', '') for item in intake.get('observed_items', [])[:8]) if intake.get('observed_items') else '- none'}
+
+intake_missing_items:
+{chr(10).join('- ' + item.get('item', 'unknown') + ': ' + item.get('reason', '') for item in intake.get('missing_items', [])[:8]) if intake.get('missing_items') else '- none'}
 
 已满足项：
 {chr(10).join('- ' + item for item in satisfied) if satisfied else '- 无'}
@@ -1845,6 +2580,7 @@ sensitive_risk：{str(not checks.get('敏感信息风险')).lower()}
 - {next_step}
 
 recommendation：{recommended}
+recommendation: {recommended}
 推荐决策：{recommended}
 
 说明：
@@ -1874,6 +2610,40 @@ def build_task_next_reply(task_id: str) -> str:
 - 安全边界：Atlas/Bridge 不执行命令，不自动调用 Codex/Kiro。"""
 
 
+def build_task_next_reply(task_id: str) -> str:
+    normalized_task_id = normalize_task_id(task_id)
+    text = read_task(normalized_task_id)
+    status = task_metadata(text).get("status", "unknown")
+    latest_dispatch = latest_dispatch_for_task(normalized_task_id)
+    dispatch_line = "- latest_dispatch_id: none\n- dispatch_status: none\n- target_executor: none"
+    if latest_dispatch:
+        dispatch_line = (
+            f"- latest_dispatch_id: {latest_dispatch.get('dispatch_id')}\n"
+            f"- dispatch_status: {latest_dispatch.get('status')}\n"
+            f"- target_executor: {latest_dispatch.get('target_executor')}"
+        )
+    advice = build_task_next_advice(normalized_task_id, status, latest_dispatch)
+    legacy_map = {
+        "open": f"建议生成交接包：/task handoff {normalized_task_id} codex 或 /task handoff {normalized_task_id} kiro。",
+        "reported": f"建议先质检再审查：/task qa {normalized_task_id}，然后 /task review {normalized_task_id}。",
+        "reviewed": f"建议记录用户决策：/task decide {normalized_task_id} pass|needs_evidence|blocked|cancelled <说明>。",
+        "needs_evidence": f"建议补证据后重新回传：/task report {normalized_task_id}\\n<补充报告>。",
+        "passed": f"建议关闭任务：/task close {normalized_task_id}。",
+        "blocked": "建议说明阻塞原因，或拆分新任务处理阻塞点。",
+        "cancelled": f"建议关闭或归档：/task close {normalized_task_id}。",
+        "archived": "任务已关闭，无需继续处理。",
+    }
+    legacy_advice = legacy_map.get(status, "状态未知，建议先 /task show 查看任务内容。")
+    return f"""Task next step: {normalized_task_id}
+- title: {task_title_from_text(normalized_task_id, text)}
+- status: {status}
+- status：{status}
+{dispatch_line}
+- recommendation: {advice}
+- legacy_recommendation：{legacy_advice}
+- safety: manual dispatch only; Atlas/Bridge does not run commands and does not call Codex/Kiro."""
+
+
 def build_evidence_help_reply() -> str:
     return """Atlas 证据链命令
 - /evidence help：查看本说明。
@@ -1882,8 +2652,9 @@ def build_evidence_help_reply() -> str:
 - /evidence show <task_id> <evidence_id>：显示证据摘要。
 - /evidence mark <task_id> <evidence_id> <verified|partial|rejected> <说明>：人工标记证据可用性。
 - /evidence gaps <task_id>：按验收标准和证据链输出缺口。
+- /evidence intake <task_id>：预览自动证据摄取结果，只解析不写入。
 
-type 可用：file、command、log、screenshot、ui、live、smoke、report、decision、other。
+type 可用：file、command、log、api、http、process、git、screenshot、ui、live、smoke、report、decision、other。
 report 不是 verified；smoke 通过不等于 live 通过；Bridge 不执行证据正文里的命令。"""
 
 
@@ -1901,6 +2672,20 @@ def build_evidence_add_reply(task_id: str, evidence_type: str, body: str) -> str
 - live_skipped：{str(analysis['live_skipped']).lower()}
 - 路径：workbench/evidence/{normalized_task_id}.md
 - 下一步：/evidence gaps {normalized_task_id} 或 /evidence mark {normalized_task_id} {evidence_id} verified <说明>"""
+
+
+def build_evidence_intake_reply(task_id: str, body: str) -> str:
+    normalized_task_id = normalize_task_id(task_id)
+    task_text = read_task(normalized_task_id)
+    intake = analyze_evidence_intake(body, task_section(task_text, "Acceptance Criteria"))
+    return f"""Evidence intake preview: {normalized_task_id}
+
+{format_intake_summary(intake)}
+
+write_effect: none
+verified_effect: none
+decision_effect: none
+note: observed evidence still requires manual /evidence mark before Atlas review can treat it as verified."""
 
 
 def build_evidence_list_reply(task_id: str) -> str:
@@ -1952,13 +2737,17 @@ def build_evidence_gaps_reply(task_id: str) -> str:
     normalized_task_id = normalize_task_id(task_id)
     sync_task_evidence_state(normalized_task_id)
     analysis = evidence_analysis(normalized_task_id)
+    gap_recommendation = "ready_for_review" if not analysis["missing"] and not analysis["risks"] and analysis["verified"] else analysis["recommendation"]
     return f"""证据缺口：{normalized_task_id}
 
 {build_evidence_gaps_text(normalized_task_id, analysis)}
 
-recommendation：{analysis['recommendation']}
+recommendation：{gap_recommendation}
+recommendation: {gap_recommendation}
 evidence_gap_count：{analysis['evidence_gap_count']}
-live_skipped：{str(analysis['live_skipped']).lower()}"""
+live_skipped：{str(analysis['live_skipped']).lower()}
+read_only_no_modification_ok: {str(bool(analysis.get('read_only_no_modification_ok'))).lower()}
+sensitive_zero_hit_ok: {str(bool(analysis.get('sensitive_zero_hit_ok'))).lower()}"""
 
 
 def handle_evidence_command(user_text: str) -> str | None:
@@ -1977,6 +2766,12 @@ def handle_evidence_command(user_text: str) -> str | None:
             inline_body = parts[4] if len(parts) > 4 else ""
             body = "\n".join(lines[1:]).strip() or inline_body
             return build_evidence_add_reply(parts[2], parts[3], body)
+        if subcommand == "intake":
+            if len(parts) < 3:
+                return "Usage: /evidence intake <task_id>\n<pasted report>"
+            inline_body = parts[3] if len(parts) > 3 else ""
+            body = "\n".join(lines[1:]).strip() or inline_body
+            return build_evidence_intake_reply(parts[2], body)
         if subcommand == "list":
             if len(parts) < 3:
                 return "用法：/evidence list <task_id>"
@@ -2369,6 +3164,8 @@ def build_retro_project_reply(project_id: str) -> str:
 def build_retro_dashboard_reply() -> str:
     projects = project_records()
     records = retro_records()
+    learn_counts = learning_counts()
+    learning_records_list = learning_records()
     approved = [record for record in records if record.get("status") == "approved"]
     needs = [
         record for record in records
@@ -2383,6 +3180,10 @@ def build_retro_dashboard_reply() -> str:
         f"- needs_evidence_retro_count：{len(needs)}",
         f"- blocked_retro_count：{len(blocked)}",
         f"- candidate_improvement_count：{candidates}",
+        f"- proposed_learning_count：{learn_counts['learning_proposals']}",
+        f"- approved_learning_count：{learn_counts['learning_approved']}",
+        f"- deferred_learning_count：{learn_counts['learning_deferred']}",
+        f"- not_applied_learning_count：{learn_counts['learning_not_applied']}",
         "",
         "active 项目：",
     ]
@@ -2407,6 +3208,14 @@ def build_retro_dashboard_reply() -> str:
             "- Candidate Improvements 只记录候选，不自动应用，等待 OHB-LEARN-009。",
         ]
     )
+    proposed = [record for record in learning_records_list if record.get("status") in {"proposed", "deferred"}]
+    lines.append("")
+    lines.append("Learning 视角：")
+    if proposed:
+        lines.append(f"- 建议优先 review：{proposed[0]['learn_id']} | {proposed[0]['title']}")
+    else:
+        lines.append("- 暂无待 review learning proposal。")
+    lines.append("- application_enabled: false")
     return "\n".join(lines)
 
 
@@ -2449,6 +3258,3453 @@ def handle_retro_command(user_text: str) -> str | None:
         return f"复盘操作被拒绝：{safe_preview(str(exc), 220)}"
     except Exception as exc:
         return f"复盘操作失败：{safe_preview(str(exc), 180)}"
+
+
+def generate_learn_id() -> str:
+    ensure_workbench_dirs()
+    base = datetime.now().strftime("LEARN-%Y%m%d-%H%M%S")
+    if not proposal_path(base).exists():
+        return base
+    for index in range(1, 100):
+        candidate = f"{base}-{index:02d}"
+        if not proposal_path(candidate).exists():
+            return candidate
+    raise RuntimeError("could not generate unique learn_id")
+
+
+def read_proposal(learn_id: str) -> str:
+    path = proposal_path(learn_id)
+    if not path.exists():
+        raise FileNotFoundError(f"learning proposal not found: {learn_id}")
+    return path.read_text(encoding="utf-8")
+
+
+def write_proposal(learn_id: str, text: str) -> None:
+    proposal_path(learn_id).write_text(sanitize_sensitive_text(text), encoding="utf-8")
+
+
+def proposal_title_from_text(learn_id: str, text: str) -> str:
+    first_line = text.splitlines()[0] if text.splitlines() else ""
+    prefix = f"# {learn_id} "
+    if first_line.startswith(prefix):
+        return first_line[len(prefix):].strip()
+    return "未命名学习提案"
+
+
+def learning_records() -> list[dict]:
+    ensure_workbench_dirs()
+    records = []
+    for path in sorted(LEARNING_PROPOSALS_DIR.glob("LEARN-*.md")):
+        learn_id = path.stem
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        meta = task_metadata(text)
+        records.append(
+            {
+                "learn_id": learn_id,
+                "title": proposal_title_from_text(learn_id, text),
+                "status": meta.get("status", "unknown"),
+                "source": meta.get("source", ""),
+                "source_task_id": meta.get("source_task_id", ""),
+                "source_project_id": meta.get("source_project_id", ""),
+                "source_retro_id": meta.get("source_retro_id", ""),
+                "created_at": meta.get("created_at", ""),
+                "updated_at": meta.get("updated_at", ""),
+                "path": path,
+                "text": text,
+            }
+        )
+    return sorted(records, key=lambda item: item.get("updated_at") or item.get("created_at", ""), reverse=True)
+
+
+def registry_records() -> list[dict]:
+    ensure_workbench_dirs()
+    records = []
+    for path in sorted(LEARNING_REGISTRY_DIR.glob("LEARN-*.md")):
+        learn_id = path.stem
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        meta = task_metadata(text)
+        records.append(
+            {
+                "learn_id": learn_id,
+                "title": proposal_title_from_text(learn_id, text),
+                "status": meta.get("status", "unknown"),
+                "source_task_id": meta.get("source_task_id", ""),
+                "source_project_id": meta.get("source_project_id", ""),
+                "approved_at": meta.get("approved_at", ""),
+                "application_status": meta.get("application_status", "not_applied"),
+                "text": text,
+            }
+        )
+    return sorted(records, key=lambda item: item.get("approved_at", ""), reverse=True)
+
+
+def learning_counts() -> dict:
+    records = learning_records()
+    registry = registry_records()
+    applied_to_playbook = sum(1 for record in registry if record.get("application_status") == "applied_to_workbench_playbook")
+    reverted_from_playbook = sum(1 for record in registry if record.get("application_status") == "reverted_from_workbench_playbook")
+    return {
+        "learning_proposals": len(records),
+        "learning_approved": sum(1 for record in records if record.get("status") in {"approved", "packaged"}),
+        "learning_rejected": sum(1 for record in records if record.get("status") == "rejected"),
+        "learning_deferred": sum(1 for record in records if record.get("status") == "deferred"),
+        "learning_packaged": sum(1 for record in records if record.get("status") == "packaged"),
+        "learning_not_applied": sum(1 for record in registry if record.get("application_status") == "not_applied"),
+        "approved_not_applied_count": sum(1 for record in registry if record.get("application_status") == "not_applied"),
+        "applied_to_workbench_playbook_count": applied_to_playbook,
+        "reverted_from_workbench_playbook_count": reverted_from_playbook,
+        "registry_count": len(registry),
+        "package_count": len(list(LEARNING_PACKAGES_DIR.glob("LEARN-*.md"))) if LEARNING_PACKAGES_DIR.exists() else 0,
+        "last_learn_id": records[0]["learn_id"] if records else "",
+    }
+
+
+def learning_project_counts(project_id: str) -> dict:
+    clean_project_id = validate_project_id(project_id)
+    records = [record for record in learning_records() if record.get("source_project_id") == clean_project_id]
+    registry = [record for record in registry_records() if record.get("source_project_id") == clean_project_id]
+    return {
+        "proposal_count": len(records),
+        "approved_count": sum(1 for record in records if record.get("status") in {"approved", "packaged"}),
+        "deferred_count": sum(1 for record in records if record.get("status") == "deferred"),
+        "not_applied_count": sum(1 for record in registry if record.get("application_status") == "not_applied"),
+    }
+
+
+def candidate_lines_from_retro(retro_text: str) -> list[str]:
+    candidates = []
+    for section_name in ("Candidate Improvements", "Lessons Learned"):
+        section = task_section(retro_text, section_name)
+        for raw_line in section.splitlines():
+            line = raw_line.strip()
+            if line.startswith("- "):
+                value = line[2:].strip()
+                if value and value not in candidates:
+                    candidates.append(value)
+    return candidates
+
+
+def retro_is_approved(retro_text: str) -> bool:
+    return task_metadata(retro_text).get("status") == "approved"
+
+
+def build_learning_proposal_markdown(
+    learn_id: str,
+    title: str,
+    source: str = "manual",
+    source_task_id: str = "",
+    source_project_id: str = "",
+    source_retro_id: str = "",
+    problem: str = "",
+    evidence: str = "",
+    lesson: str = "",
+    proposed_change: str = "",
+    risks: str = "",
+) -> str:
+    now = iso_now()
+    clean_title = sanitize_title(title)
+    return f"""# {learn_id} {clean_title}
+
+status: proposed
+created_at: {now}
+updated_at: {now}
+source: {sanitize_title(source).lower()}
+source_task_id: {source_task_id}
+source_project_id: {source_project_id}
+source_retro_id: {source_retro_id}
+mode: consultation
+owner: 小小
+
+## Problem
+{sanitize_sensitive_text(problem).strip() or '- 待补充问题描述。'}
+
+## Evidence
+{sanitize_sensitive_text(evidence).strip() or '- 待补充证据。'}
+
+## Lesson
+- {sanitize_sensitive_text(lesson).strip() or clean_title}
+
+## Proposed Behavior Change
+- {sanitize_sensitive_text(proposed_change).strip() or clean_title}
+
+## Scope
+- 仅作为 Atlas Workbench 本地 learning proposal，供后续人工审查。
+- 适用项目：{source_project_id or 'unassigned'}。
+
+## Non-Goals
+- 不做模型训练。
+- 不自动修改 Hermes、Memory、SkillRepo、系统提示词或项目代码。
+- 不自动调用 Codex/Kiro。
+
+## Safety Boundary
+- Bridge 只写 workbench/learning。
+- application_enabled: false。
+- approved 只代表进入本地 registry，不代表已经应用。
+
+## Acceptance Test
+- 人工检查 proposal 有来源 retro/task/project、证据、风险、rollback plan。
+- /learn review {learn_id} 输出建议决策。
+- /learn approve {learn_id} 后 registry application_status 仍为 not_applied。
+
+## Rollback Plan
+- 删除或归档 workbench/learning/registry/{learn_id}.md。
+- 将 proposal status 改为 deferred 或 rejected。
+- 不需要回滚 Hermes、Memory、SkillRepo，因为本阶段不会修改它们。
+
+## Risks
+{sanitize_sensitive_text(risks).strip() or '- 若证据不足或范围过宽，应 defer 或 reject。'}
+
+## Approval Record
+- 尚未批准。
+
+## Application Status
+- Application Status: not_applied
+- application_status: not_applied
+- application_enabled: false
+- applied_to_hermes: false
+- applied_to_memory: false
+- applied_to_skillrepo: false
+
+## Do Not Auto-Apply
+- 本提案不会自动修改 Hermes。
+- 本提案不会自动写入 Memory。
+- 本提案不会自动修改 SkillRepo。
+- 本提案不会自动修改系统提示词。
+- 本提案不会自动修改项目代码。
+- Learning package 也只是人工应用包，不会自动应用。
+"""
+
+
+def build_learn_help_reply() -> str:
+    return """Atlas 受控学习循环命令
+- /learn help：查看本说明。
+- /learn scan retro <task_id>：从 retro 查看候选学习项，不创建 proposal。
+- /learn propose retro <task_id>：从 retro 创建 learning proposal。
+- /learn propose manual <标题>：创建空白手工 proposal。
+- /learn list：列出最近 10 个 proposal。
+- /learn list --status <candidate|proposed|approved|rejected|deferred|packaged>：按状态列出。
+- /learn show <learn_id>：查看 proposal 摘要。
+- /learn review <learn_id>：审查 proposal。
+- /learn approve <learn_id> <说明>：批准进入本地 registry，但不应用。
+- /learn reject <learn_id> <说明>：拒绝 proposal。
+- /learn defer <learn_id> <说明>：延后 proposal。
+- /learn package <learn_id>：为 approved proposal 生成人工应用包，不应用。
+- /learn dashboard：查看学习看板。
+- /learn registry：列出 approved registry。
+- /learn status：查看学习系统状态。
+
+LEARN-009 不是模型训练，不自动改 Hermes，不写 Memory，不改 SkillRepo，只写 workbench learning registry。application_enabled: false。"""
+
+
+def build_learn_scan_retro_reply(task_id: str) -> str:
+    normalized_task_id = normalize_task_id(task_id)
+    retro_text = read_retro(normalized_task_id)
+    meta = task_metadata(retro_text)
+    candidates = candidate_lines_from_retro(retro_text)
+    risk = "- retro_status 不是 approved，允许 scan，但建议 approve retro 后再 propose。" if meta.get("status") != "approved" else "- retro 已 approved。"
+    lines = [
+        f"Learning candidates from retro：{normalized_task_id}",
+        f"- project_id：{meta.get('project_id', '') or 'unassigned'}",
+        f"- retro_status：{meta.get('status', 'unknown')}",
+        risk,
+        "",
+        "候选学习项 / Candidate Improvements：",
+    ]
+    lines.extend([f"- {item}" for item in candidates] or ["- 未发现 Candidate Improvements 或 Lessons Learned。"])
+    lines.extend(
+        [
+            "",
+            "来源摘要：",
+            f"- Evidence Gaps：{safe_preview(task_section(retro_text, 'Evidence Gaps'), 220)}",
+            f"- Process Issues：{safe_preview(task_section(retro_text, 'Process Issues'), 220)}",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def build_learn_propose_retro_reply(task_id: str) -> str:
+    normalized_task_id = normalize_task_id(task_id)
+    retro_text = read_retro(normalized_task_id)
+    meta = task_metadata(retro_text)
+    candidates = candidate_lines_from_retro(retro_text)
+    if not candidates:
+        return f"未创建 proposal：retro {normalized_task_id} 中没有 Candidate Improvements 或 Lessons Learned。"
+    learn_ids = []
+    source_project_id = meta.get("project_id", "")
+    approved_note = "retro 已 approved。" if meta.get("status") == "approved" else "retro 未 approved，review 时通常建议 defer。"
+    for candidate in candidates[:3]:
+        learn_id = generate_learn_id()
+        problem = task_section(retro_text, "Process Issues") or task_section(retro_text, "Evidence Gaps")
+        evidence = "\n".join(
+            [
+                f"- source_retro: workbench/retros/{normalized_task_id}.md",
+                f"- retro_status: {meta.get('status', 'unknown')}",
+                f"- {approved_note}",
+                safe_preview(task_section(retro_text, "Evidence Summary"), 420),
+            ]
+        )
+        proposal = build_learning_proposal_markdown(
+            learn_id,
+            candidate,
+            source="retro",
+            source_task_id=normalized_task_id,
+            source_project_id=source_project_id,
+            source_retro_id=f"RETRO-{normalized_task_id}",
+            problem=problem,
+            evidence=evidence,
+            lesson=candidate,
+            proposed_change=candidate,
+            risks=task_section(retro_text, "Evidence Gaps") or "- 需要人工 review 证据是否足够。",
+        )
+        write_proposal(learn_id, proposal)
+        learn_ids.append(learn_id)
+        log_event("learn_proposed", learn_id=learn_id, source_task_id=normalized_task_id)
+    return f"""Learning proposal 已创建：
+{chr(10).join('- ' + learn_id for learn_id in learn_ids)}
+
+- source_task_id：{normalized_task_id}
+- 不自动 approve。
+- 不自动应用。
+- 下一步：/learn review {learn_ids[0]}"""
+
+
+def build_learn_propose_manual_reply(title: str) -> str:
+    learn_id = generate_learn_id()
+    proposal = build_learning_proposal_markdown(
+        learn_id,
+        title,
+        source="manual",
+        problem="- 手工 proposal，待用户补充。",
+        evidence="- 手工 proposal，待用户补充 evidence。",
+        lesson="- 待填写 lesson。",
+        proposed_change="- 待填写 proposed behavior change。",
+        risks="- 手工 proposal 尚未绑定 retro/evidence，review 应谨慎。",
+    )
+    write_proposal(learn_id, proposal)
+    log_event("learn_manual_proposed", learn_id=learn_id)
+    return f"""手工 learning proposal 已创建：{learn_id}
+- 路径：workbench/learning/proposals/{learn_id}.md
+- status：proposed
+- application_status：not_applied
+- 下一步：手工补充后 /learn review {learn_id}"""
+
+
+def build_learn_list_reply(status_filter: str = "") -> str:
+    records = learning_records()
+    if status_filter:
+        normalized = status_filter.strip().lower()
+        if normalized not in LEARNING_STATUSES:
+            return "status 无效。可用：candidate、proposed、approved、rejected、deferred、packaged。"
+        records = [record for record in records if record.get("status") == normalized]
+    if not records:
+        return f"Learning proposals：{status_filter or 'all'}\n- 暂无。"
+    lines = [f"Learning proposals：{status_filter or 'all'}"]
+    for record in records[:10]:
+        lines.append(
+            f"- {record['learn_id']} | {record['status']} | task={record.get('source_task_id') or 'none'} | project={record.get('source_project_id') or 'unassigned'} | {record['updated_at']} | {record['title']}"
+        )
+    return "\n".join(lines)
+
+
+def build_learn_show_reply(learn_id: str) -> str:
+    normalized_learn_id = normalize_learn_id(learn_id)
+    text = read_proposal(normalized_learn_id)
+    meta = task_metadata(text)
+    return f"""Learning proposal：{normalized_learn_id}
+- title：{proposal_title_from_text(normalized_learn_id, text)}
+- status：{meta.get('status', 'unknown')}
+- source：{meta.get('source', '')}
+- source_task_id：{meta.get('source_task_id', '')}
+- source_project_id：{meta.get('source_project_id', '') or 'unassigned'}
+- problem：{safe_preview(task_section(text, 'Problem'), 220)}
+- lesson：{safe_preview(task_section(text, 'Lesson'), 220)}
+- proposed_behavior_change：{safe_preview(task_section(text, 'Proposed Behavior Change'), 220)}
+- scope：{safe_preview(task_section(text, 'Scope'), 180)}
+- risks：{safe_preview(task_section(text, 'Risks'), 220)}
+- acceptance_test：{safe_preview(task_section(text, 'Acceptance Test'), 220)}
+- application_status：{safe_preview(task_section(text, 'Application Status'), 180)}"""
+
+
+def proposal_has_auto_apply_intent(text: str) -> bool:
+    review_surface = "\n".join(
+        [
+            task_section(text, "Proposed Behavior Change"),
+            task_section(text, "Scope"),
+            task_section(text, "Acceptance Test"),
+        ]
+    ).lower()
+    risky_phrases = [
+        "\u81ea\u52a8\u4fee\u6539 hermes",
+        "\u81ea\u52a8\u5199\u5165 memory",
+        "\u81ea\u52a8\u4fee\u6539 skillrepo",
+        "\u81ea\u52a8\u6539\u7cfb\u7edf\u63d0\u793a\u8bcd",
+        "\u81ea\u52a8\u5e94\u7528",
+        "modify hermes automatically",
+        "write memory automatically",
+    ]
+    return any(phrase in review_surface for phrase in risky_phrases)
+
+
+def build_learn_review_reply(learn_id: str) -> str:
+    normalized_learn_id = normalize_learn_id(learn_id)
+    text = read_proposal(normalized_learn_id)
+    meta = task_metadata(text)
+    source_task_id = meta.get("source_task_id", "")
+    retro_status = "none"
+    live_or_gap = False
+    evidence_enough = bool(task_section(text, "Evidence").strip()) and "待补充" not in task_section(text, "Evidence")
+    if source_task_id:
+        try:
+            retro_text = read_retro(source_task_id)
+            retro_status = task_metadata(retro_text).get("status", "unknown")
+            retro_gap_text = task_section(retro_text, "Evidence Gaps")
+            live_or_gap = "live_skipped" in retro_text or "live skipped" in retro_text.lower() or "missing" in retro_gap_text
+        except Exception:
+            retro_status = "missing"
+            evidence_enough = False
+    auto_apply = proposal_has_auto_apply_intent(text)
+    scope_text = task_section(text, "Scope")
+    scope_too_wide = any(marker in scope_text for marker in ("所有", "全局", "全部", "all projects", "global"))
+    has_acceptance = bool(task_section(text, "Acceptance Test").strip())
+    has_rollback = bool(task_section(text, "Rollback Plan").strip())
+    decision = "approve"
+    reasons = []
+    if auto_apply:
+        decision = "reject"
+        reasons.append("proposal 试图自动改 Hermes/Memory/SkillRepo 或自动应用。")
+    if retro_status not in {"approved", "none"}:
+        decision = "defer" if decision != "reject" else decision
+        reasons.append("source retro 未 approved。")
+    if not evidence_enough:
+        decision = "defer" if decision != "reject" else decision
+        reasons.append("证据不足。")
+    if live_or_gap:
+        decision = "defer" if decision != "reject" else decision
+        reasons.append("来源存在 live skipped / evidence gaps。")
+    if scope_too_wide:
+        decision = "defer" if decision != "reject" else decision
+        reasons.append("适用范围过宽，建议拆小。")
+    if not has_acceptance:
+        decision = "defer" if decision != "reject" else decision
+        reasons.append("缺 Acceptance Test。")
+    if not has_rollback:
+        decision = "defer" if decision != "reject" else decision
+        reasons.append("缺 Rollback Plan。")
+    if not reasons:
+        reasons.append("只登记到 workbench registry，application_status 保持 not_applied，证据和回滚信息可审查。")
+    return f"""Learning proposal 审查：{normalized_learn_id}
+
+证据是否足够：
+- {str(evidence_enough).lower()}
+
+是否来自 approved retro：
+- retro_status：{retro_status}
+
+live skipped / evidence gaps：
+- {str(live_or_gap).lower()}
+
+越权修改 Hermes / Memory / SkillRepo：
+- {str(auto_apply).lower()}
+
+范围是否过宽：
+- {str(scope_too_wide).lower()}
+
+Acceptance Test：
+- {str(has_acceptance).lower()}
+
+Rollback Plan：
+- {str(has_rollback).lower()}
+
+审查理由：
+{chr(10).join('- ' + item for item in reasons)}
+
+建议决策：{decision}
+
+安全边界：
+- application_enabled: false
+- approve 只写本地 registry，不应用。"""
+
+
+def replace_proposal_status(text: str, status: str) -> str:
+    text = replace_task_field(text, "status", status)
+    text = replace_task_field(text, "updated_at", iso_now())
+    return text
+
+
+def build_registry_markdown(learn_id: str, proposal_text: str, approval_note: str) -> str:
+    meta = task_metadata(proposal_text)
+    title = proposal_title_from_text(learn_id, proposal_text)
+    approved_at = iso_now()
+    rollback = safe_preview(task_section(proposal_text, "Rollback Plan"), 600)
+    acceptance = safe_preview(task_section(proposal_text, "Acceptance Test"), 600)
+    return f"""# {learn_id} {title}
+
+status: approved
+learn_id: {learn_id}
+title: {sanitize_title(title)}
+source_task_id: {meta.get('source_task_id', '')}
+source_project_id: {meta.get('source_project_id', '')}
+approved_at: {approved_at}
+approval_note: {sanitize_sensitive_text(approval_note).strip() or '未填写说明。'}
+application_status: not_applied
+
+## Registry Entry
+- learn_id: {learn_id}
+- title: {sanitize_title(title)}
+- status: approved
+- source_task_id: {meta.get('source_task_id', '')}
+- source_project_id: {meta.get('source_project_id', '') or 'unassigned'}
+- approved_at: {approved_at}
+- approval_note: {sanitize_sensitive_text(approval_note).strip() or '未填写说明。'}
+- application_status: not_applied
+
+## Rollback Plan
+{rollback}
+
+## Acceptance Test
+{acceptance}
+
+## Application Status
+- application_status: not_applied
+- application_enabled: false
+- not_applied_to_hermes: true
+- not_written_to_memory: true
+- not_written_to_skillrepo: true
+"""
+
+
+def rebuild_registry_index() -> None:
+    records = registry_records()
+    lines = ["# Learning Registry Index", "", "application_enabled: false", ""]
+    for record in records:
+        lines.append(
+            f"- {record['learn_id']} | project={record.get('source_project_id') or 'unassigned'} | application_status={record.get('application_status')} | {record.get('title')}"
+        )
+    (LEARNING_REGISTRY_DIR / "index.md").write_text(sanitize_sensitive_text("\n".join(lines) + "\n"), encoding="utf-8")
+
+
+def build_learn_approve_reply(learn_id: str, note: str) -> str:
+    normalized_learn_id = normalize_learn_id(learn_id)
+    text = read_proposal(normalized_learn_id)
+    now = iso_now()
+    approval = f"### Approved at {now}\n- note: {sanitize_sensitive_text(note).strip() or '未填写说明。'}\n- application_status: not_applied\n- application_enabled: false"
+    text = append_to_section(text, "Approval Record", approval)
+    text = replace_proposal_status(text, "approved")
+    write_proposal(normalized_learn_id, text)
+    registry_text = build_registry_markdown(normalized_learn_id, text, note)
+    registry_path(normalized_learn_id).write_text(sanitize_sensitive_text(registry_text), encoding="utf-8")
+    rebuild_registry_index()
+    log_event("learn_approved", learn_id=normalized_learn_id)
+    return f"""Learning proposal 已批准但未应用：{normalized_learn_id}
+- status：approved
+- registry：workbench/learning/registry/{normalized_learn_id}.md
+- application_status：not_applied
+- application_enabled：false
+- 未写 Memory，未写 SkillRepo，未改 Hermes。"""
+
+
+def move_learning_copy(learn_id: str, target_dir: Path, text: str) -> None:
+    ensure_workbench_dirs()
+    ensure_inside_workbench(target_dir / f"{learn_id}.md").write_text(sanitize_sensitive_text(text), encoding="utf-8")
+
+
+def build_learn_reject_reply(learn_id: str, note: str) -> str:
+    normalized_learn_id = normalize_learn_id(learn_id)
+    text = read_proposal(normalized_learn_id)
+    text = append_to_section(text, "Approval Record", f"### Rejected at {iso_now()}\n- note: {sanitize_sensitive_text(note).strip() or '未填写说明。'}")
+    text = replace_proposal_status(text, "rejected")
+    write_proposal(normalized_learn_id, text)
+    move_learning_copy(normalized_learn_id, LEARNING_REJECTED_DIR, text)
+    log_event("learn_rejected", learn_id=normalized_learn_id)
+    return f"""Learning proposal 已拒绝：{normalized_learn_id}
+- status：rejected
+- rejected_copy：workbench/learning/rejected/{normalized_learn_id}.md
+- 原始证据保留。"""
+
+
+def build_learn_defer_reply(learn_id: str, note: str) -> str:
+    normalized_learn_id = normalize_learn_id(learn_id)
+    text = read_proposal(normalized_learn_id)
+    text = append_to_section(text, "Approval Record", f"### Deferred at {iso_now()}\n- reason: {sanitize_sensitive_text(note).strip() or '未填写说明。'}")
+    text = replace_proposal_status(text, "deferred")
+    write_proposal(normalized_learn_id, text)
+    move_learning_copy(normalized_learn_id, LEARNING_DEFERRED_DIR, text)
+    log_event("learn_deferred", learn_id=normalized_learn_id)
+    return f"""Learning proposal 已延后：{normalized_learn_id}
+- status：deferred
+- deferred_copy：workbench/learning/deferred/{normalized_learn_id}.md
+- 未应用。"""
+
+
+def build_learn_package_reply(learn_id: str) -> str:
+    normalized_learn_id = normalize_learn_id(learn_id)
+    text = read_proposal(normalized_learn_id)
+    meta = task_metadata(text)
+    if meta.get("status") not in {"approved", "packaged"}:
+        return f"不能生成 package：{normalized_learn_id} 当前 status={meta.get('status', 'unknown')}。只有 approved proposal 可 package。"
+    title = proposal_title_from_text(normalized_learn_id, text)
+    package = f"""# Learning Package {normalized_learn_id} {title}
+
+learn_id: {normalized_learn_id}
+source_task_id: {meta.get('source_task_id', '')}
+source_project_id: {meta.get('source_project_id', '')}
+application_status: not_applied
+application_enabled: false
+
+## Lesson
+{task_section(text, 'Lesson')}
+
+## Proposed Behavior
+{task_section(text, 'Proposed Behavior Change')}
+
+## Acceptance Test
+{task_section(text, 'Acceptance Test')}
+
+## Rollback Plan
+{task_section(text, 'Rollback Plan')}
+
+## Suggested Manual Application Steps
+- 人工阅读本 package。
+- 在后续明确授权的 OHB-APPLY 阶段决定是否应用。
+- 应用前再次核对 evidence、approval、rollback、acceptance test。
+
+## Explicit Warning
+- not applied automatically。
+- 不修改 Hermes。
+- 不写 Memory。
+- 不改 SkillRepo。
+- 不改系统提示词。
+- 不改项目代码。
+"""
+    package_path(normalized_learn_id).write_text(sanitize_sensitive_text(package), encoding="utf-8")
+    text = append_to_section(text, "Application Status", f"- package_created_at: {iso_now()}\n- package_path: workbench/learning/packages/{normalized_learn_id}.md\n- application_status: not_applied")
+    text = replace_proposal_status(text, "packaged")
+    write_proposal(normalized_learn_id, text)
+    log_event("learn_packaged", learn_id=normalized_learn_id)
+    return f"""Learning package 已生成：{normalized_learn_id}
+- package：workbench/learning/packages/{normalized_learn_id}.md
+- status：packaged
+- application_status：not_applied
+- explicit warning：not applied automatically"""
+
+
+def build_learn_dashboard_reply() -> str:
+    records = learning_records()
+    counts = learning_counts()
+    apply_view = apply_counts()
+    project_distribution: dict[str, int] = {}
+    high_risk = []
+    for record in records:
+        project_distribution[record.get("source_project_id") or "unassigned"] = project_distribution.get(record.get("source_project_id") or "unassigned", 0) + 1
+        text = record.get("text", "")
+        if "live skipped" in text.lower() or "evidence gaps" in text.lower() or "未 approved" in text:
+            high_risk.append(record)
+    lines = [
+        "Atlas Learning Dashboard",
+        f"- proposals：{counts['learning_proposals']}",
+        f"- approved：{counts['learning_approved']}",
+        f"- rejected：{counts['learning_rejected']}",
+        f"- deferred：{counts['learning_deferred']}",
+        f"- packaged：{counts['learning_packaged']}",
+        f"- not_applied：{counts['learning_not_applied']}",
+        f"- approved_not_applied: {counts['approved_not_applied_count']}",
+        f"- applied_to_playbook: {counts['applied_to_workbench_playbook_count']}",
+        f"- reverted_from_playbook: {counts['reverted_from_workbench_playbook_count']}",
+        f"- pending_apply_plans: {apply_view['planned_count']}",
+        f"- application_enabled：{str(APPLICATION_ENABLED).lower()}",
+        f"- runtime_injection_enabled: {str(RUNTIME_INJECTION_ENABLED).lower()}",
+        "",
+        "来源项目分布：",
+    ]
+    lines.extend([f"- {project}: {count}" for project, count in sorted(project_distribution.items())] or ["- 暂无。"])
+    lines.append("")
+    lines.append("高风险 proposal：")
+    lines.extend([f"- {record['learn_id']} | {record['status']} | {record['title']}" for record in high_risk[:10]] or ["- 暂无。"])
+    lines.extend(
+        [
+            "",
+            "Apply view:",
+            f"- approved_not_applied: {counts['approved_not_applied_count']}",
+            f"- applied_to_playbook: {counts['applied_to_workbench_playbook_count']}",
+            f"- reverted_from_playbook: {counts['reverted_from_workbench_playbook_count']}",
+            f"- pending_apply_plans: {apply_view['planned_count']}",
+            "",
+            "今日建议：",
+            "- 优先 /learn review proposed/deferred 中证据最完整、范围最小的 proposal。",
+            "- Approved proposals can move to /apply plan <learn_id> global|project <project_id> for Workbench-only playbook use.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def build_learn_registry_reply() -> str:
+    records = registry_records()
+    if not records:
+        return "Learning registry：暂无 approved learning。"
+    lines = ["Learning registry："]
+    for record in records[:30]:
+        lines.append(
+            f"- {record['learn_id']} | {record.get('title')} | project={record.get('source_project_id') or 'unassigned'} | application_status={record.get('application_status')} | approved_at={record.get('approved_at')}"
+        )
+    return "\n".join(lines)
+
+
+def build_learn_status_reply() -> str:
+    counts = learning_counts()
+    return f"""Learning system status
+- learning_dir：workbench/learning/
+- proposal_count：{counts['learning_proposals']}
+- registry_count：{counts['registry_count']}
+- approved_not_applied_count: {counts['approved_not_applied_count']}
+- applied_to_workbench_playbook_count: {counts['applied_to_workbench_playbook_count']}
+- reverted_from_workbench_playbook_count: {counts['reverted_from_workbench_playbook_count']}
+- package_count：{counts['package_count']}
+- last_learn_id：{counts['last_learn_id'] or 'none'}
+- application_enabled: false
+- runtime_injection_enabled: false
+- external_application_enabled: false
+- safety_boundary：只写 workbench learning registry/packages；不改 Hermes、Memory、SkillRepo、系统提示词或项目代码。"""
+
+
+def handle_learn_command(user_text: str) -> str | None:
+    first_line = user_text.strip().splitlines()[0] if user_text.strip() else ""
+    parts = first_line.split(maxsplit=4)
+    if len(parts) < 2 or parts[0].lower() != "/learn":
+        return None
+    subcommand = parts[1].lower()
+    try:
+        if subcommand == "help":
+            return build_learn_help_reply()
+        if subcommand == "scan":
+            if len(parts) < 4 or parts[2].lower() != "retro":
+                return "用法：/learn scan retro <task_id>"
+            return build_learn_scan_retro_reply(parts[3])
+        if subcommand == "propose":
+            if len(parts) < 4:
+                return "用法：/learn propose retro <task_id> 或 /learn propose manual <标题>"
+            kind = parts[2].lower()
+            tail = parts[3] if len(parts) > 3 else ""
+            if kind == "retro":
+                return build_learn_propose_retro_reply(tail)
+            if kind == "manual":
+                manual_title = tail if len(parts) == 4 else f"{tail} {parts[4]}"
+                return build_learn_propose_manual_reply(manual_title)
+            return "用法：/learn propose retro <task_id> 或 /learn propose manual <标题>"
+        if subcommand == "list":
+            if len(parts) >= 4 and parts[2] == "--status":
+                return build_learn_list_reply(parts[3])
+            return build_learn_list_reply()
+        if subcommand == "show":
+            return build_learn_show_reply(parts[2] if len(parts) > 2 else "")
+        if subcommand == "review":
+            return build_learn_review_reply(parts[2] if len(parts) > 2 else "")
+        if subcommand == "approve":
+            approve_parts = first_line.split(maxsplit=3)
+            if len(approve_parts) < 3:
+                return "用法：/learn approve <learn_id> <说明>"
+            return build_learn_approve_reply(approve_parts[2], approve_parts[3] if len(approve_parts) > 3 else "")
+        if subcommand == "reject":
+            reject_parts = first_line.split(maxsplit=3)
+            if len(reject_parts) < 3:
+                return "用法：/learn reject <learn_id> <说明>"
+            return build_learn_reject_reply(reject_parts[2], reject_parts[3] if len(reject_parts) > 3 else "")
+        if subcommand == "defer":
+            defer_parts = first_line.split(maxsplit=3)
+            if len(defer_parts) < 3:
+                return "用法：/learn defer <learn_id> <说明>"
+            return build_learn_defer_reply(defer_parts[2], defer_parts[3] if len(defer_parts) > 3 else "")
+        if subcommand == "package":
+            return build_learn_package_reply(parts[2] if len(parts) > 2 else "")
+        if subcommand == "dashboard":
+            return build_learn_dashboard_reply()
+        if subcommand == "registry":
+            return build_learn_registry_reply()
+        if subcommand == "status":
+            return build_learn_status_reply()
+        return build_learn_help_reply()
+    except FileNotFoundError as exc:
+        return f"学习提案或来源不存在：{safe_preview(str(exc), 180)}"
+    except ValueError as exc:
+        return f"学习操作被拒绝：{safe_preview(str(exc), 220)}"
+    except Exception as exc:
+        return f"学习操作失败：{safe_preview(str(exc), 180)}"
+
+
+def generate_apply_id() -> str:
+    ensure_workbench_dirs()
+    base = datetime.now().strftime("APPLY-%Y%m%d-%H%M%S")
+    if not application_path(base).exists():
+        return base
+    for index in range(1, 100):
+        candidate = f"{base}-{index:02d}"
+        if not application_path(candidate).exists():
+            return candidate
+    raise RuntimeError("could not generate unique apply_id")
+
+
+def read_application(apply_id: str) -> str:
+    path = application_path(apply_id)
+    if not path.exists():
+        raise FileNotFoundError(f"apply plan not found: {apply_id}")
+    return path.read_text(encoding="utf-8")
+
+
+def write_application(apply_id: str, text: str) -> None:
+    application_path(apply_id).write_text(sanitize_sensitive_text(text), encoding="utf-8")
+
+
+def application_title_from_text(apply_id: str, text: str) -> str:
+    first_line = text.splitlines()[0] if text.splitlines() else ""
+    prefix = f"# {apply_id} "
+    if first_line.startswith(prefix):
+        return first_line[len(prefix):].strip()
+    return task_metadata(text).get("title", "untitled apply plan")
+
+
+def application_records() -> list[dict]:
+    ensure_workbench_dirs()
+    records = []
+    for path in sorted(APPLICATIONS_DIR.glob("APPLY-*.md")):
+        apply_id = path.stem
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        meta = task_metadata(text)
+        records.append(
+            {
+                "apply_id": apply_id,
+                "title": application_title_from_text(apply_id, text),
+                "status": meta.get("status", "unknown"),
+                "source_learn_id": meta.get("source_learn_id", ""),
+                "source_project_id": meta.get("source_project_id", ""),
+                "source_task_id": meta.get("source_task_id", ""),
+                "target": meta.get("target", ""),
+                "target_path": meta.get("target_path", ""),
+                "created_at": meta.get("created_at", ""),
+                "updated_at": meta.get("updated_at", ""),
+                "path": path,
+                "text": text,
+            }
+        )
+    return sorted(records, key=lambda item: item.get("updated_at") or item.get("created_at", ""), reverse=True)
+
+
+def playbook_entry_count(path: Path) -> int:
+    if not path.exists():
+        return 0
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    return len(re.findall(r"^## LEARN-\d{8}-\d{6}(?:-\d{2})?\b", text, re.MULTILINE))
+
+
+def playbook_records() -> list[dict]:
+    ensure_workbench_dirs()
+    records = []
+    global_path = global_playbook_path()
+    if global_path.exists():
+        records.append(
+            {
+                "name": "global",
+                "path": global_path,
+                "entry_count": playbook_entry_count(global_path),
+                "updated_at": datetime.fromtimestamp(global_path.stat().st_mtime).astimezone().isoformat(timespec="seconds"),
+            }
+        )
+    for path in sorted(PROJECT_PLAYBOOKS_DIR.glob("*.md")):
+        records.append(
+            {
+                "name": f"projects/{path.stem}",
+                "path": path,
+                "entry_count": playbook_entry_count(path),
+                "updated_at": datetime.fromtimestamp(path.stat().st_mtime).astimezone().isoformat(timespec="seconds"),
+            }
+        )
+    return records
+
+
+def apply_counts() -> dict:
+    records = application_records()
+    registry = registry_records()
+    global_entries = playbook_entry_count(global_playbook_path())
+    project_entries = sum(playbook_entry_count(path) for path in PROJECT_PLAYBOOKS_DIR.glob("*.md")) if PROJECT_PLAYBOOKS_DIR.exists() else 0
+    return {
+        "apply_plans": len(records),
+        "planned_count": sum(1 for record in records if record.get("status") == "planned"),
+        "applied_count": sum(1 for record in records if record.get("status") == "applied"),
+        "reverted_count": sum(1 for record in records if record.get("status") == "reverted"),
+        "cancelled_count": sum(1 for record in records if record.get("status") == "cancelled"),
+        "global_playbook_entries": global_entries,
+        "project_playbook_entries": project_entries,
+        "playbook_entries": global_entries + project_entries,
+        "applied_to_workbench_playbook": sum(1 for record in registry if record.get("application_status") == "applied_to_workbench_playbook"),
+        "reverted_from_workbench_playbook": sum(1 for record in registry if record.get("application_status") == "reverted_from_workbench_playbook"),
+    }
+
+
+def project_apply_counts(project_id: str) -> dict:
+    clean_project_id = validate_project_id(project_id)
+    records = [
+        record for record in application_records()
+        if record.get("source_project_id") == clean_project_id or record.get("target_path", "").endswith(f"/projects/{clean_project_id}.md")
+    ]
+    registry = [record for record in registry_records() if record.get("source_project_id") == clean_project_id]
+    return {
+        "playbook_entry_count": playbook_entry_count(project_playbook_path(clean_project_id)),
+        "applied_learning_count": sum(1 for record in registry if record.get("application_status") == "applied_to_workbench_playbook"),
+        "reverted_learning_count": sum(1 for record in registry if record.get("application_status") == "reverted_from_workbench_playbook"),
+        "pending_apply_count": sum(1 for record in records if record.get("status") == "planned"),
+        "suggested_not_applied_learnings": sum(1 for record in registry if record.get("application_status") == "not_applied"),
+    }
+
+
+def playbook_display_path(path: Path) -> str:
+    safe_path = ensure_inside_playbooks(path)
+    try:
+        relative = safe_path.relative_to(WORKBENCH_DIR.resolve())
+        return f"workbench/{relative.as_posix()}"
+    except ValueError:
+        return display_path(safe_path).replace("\\", "/")
+
+
+def playbook_path_from_display(value: str) -> Path:
+    normalized = str(value or "").replace("\\", "/").strip()
+    prefix = "workbench/playbooks/"
+    if not normalized.startswith(prefix):
+        raise ValueError("target_path must be inside workbench/playbooks")
+    suffix = normalized[len(prefix):]
+    suffix_parts = Path(suffix).parts
+    if not suffix or suffix.startswith("/") or ".." in suffix_parts:
+        raise ValueError("invalid playbook target_path")
+    return ensure_inside_playbooks(PLAYBOOKS_DIR / Path(suffix))
+
+
+def approved_learning_text(learn_id: str) -> tuple[str, str]:
+    normalized_learn_id = normalize_learn_id(learn_id)
+    proposal = read_proposal(normalized_learn_id)
+    proposal_status = task_metadata(proposal).get("status", "unknown")
+    if proposal_status not in {"approved", "packaged"}:
+        raise ValueError(f"learning proposal is not approved: {normalized_learn_id} status={proposal_status}")
+    registry_file = registry_path(normalized_learn_id)
+    if not registry_file.exists():
+        raise ValueError(f"learning registry entry missing for approved proposal: {normalized_learn_id}")
+    return proposal, registry_file.read_text(encoding="utf-8")
+
+
+def build_playbook_entry(
+    learn_id: str,
+    title: str,
+    proposal_text: str,
+    registry_text: str,
+    apply_id: str,
+    applied_at: str = "pending",
+) -> str:
+    proposal_meta = task_metadata(proposal_text)
+    registry_meta = task_metadata(registry_text)
+    source_project_id = registry_meta.get("source_project_id") or proposal_meta.get("source_project_id") or "unassigned"
+    lesson = task_section(proposal_text, "Lesson") or task_section(registry_text, "Registry Entry")
+    behavior = task_section(proposal_text, "Proposed Behavior Change") or title
+    acceptance = task_section(proposal_text, "Acceptance Test") or "- Human checks this playbook entry before using it."
+    rollback = task_section(proposal_text, "Rollback Plan") or "- Append a Revert Note and set registry application_status to reverted_from_workbench_playbook."
+    evidence = task_section(proposal_text, "Evidence") or "- Source evidence remains in the learning proposal and registry."
+    safety = task_section(proposal_text, "Safety Boundary") or "- Workbench reference only. No runtime injection."
+    return sanitize_sensitive_text(f"""## {learn_id} {sanitize_title(title)}
+
+applied_at: {applied_at}
+apply_id: {apply_id}
+source_learn_id: {learn_id}
+source_project_id: {source_project_id}
+application_status: applied_to_workbench_playbook
+runtime_injection_enabled: false
+
+### Lesson
+{lesson}
+
+### Behavior Guideline
+{behavior}
+
+### When To Use
+- Use as a human-readable Atlas Workbench reference when a similar task pattern appears.
+
+### When Not To Use
+- Do not use when the source evidence does not match the new task.
+- Do not treat this entry as a runtime rule, system prompt, Memory item, or SkillRepo patch.
+
+### Acceptance Check
+{acceptance}
+
+### Rollback Note
+{rollback}
+
+### Source Evidence
+{evidence}
+
+### Safety Boundary
+{safety}
+
+### Not Applied To
+- Hermes config
+- Hermes Memory
+- SkillRepo
+- System prompt
+- Project code
+""")
+
+
+def build_apply_plan_markdown(
+    apply_id: str,
+    learn_id: str,
+    target: str,
+    target_path: Path,
+    proposal_text: str,
+    registry_text: str,
+) -> str:
+    now = iso_now()
+    title = proposal_title_from_text(learn_id, proposal_text)
+    proposal_meta = task_metadata(proposal_text)
+    registry_meta = task_metadata(registry_text)
+    source_project_id = registry_meta.get("source_project_id") or proposal_meta.get("source_project_id") or ""
+    source_task_id = registry_meta.get("source_task_id") or proposal_meta.get("source_task_id") or ""
+    entry = build_playbook_entry(learn_id, title, proposal_text, registry_text, apply_id)
+    return sanitize_sensitive_text(f"""# {apply_id} {sanitize_title(title)}
+
+status: planned
+created_at: {now}
+updated_at: {now}
+source_learn_id: {learn_id}
+source_project_id: {source_project_id}
+source_task_id: {source_task_id}
+target: {target}
+target_path: {playbook_display_path(target_path)}
+mode: consultation
+owner: XiaoXiao
+
+## Source Learning
+- learn_id: {learn_id}
+- proposal_path: workbench/learning/proposals/{learn_id}.md
+- registry_path: workbench/learning/registry/{learn_id}.md
+- application_status: {registry_meta.get('application_status', 'not_applied')}
+
+## Proposed Playbook Entry
+{entry}
+
+## Scope
+- Workbench-only apply.
+- Write only the target playbook under workbench/playbooks.
+
+## Non-Goals
+- Do not modify Hermes.
+- Do not write Memory.
+- Do not modify SkillRepo.
+- Do not modify system prompts.
+- Do not modify project code.
+- Do not call Codex/Kiro.
+- Do not execute commands.
+- Do not perform model training.
+
+## Safety Boundary
+- target_path must stay under workbench/playbooks.
+- runtime_injection_enabled: false
+- external_application_enabled: false
+
+## Acceptance Test
+- /apply show {apply_id} displays status, source_learn_id, target_path, rollback plan, and runtime impact.
+- /apply enact {apply_id} appends the proposed entry to the selected playbook only.
+- /learn registry shows application_status=applied_to_workbench_playbook after enact.
+
+## Rollback Plan
+- /apply revert {apply_id} appends a Revert Note to the playbook.
+- Registry application_status becomes reverted_from_workbench_playbook.
+- Original playbook history is retained for audit.
+
+## Apply Record
+- not enacted.
+
+## Revert Record
+- not reverted.
+
+## Runtime Impact
+- none
+- runtime_injection_enabled: false
+- external_application_enabled: false
+
+## Do Not Auto-Apply Beyond Workbench
+- This apply plan only writes workbench/playbooks after explicit /apply enact.
+- It does not modify Hermes, Memory, SkillRepo, system prompts, or project code.
+""")
+
+
+def build_apply_help_reply() -> str:
+    return """Atlas Workbench apply commands
+- /apply help
+- /apply plan <learn_id> global
+- /apply plan <learn_id> project <project_id>
+- /apply show <apply_id>
+- /apply list
+- /apply list --status <planned|applied|reverted|cancelled>
+- /apply enact <apply_id> <note>
+- /apply revert <apply_id> <note>
+- /apply cancel <apply_id> <note>
+- /apply dashboard
+
+Boundary: apply means workbench/playbooks only. It does not modify Hermes, Memory, SkillRepo, system prompts, project code, or runtime prompts. It does not execute commands. runtime_injection_enabled: false."""
+
+
+def build_apply_plan_reply(tail: str) -> str:
+    parts = str(tail or "").strip().split()
+    if len(parts) < 2:
+        return "Usage: /apply plan <learn_id> global OR /apply plan <learn_id> project <project_id>"
+    learn_id = normalize_learn_id(parts[0])
+    kind = parts[1].lower()
+    proposal_text, registry_text = approved_learning_text(learn_id)
+    if kind == "global":
+        target = "global_playbook"
+        target_path = global_playbook_path()
+    elif kind == "project":
+        if len(parts) < 3:
+            return "Usage: /apply plan <learn_id> project <project_id>"
+        project_id = validate_project_id(parts[2])
+        read_project(project_id)
+        target = "project_playbook"
+        target_path = project_playbook_path(project_id)
+    else:
+        return "Usage: /apply plan <learn_id> global OR /apply plan <learn_id> project <project_id>"
+    apply_id = generate_apply_id()
+    plan = build_apply_plan_markdown(apply_id, learn_id, target, target_path, proposal_text, registry_text)
+    write_application(apply_id, plan)
+    log_event("apply_planned", apply_id=apply_id, learn_id=learn_id, target=target)
+    return f"""Apply plan created: {apply_id}
+- status: planned
+- source_learn_id: {learn_id}
+- target: {target}
+- target_path: {playbook_display_path(target_path)}
+- path: workbench/applications/{apply_id}.md
+- next: /apply show {apply_id}
+- not enacted; playbook was not written."""
+
+
+def build_apply_show_reply(apply_id: str) -> str:
+    normalized_apply_id = normalize_apply_id(apply_id)
+    text = read_application(normalized_apply_id)
+    meta = task_metadata(text)
+    return f"""Apply plan: {normalized_apply_id}
+- title: {application_title_from_text(normalized_apply_id, text)}
+- status: {meta.get('status', 'unknown')}
+- source_learn_id: {meta.get('source_learn_id', '')}
+- target: {meta.get('target', '')}
+- target_path: {meta.get('target_path', '')}
+- proposed_playbook_entry: {safe_preview(apply_plan_proposed_entry(text), 420)}
+- safety_boundary: {safe_preview(task_section(text, 'Safety Boundary'), 240)}
+- rollback_plan: {safe_preview(task_section(text, 'Rollback Plan'), 240)}
+- runtime_impact: {safe_preview(task_section(text, 'Runtime Impact'), 180)}"""
+
+
+def build_apply_list_reply(status_filter: str = "") -> str:
+    records = application_records()
+    if status_filter:
+        normalized = status_filter.strip().lower()
+        if normalized not in APPLY_STATUSES:
+            return "invalid status. Use planned, applied, reverted, or cancelled."
+        records = [record for record in records if record.get("status") == normalized]
+    if not records:
+        return f"Apply plans: {status_filter or 'all'}\n- none."
+    lines = [f"Apply plans: {status_filter or 'all'}"]
+    for record in records[:10]:
+        lines.append(
+            f"- {record['apply_id']} | {record['status']} | learn={record.get('source_learn_id') or 'none'} | target={record.get('target')} | {record.get('updated_at')} | {record.get('title')}"
+        )
+    return "\n".join(lines)
+
+
+def apply_plan_proposed_entry(text: str) -> str:
+    heading = "## Proposed Playbook Entry"
+    start = text.find(heading)
+    if start < 0:
+        return ""
+    body_start = start + len(heading)
+    end_marker = "\n## Scope"
+    end = text.find(end_marker, body_start)
+    if end < 0:
+        end = len(text)
+    return text[body_start:end].strip()
+
+
+def update_registry_application_status(learn_id: str, application_status: str, note: str = "") -> None:
+    normalized_learn_id = normalize_learn_id(learn_id)
+    path = registry_path(normalized_learn_id)
+    if not path.exists():
+        raise FileNotFoundError(f"learning registry entry not found: {normalized_learn_id}")
+    text = path.read_text(encoding="utf-8")
+    clean_status = sanitize_sensitive_text(application_status).strip()
+    text = re.sub(r"^application_status:.*$", f"application_status: {clean_status}", text, flags=re.MULTILINE)
+    text = re.sub(r"^-\s*application_status:.*$", f"- application_status: {clean_status}", text, flags=re.MULTILINE)
+    text = append_to_section(text, "Application History", f"- {iso_now()} application_status={clean_status} note={sanitize_sensitive_text(note).strip() or 'no note'}")
+    path.write_text(sanitize_sensitive_text(text), encoding="utf-8")
+    rebuild_registry_index()
+
+
+def update_proposal_application_status(learn_id: str, application_status: str, note: str = "") -> None:
+    normalized_learn_id = normalize_learn_id(learn_id)
+    try:
+        text = read_proposal(normalized_learn_id)
+    except FileNotFoundError:
+        return
+    clean_status = sanitize_sensitive_text(application_status).strip()
+    text = re.sub(r"^-\s*application_status:.*$", f"- application_status: {clean_status}", text, flags=re.MULTILINE)
+    text = re.sub(r"^- Application Status:.*$", f"- Application Status: {clean_status}", text, flags=re.MULTILINE)
+    text = append_to_section(text, "Application Status", f"- {iso_now()} application_status: {clean_status} note={sanitize_sensitive_text(note).strip() or 'no note'}")
+    write_proposal(normalized_learn_id, text)
+
+
+def ensure_playbook_header(path: Path, target: str) -> None:
+    safe_path = ensure_inside_playbooks(path)
+    if safe_path.exists():
+        return
+    now = iso_now()
+    if target == "global_playbook":
+        title = "Atlas Workbench Playbook"
+    else:
+        title = f"Atlas Project Playbook {safe_path.stem}"
+    safe_path.write_text(
+        sanitize_sensitive_text(
+            f"""# {title}
+
+created_at: {now}
+updated_at: {now}
+mode: consultation
+runtime_injection_enabled: false
+external_application_enabled: false
+
+This is a Workbench reference layer, not a runtime layer.
+"""
+        ),
+        encoding="utf-8",
+    )
+
+
+def build_apply_enact_reply(apply_id: str, note: str) -> str:
+    normalized_apply_id = normalize_apply_id(apply_id)
+    text = read_application(normalized_apply_id)
+    meta = task_metadata(text)
+    if meta.get("status") != "planned":
+        return f"Cannot enact {normalized_apply_id}: status must be planned, current={meta.get('status', 'unknown')}."
+    target_path = playbook_path_from_display(meta.get("target_path", ""))
+    ensure_playbook_header(target_path, meta.get("target", "global_playbook"))
+    now = iso_now()
+    entry = apply_plan_proposed_entry(text).replace("applied_at: pending", f"applied_at: {now}")
+    if not entry.strip():
+        raise ValueError("apply plan has no Proposed Playbook Entry")
+    with target_path.open("a", encoding="utf-8") as handle:
+        handle.write("\n\n" + sanitize_sensitive_text(entry).strip() + "\n")
+    text = append_to_section(text, "Apply Record", f"### Applied at {now}\n- note: {sanitize_sensitive_text(note).strip() or 'no note'}\n- target_path: {playbook_display_path(target_path)}\n- runtime_injection_enabled: false")
+    text = replace_task_field(text, "status", "applied")
+    text = replace_task_field(text, "updated_at", now)
+    write_application(normalized_apply_id, text)
+    learn_id = meta.get("source_learn_id", "")
+    if learn_id:
+        update_registry_application_status(learn_id, "applied_to_workbench_playbook", f"apply_id={normalized_apply_id}; {note}")
+        update_proposal_application_status(learn_id, "applied_to_workbench_playbook", f"apply_id={normalized_apply_id}; {note}")
+    log_event("apply_enacted", apply_id=normalized_apply_id, learn_id=learn_id)
+    return f"""Applied to Workbench Playbook: {normalized_apply_id}
+- status: applied
+- target_path: {playbook_display_path(target_path)}
+- registry_application_status: applied_to_workbench_playbook
+- runtime_injection_enabled: false
+- Applied to Workbench Playbook, but not applied to Hermes / Memory / SkillRepo / system prompt / project code."""
+
+
+def build_apply_revert_reply(apply_id: str, note: str) -> str:
+    normalized_apply_id = normalize_apply_id(apply_id)
+    text = read_application(normalized_apply_id)
+    meta = task_metadata(text)
+    if meta.get("status") != "applied":
+        return f"Cannot revert {normalized_apply_id}: status must be applied, current={meta.get('status', 'unknown')}."
+    target_path = playbook_path_from_display(meta.get("target_path", ""))
+    ensure_playbook_header(target_path, meta.get("target", "global_playbook"))
+    now = iso_now()
+    learn_id = meta.get("source_learn_id", "")
+    revert_note = f"""## Revert Note {normalized_apply_id}
+
+reverted_at: {now}
+apply_id: {normalized_apply_id}
+source_learn_id: {learn_id}
+application_status: reverted_from_workbench_playbook
+runtime_injection_enabled: false
+note: {sanitize_sensitive_text(note).strip() or 'no note'}
+
+The original playbook entry is retained for audit. This revert did not modify Hermes, Memory, SkillRepo, system prompts, or project code.
+"""
+    with target_path.open("a", encoding="utf-8") as handle:
+        handle.write("\n\n" + sanitize_sensitive_text(revert_note).strip() + "\n")
+    text = append_to_section(text, "Revert Record", f"### Reverted at {now}\n- note: {sanitize_sensitive_text(note).strip() or 'no note'}\n- target_path: {playbook_display_path(target_path)}\n- runtime_injection_enabled: false")
+    text = replace_task_field(text, "status", "reverted")
+    text = replace_task_field(text, "updated_at", now)
+    write_application(normalized_apply_id, text)
+    if learn_id:
+        update_registry_application_status(learn_id, "reverted_from_workbench_playbook", f"apply_id={normalized_apply_id}; {note}")
+        update_proposal_application_status(learn_id, "reverted_from_workbench_playbook", f"apply_id={normalized_apply_id}; {note}")
+    log_event("apply_reverted", apply_id=normalized_apply_id, learn_id=learn_id)
+    return f"""Workbench-only apply reverted: {normalized_apply_id}
+- status: reverted
+- target_path: {playbook_display_path(target_path)}
+- registry_application_status: reverted_from_workbench_playbook
+- runtime_injection_enabled: false
+- Revert Note appended; original playbook entry was not deleted."""
+
+
+def build_apply_cancel_reply(apply_id: str, note: str) -> str:
+    normalized_apply_id = normalize_apply_id(apply_id)
+    text = read_application(normalized_apply_id)
+    meta = task_metadata(text)
+    if meta.get("status") != "planned":
+        return f"Cannot cancel {normalized_apply_id}: status must be planned, current={meta.get('status', 'unknown')}."
+    now = iso_now()
+    text = append_to_section(text, "Apply Record", f"### Cancelled at {now}\n- note: {sanitize_sensitive_text(note).strip() or 'no note'}")
+    text = replace_task_field(text, "status", "cancelled")
+    text = replace_task_field(text, "updated_at", now)
+    write_application(normalized_apply_id, text)
+    log_event("apply_cancelled", apply_id=normalized_apply_id)
+    return f"""Apply plan cancelled: {normalized_apply_id}
+- status: cancelled
+- no playbook write occurred."""
+
+
+def build_apply_dashboard_reply() -> str:
+    counts = apply_counts()
+    return f"""Atlas Apply Dashboard
+- planned_count: {counts['planned_count']}
+- applied_count: {counts['applied_count']}
+- reverted_count: {counts['reverted_count']}
+- cancelled_count: {counts['cancelled_count']}
+- global_playbook_entries: {counts['global_playbook_entries']}
+- project_playbook_entries: {counts['project_playbook_entries']}
+- runtime_injection_enabled: false
+- external_application_enabled: false
+
+Today suggestion:
+- Enact only planned apply plans that have an approved learning registry entry and a clear rollback plan.
+- Keep Playbook as reference layer; do not treat it as runtime behavior."""
+
+
+def handle_apply_command(user_text: str) -> str | None:
+    first_line = user_text.strip().splitlines()[0] if user_text.strip() else ""
+    parts = first_line.split(maxsplit=2)
+    if len(parts) < 2 or parts[0].lower() != "/apply":
+        return None
+    subcommand = parts[1].lower()
+    tail = parts[2] if len(parts) > 2 else ""
+    try:
+        if subcommand == "help":
+            return build_apply_help_reply()
+        if subcommand == "plan":
+            return build_apply_plan_reply(tail)
+        if subcommand == "show":
+            return build_apply_show_reply(tail)
+        if subcommand == "list":
+            list_parts = tail.split()
+            if len(list_parts) >= 2 and list_parts[0] == "--status":
+                return build_apply_list_reply(list_parts[1])
+            return build_apply_list_reply()
+        if subcommand == "enact":
+            enact_parts = tail.split(maxsplit=1)
+            if not enact_parts:
+                return "Usage: /apply enact <apply_id> <note>"
+            return build_apply_enact_reply(enact_parts[0], enact_parts[1] if len(enact_parts) > 1 else "")
+        if subcommand == "revert":
+            revert_parts = tail.split(maxsplit=1)
+            if not revert_parts:
+                return "Usage: /apply revert <apply_id> <note>"
+            return build_apply_revert_reply(revert_parts[0], revert_parts[1] if len(revert_parts) > 1 else "")
+        if subcommand == "cancel":
+            cancel_parts = tail.split(maxsplit=1)
+            if not cancel_parts:
+                return "Usage: /apply cancel <apply_id> <note>"
+            return build_apply_cancel_reply(cancel_parts[0], cancel_parts[1] if len(cancel_parts) > 1 else "")
+        if subcommand == "dashboard":
+            return build_apply_dashboard_reply()
+        return build_apply_help_reply()
+    except FileNotFoundError as exc:
+        return f"apply source not found: {safe_preview(str(exc), 180)}"
+    except ValueError as exc:
+        return f"apply operation refused: {safe_preview(str(exc), 240)}"
+    except Exception as exc:
+        return f"apply operation failed: {safe_preview(str(exc), 180)}"
+
+
+def build_playbook_help_reply() -> str:
+    return """Atlas Playbook commands
+- /playbook help
+- /playbook show global
+- /playbook show project <project_id>
+- /playbook list
+- /playbook search <keyword>
+- /playbook advise task <task_id>
+- /playbook advise project <project_id>
+
+Playbook is a Workbench reference layer only. It does not change runtime behavior. runtime_injection_enabled: false."""
+
+
+def playbook_summary(path: Path, label: str) -> str:
+    safe_path = ensure_inside_playbooks(path)
+    if not safe_path.exists():
+        return f"Playbook {label}: none\n- path: {playbook_display_path(safe_path)}\n- entry_count: 0"
+    text = safe_path.read_text(encoding="utf-8")
+    entries = re.findall(r"^## (LEARN-\d{8}-\d{6}(?:-\d{2})?.*)$", text, re.MULTILINE)
+    recent = entries[-5:]
+    lines = [
+        f"Playbook {label}",
+        f"- path: {playbook_display_path(safe_path)}",
+        f"- entry_count: {playbook_entry_count(safe_path)}",
+        f"- updated_at: {datetime.fromtimestamp(safe_path.stat().st_mtime).astimezone().isoformat(timespec='seconds')}",
+        "- runtime_injection_enabled: false",
+        "",
+        "Recent entries:",
+    ]
+    lines.extend([f"- {entry}" for entry in recent] or ["- none."])
+    return "\n".join(lines)
+
+
+def build_playbook_show_reply(tail: str) -> str:
+    parts = str(tail or "").strip().split()
+    if not parts:
+        return "Usage: /playbook show global OR /playbook show project <project_id>"
+    kind = parts[0].lower()
+    if kind == "global":
+        return playbook_summary(global_playbook_path(), "global")
+    if kind == "project":
+        if len(parts) < 2:
+            return "Usage: /playbook show project <project_id>"
+        project_id = validate_project_id(parts[1])
+        read_project(project_id)
+        return playbook_summary(project_playbook_path(project_id), f"project {project_id}")
+    return "Usage: /playbook show global OR /playbook show project <project_id>"
+
+
+def build_playbook_list_reply() -> str:
+    records = playbook_records()
+    if not records:
+        return "Playbooks:\n- none."
+    lines = ["Playbooks:"]
+    for record in records:
+        lines.append(f"- {record['name']} | entries={record['entry_count']} | updated_at={record['updated_at']} | path={display_path(record['path']).replace(chr(92), '/')}")
+    return "\n".join(lines)
+
+
+def build_playbook_search_reply(keyword: str) -> str:
+    clean_keyword = sanitize_sensitive_text(keyword).strip()
+    if not clean_keyword:
+        return "Usage: /playbook search <keyword>"
+    records = playbook_records()
+    hits = []
+    lowered = clean_keyword.lower()
+    for record in records:
+        path = ensure_inside_playbooks(record["path"])
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for index, line in enumerate(lines, start=1):
+            if lowered in line.lower():
+                hits.append(f"- {record['name']}:{index} {safe_preview(line, 180)}")
+                if len(hits) >= 10:
+                    break
+        if len(hits) >= 10:
+            break
+    if not hits:
+        return f"Playbook search: {clean_keyword}\n- no hits in workbench/playbooks."
+    return "Playbook search: " + clean_keyword + "\n" + "\n".join(hits)
+
+
+def context_keywords_from_text(text: str, limit: int = 20) -> list[str]:
+    clean = sanitize_sensitive_text(text).lower()
+    tokens = []
+    for token in re.findall(r"[a-z0-9_-]{4,}", clean):
+        if token not in tokens:
+            tokens.append(token)
+    for raw in re.split(r"\s+", sanitize_sensitive_text(text)):
+        value = raw.strip("，。,.!?:;()[]{}<>|`'\"")
+        if len(value) >= 3 and value not in tokens:
+            tokens.append(value)
+    return tokens[:limit]
+
+
+def playbook_entry_units() -> list[dict]:
+    units = []
+    for record in playbook_records():
+        path = ensure_inside_playbooks(record["path"])
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        matches = list(re.finditer(r"^## (LEARN-\d{8}-\d{6}(?:-\d{2})?.*)$", text, re.MULTILINE))
+        if not matches and text.strip():
+            units.append({"name": record["name"], "heading": record["name"], "body": text, "path": path})
+            continue
+        for index, match in enumerate(matches):
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+            units.append(
+                {
+                    "name": record["name"],
+                    "heading": match.group(1).strip(),
+                    "body": text[match.start():end].strip(),
+                    "path": path,
+                }
+            )
+    return units
+
+
+def score_playbook_unit(unit: dict, keywords: list[str]) -> int:
+    haystack = f"{unit.get('heading', '')}\n{unit.get('body', '')}".lower()
+    score = 0
+    for keyword in keywords:
+        key = keyword.lower()
+        if key and key in haystack:
+            score += 1
+    return score
+
+
+def playbook_advisory_lines_for_keywords(keywords: list[str], max_items: int = 5) -> list[str]:
+    scored = []
+    for unit in playbook_entry_units():
+        score = score_playbook_unit(unit, keywords)
+        if score:
+            scored.append((score, unit))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    if not scored:
+        return ["- 未找到相关 playbook 条目 / no relevant playbook entries found."]
+    lines = []
+    for score, unit in scored[:max_items]:
+        lines.append(f"- {unit['heading']} | source={unit['name']} | score={score} | {safe_preview(unit['body'], 220)}")
+    return lines
+
+
+def playbook_advisory_for_task(task_id: str, max_items: int = 5) -> str:
+    normalized_task_id = normalize_task_id(task_id)
+    task_text = read_task(normalized_task_id)
+    meta = task_metadata(task_text)
+    project_text = ""
+    if meta.get("project_id"):
+        try:
+            project_text = read_project(meta["project_id"])
+        except Exception:
+            project_text = ""
+    evidence_gap_text = ""
+    try:
+        evidence_gap_text = "\n".join(evidence_analysis(normalized_task_id, task_text).get("missing", []))
+    except Exception:
+        evidence_gap_text = ""
+    retro_text = ""
+    try:
+        retro_text = read_retro(normalized_task_id)
+    except Exception:
+        retro_text = ""
+    keyword_source = "\n".join(
+        [
+            task_title_from_text(normalized_task_id, task_text),
+            meta.get("project_id", ""),
+            task_section(task_text, "Goal"),
+            task_section(task_text, "Scope"),
+            task_section(task_text, "Acceptance Criteria"),
+            evidence_gap_text,
+            task_section(retro_text, "Lessons Learned"),
+            task_section(retro_text, "Candidate Improvements"),
+            project_title_from_text(meta.get("project_id", ""), project_text) if project_text and meta.get("project_id") else "",
+        ]
+    )
+    lines = playbook_advisory_lines_for_keywords(context_keywords_from_text(keyword_source), max_items=max_items)
+    return "\n".join(lines)
+
+
+def playbook_advisory_for_project(project_id: str, max_items: int = 5) -> str:
+    clean_project_id = validate_project_id(project_id)
+    project_text = read_project(clean_project_id)
+    tasks = project_task_records(clean_project_id)
+    task_texts = []
+    for task in tasks[:10]:
+        try:
+            task_texts.append(read_task(task["task_id"]))
+        except Exception:
+            continue
+    retro_text = "\n".join(task_section(record.get("text", ""), "Lessons Learned") for record in retro_records() if record.get("project_id") == clean_project_id)
+    keyword_source = "\n".join(
+        [
+            clean_project_id,
+            project_title_from_text(clean_project_id, project_text),
+            task_section(project_text, "Current State"),
+            task_section(project_text, "Next Actions"),
+            retro_text,
+            "\n".join(task_title_from_text(task_metadata(text).get("task_id", ""), text) if task_metadata(text).get("task_id") else text.splitlines()[0] for text in task_texts),
+        ]
+    )
+    lines = playbook_advisory_lines_for_keywords(context_keywords_from_text(keyword_source), max_items=max_items)
+    return "\n".join(lines)
+
+
+def build_playbook_advise_reply(tail: str) -> str:
+    parts = str(tail or "").strip().split(maxsplit=1)
+    if len(parts) != 2:
+        return "Usage: /playbook advise task <task_id> OR /playbook advise project <project_id>"
+    kind, value = parts[0].lower(), parts[1].strip()
+    if kind == "task":
+        normalized_task_id = normalize_task_id(value)
+        advisory = playbook_advisory_for_task(normalized_task_id)
+        return f"""Playbook Advisory for task {normalized_task_id}
+- search_scope: workbench/playbooks only
+- runtime_injection_enabled: false
+
+{advisory}"""
+    if kind == "project":
+        clean_project_id = validate_project_id(value)
+        advisory = playbook_advisory_for_project(clean_project_id)
+        return f"""Playbook Advisory for project {clean_project_id}
+- search_scope: workbench/playbooks only
+- runtime_injection_enabled: false
+
+{advisory}"""
+    return "Usage: /playbook advise task <task_id> OR /playbook advise project <project_id>"
+
+
+def handle_playbook_command(user_text: str) -> str | None:
+    first_line = user_text.strip().splitlines()[0] if user_text.strip() else ""
+    parts = first_line.split(maxsplit=2)
+    if len(parts) < 2 or parts[0].lower() != "/playbook":
+        return None
+    subcommand = parts[1].lower()
+    tail = parts[2] if len(parts) > 2 else ""
+    try:
+        if subcommand == "help":
+            return build_playbook_help_reply()
+        if subcommand == "show":
+            return build_playbook_show_reply(tail)
+        if subcommand == "list":
+            return build_playbook_list_reply()
+        if subcommand == "search":
+            return build_playbook_search_reply(tail)
+        if subcommand == "advise":
+            return build_playbook_advise_reply(tail)
+        return build_playbook_help_reply()
+    except FileNotFoundError as exc:
+        return f"playbook source not found: {safe_preview(str(exc), 180)}"
+    except ValueError as exc:
+        return f"playbook operation refused: {safe_preview(str(exc), 220)}"
+    except Exception as exc:
+        return f"playbook operation failed: {safe_preview(str(exc), 180)}"
+
+
+def generate_context_id() -> str:
+    ensure_workbench_dirs()
+    base = datetime.now().strftime("CTX-%Y%m%d-%H%M%S")
+    if not context_pack_path(base).exists():
+        return base
+    for index in range(1, 100):
+        candidate = f"{base}-{index:02d}"
+        if not context_pack_path(candidate).exists():
+            return candidate
+    raise RuntimeError("could not generate unique context_id")
+
+
+def read_context_pack(context_id: str) -> str:
+    path = context_pack_path(context_id)
+    if not path.exists():
+        raise FileNotFoundError(f"context pack not found: {context_id}")
+    return path.read_text(encoding="utf-8")
+
+
+def write_context_pack(context_id: str, text: str) -> None:
+    context_pack_path(context_id).write_text(sanitize_sensitive_text(text), encoding="utf-8")
+
+
+def context_title_from_text(context_id: str, text: str) -> str:
+    first_line = text.splitlines()[0] if text.splitlines() else ""
+    prefix = f"# {context_id} "
+    if first_line.startswith(prefix):
+        return first_line[len(prefix):].strip()
+    return "untitled context pack"
+
+
+def context_records() -> list[dict]:
+    ensure_workbench_dirs()
+    records = []
+    for path in sorted(CONTEXT_PACKS_DIR.glob("CTX-*.md")):
+        context_id = path.stem
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        meta = task_metadata(text)
+        records.append(
+            {
+                "context_id": context_id,
+                "title": context_title_from_text(context_id, text),
+                "status": meta.get("status", "active"),
+                "target": meta.get("target", "generic"),
+                "source_task_id": meta.get("source_task_id", ""),
+                "source_project_id": meta.get("source_project_id", ""),
+                "created_at": meta.get("created_at", ""),
+                "path": path,
+                "text": text,
+            }
+        )
+    return sorted(records, key=lambda item: item.get("created_at", ""), reverse=True)
+
+
+def context_counts() -> dict:
+    records = context_records()
+    project_ids = {record.get("source_project_id") for record in records if record.get("source_project_id")}
+    projects = {record.get("project_id") for record in project_records()}
+    return {
+        "context_pack_count": len(records),
+        "latest_context_id": records[0]["context_id"] if records else "",
+        "projects_with_context": len(project_ids),
+        "projects_missing_context": len(projects - project_ids),
+    }
+
+
+def optional_section(label: str, value: str) -> str:
+    text = sanitize_sensitive_text(value).strip()
+    return text if text else "- not available"
+
+
+def latest_execution_report(task_text: str) -> str:
+    report = task_section(task_text, "Execution Report")
+    if "### Report at" not in report:
+        return "- not available"
+    chunks = [chunk.strip() for chunk in report.split("### Report at") if chunk.strip()]
+    if not chunks:
+        return safe_preview(report, 800)
+    return "### Report at " + chunks[-1]
+
+
+def evidence_summary_for_task(task_id: str) -> tuple[str, str]:
+    try:
+        records = evidence_records(task_id)
+    except Exception:
+        return "- not available", "- not available"
+    if not records:
+        return "- not available", "- no evidence records found"
+    summary_lines = []
+    gap_lines = []
+    for record in records[:10]:
+        summary_lines.append(
+            f"- {record.get('evidence_id')} | type={record.get('type')} | verified={record.get('verified')} | supports={record.get('supports_acceptance')} | {safe_preview(record.get('observed') or record.get('claim') or record.get('notes'), 180)}"
+        )
+        if record.get("verified") != "verified" or record.get("supports_acceptance") in {"missing", "claimed"}:
+            gap_lines.append(f"- {record.get('evidence_id')} needs stronger verification or acceptance support.")
+    if not gap_lines:
+        gap_lines.append("- no obvious evidence gaps in evidence ledger")
+    return "\n".join(summary_lines), "\n".join(gap_lines)
+
+
+def learning_summary_for_task_project(task_id: str = "", project_id: str = "") -> str:
+    related = []
+    for record in registry_records():
+        if task_id and record.get("source_task_id") == task_id:
+            related.append(record)
+        elif project_id and record.get("source_project_id") == project_id:
+            related.append(record)
+    if not related:
+        return "- not available"
+    return "\n".join(
+        f"- {record['learn_id']} | application_status={record.get('application_status')} | project={record.get('source_project_id') or 'unassigned'} | {record.get('title')}"
+        for record in related[:10]
+    )
+
+
+def retro_lessons_for_task_project(task_id: str = "", project_id: str = "") -> str:
+    texts = []
+    if task_id:
+        try:
+            retro_text = read_retro(task_id)
+            texts.append(task_section(retro_text, "Lessons Learned") or task_section(retro_text, "Candidate Improvements"))
+        except Exception:
+            pass
+    if project_id:
+        for record in retro_records():
+            if record.get("project_id") == project_id:
+                texts.append(task_section(record.get("text", ""), "Lessons Learned") or task_section(record.get("text", ""), "Candidate Improvements"))
+    merged = "\n".join(text for text in texts if text.strip()).strip()
+    return merged or "- not available"
+
+
+def task_summary_block(task_id: str) -> tuple[str, str, str, str, str, str, str, str]:
+    normalized_task_id = normalize_task_id(task_id)
+    task_text = read_task(normalized_task_id)
+    meta = task_metadata(task_text)
+    project_id = meta.get("project_id", "")
+    project_text = ""
+    if project_id:
+        try:
+            project_text = read_project(project_id)
+        except Exception:
+            project_text = ""
+    task_summary = f"""- task_id: {normalized_task_id}
+- title: {task_title_from_text(normalized_task_id, task_text)}
+- status: {meta.get('status', 'unknown')}
+- project_id: {project_id or 'unassigned'}
+- updated_at: {meta.get('updated_at', '')}"""
+    project_summary = (
+        f"- project_id: {project_id}\n- title: {project_title_from_text(project_id, project_text)}\n- status: {project_metadata(project_text).get('status', 'unknown')}"
+        if project_text and project_id
+        else "- not available"
+    )
+    evidence_summary, evidence_gaps = evidence_summary_for_task(normalized_task_id)
+    return (
+        task_text,
+        project_text,
+        task_summary,
+        project_summary,
+        evidence_summary,
+        evidence_gaps,
+        project_id,
+        meta.get("status", "unknown"),
+    )
+
+
+def build_context_pack_markdown_for_task(context_id: str, task_id: str, target: str = "generic") -> str:
+    normalized_task_id = normalize_task_id(task_id)
+    task_text, _project_text, task_summary, project_summary, evidence_summary, evidence_gaps, project_id, task_status_value = task_summary_block(normalized_task_id)
+    title = task_title_from_text(normalized_task_id, task_text)
+    advisory = playbook_advisory_for_task(normalized_task_id)
+    retro_lessons = retro_lessons_for_task_project(task_id=normalized_task_id, project_id=project_id)
+    learning_summary = learning_summary_for_task_project(task_id=normalized_task_id, project_id=project_id)
+    latest_report = latest_execution_report(task_text)
+    review_summary = optional_section("Atlas Review Summary", task_section(task_text, "Atlas Review"))
+    user_decision = optional_section("User Decision", task_section(task_text, "User Decision"))
+    acceptance = optional_section("Acceptance Criteria", task_section(task_text, "Acceptance Criteria"))
+    next_action = f"- Review evidence gaps first; then decide whether to ask Codex/Kiro for more evidence or continue. task_status={task_status_value}"
+    handoff_context = build_copyable_handoff_context(normalized_task_id, target, advisory, create_file=False)
+    return sanitize_sensitive_text(f"""# {context_id} {sanitize_title(title)}
+
+context_id: {context_id}
+status: active
+created_at: {iso_now()}
+source: atlas
+mode: consultation
+target: {target}
+source_task_id: {normalized_task_id}
+source_project_id: {project_id}
+runtime_injection_enabled: false
+external_execution_enabled: false
+
+## Task Summary
+{task_summary}
+
+## Project Summary
+{project_summary}
+
+## Current Status
+- task_status: {task_status_value}
+- runtime_injection_enabled: false
+- external_execution_enabled: false
+
+## Acceptance Criteria
+{acceptance}
+
+## Evidence Summary
+{evidence_summary}
+
+## Evidence Gaps
+{evidence_gaps}
+
+## Latest Report
+{latest_report}
+
+## Atlas Review Summary
+{review_summary}
+
+## User Decision
+{user_decision}
+
+## Retro Lessons
+{retro_lessons}
+
+## Learning Registry Summary
+{learning_summary}
+
+## Playbook Advisory
+{advisory}
+
+## Safety Boundary
+- Read only workbench materials.
+- Write only workbench/context_packs.
+- Do not read .env.
+- Do not modify Hermes, Memory, SkillRepo, system prompts, or project code.
+- Do not run commands or call Codex/Kiro automatically.
+
+## Recommended Next Action
+{next_action}
+
+## Copyable Handoff Context
+{handoff_context}
+
+## Not Applied To
+- Hermes config
+- Hermes Memory
+- SkillRepo
+- System prompt
+- Project code
+""")
+
+
+def project_context_task_summary(project_id: str) -> str:
+    clean_project_id = validate_project_id(project_id)
+    records = [
+        record for record in project_task_records(clean_project_id)
+        if record.get("status") in {"open", "reported", "reviewed", "needs_evidence", "blocked"}
+    ]
+    if not records:
+        return "- not available"
+    return "\n".join(f"- {record['task_id']} | {record['status']} | {record['updated_at']} | {record['title']}" for record in records[:20])
+
+
+def project_evidence_gap_summary(project_id: str) -> str:
+    clean_project_id = validate_project_id(project_id)
+    lines = []
+    for record in project_task_records(clean_project_id):
+        try:
+            analysis = evidence_analysis(record["task_id"])
+        except Exception:
+            continue
+        if analysis.get("has_gaps"):
+            lines.append(f"- {record['task_id']} | {record['title']} | missing={'; '.join(analysis.get('missing', [])[:3])}")
+    return "\n".join(lines[:20]) if lines else "- not available"
+
+
+def build_context_pack_markdown_for_project(context_id: str, project_id: str, target: str = "generic") -> str:
+    clean_project_id = validate_project_id(project_id)
+    project_text = read_project(clean_project_id)
+    project_meta = project_metadata(project_text)
+    title = project_title_from_text(clean_project_id, project_text)
+    task_summary = project_context_task_summary(clean_project_id)
+    evidence_gaps = project_evidence_gap_summary(clean_project_id)
+    advisory = playbook_advisory_for_project(clean_project_id)
+    retro_lessons = retro_lessons_for_task_project(project_id=clean_project_id)
+    learning_summary = learning_summary_for_task_project(project_id=clean_project_id)
+    return sanitize_sensitive_text(f"""# {context_id} {sanitize_title(title)}
+
+context_id: {context_id}
+status: active
+created_at: {iso_now()}
+source: atlas
+mode: consultation
+target: {target}
+source_task_id:
+source_project_id: {clean_project_id}
+runtime_injection_enabled: false
+external_execution_enabled: false
+
+## Task Summary
+{task_summary}
+
+## Project Summary
+- project_id: {clean_project_id}
+- title: {title}
+- status: {project_meta.get('status', 'unknown')}
+- priority: {project_meta.get('priority', '')}
+- updated_at: {project_meta.get('updated_at', '')}
+
+## Current Status
+{optional_section('Current Status', task_section(project_text, 'Current State'))}
+
+## Acceptance Criteria
+- project-level pack; see task-specific packs for full criteria.
+
+## Evidence Summary
+- project evidence is summarized through task evidence ledgers.
+
+## Evidence Gaps
+{evidence_gaps}
+
+## Latest Report
+- project-level pack; see task-specific reports.
+
+## Atlas Review Summary
+- project-level pack; see task-specific Atlas reviews.
+
+## User Decision
+- project-level pack; see task-specific user decisions.
+
+## Retro Lessons
+{retro_lessons}
+
+## Learning Registry Summary
+{learning_summary}
+
+## Playbook Advisory
+{advisory}
+
+## Safety Boundary
+- Read only workbench materials.
+- Write only workbench/context_packs.
+- Do not read .env.
+- Do not modify Hermes, Memory, SkillRepo, system prompts, or project code.
+- Do not run commands or call Codex/Kiro automatically.
+
+## Recommended Next Action
+- Pick the highest-risk active/reported/reviewed/needs_evidence task and generate a task handoff with context.
+
+## Copyable Handoff Context
+- Project context pack for manual copy only. It is not sent automatically.
+
+## Not Applied To
+- Hermes config
+- Hermes Memory
+- SkillRepo
+- System prompt
+- Project code
+""")
+
+
+def build_context_help_reply() -> str:
+    return """Atlas Context Pack commands
+- /context help
+- /context pack task <task_id>
+- /context pack project <project_id>
+- /context show <context_id>
+- /context list
+- /context archive <context_id>
+- /context handoff <task_id> codex|kiro
+
+Boundary: reads workbench only, writes workbench/context_packs only, does not read .env, does not execute commands, does not call Codex/Kiro, and does not perform runtime injection."""
+
+
+def build_context_pack_task_reply(task_id: str) -> str:
+    normalized_task_id = normalize_task_id(task_id)
+    context_id = generate_context_id()
+    markdown = build_context_pack_markdown_for_task(context_id, normalized_task_id)
+    write_context_pack(context_id, markdown)
+    meta = task_metadata(read_task(normalized_task_id))
+    log_event("context_pack_created", context_id=context_id, source_task_id=normalized_task_id)
+    return f"""Context Pack created: {context_id}
+- source_task_id: {normalized_task_id}
+- source_project_id: {meta.get('project_id', '') or 'unassigned'}
+- path: workbench/context_packs/{context_id}.md
+- runtime_injection_enabled: false
+- external_execution_enabled: false
+- next: /context show {context_id}"""
+
+
+def build_context_pack_project_reply(project_id: str) -> str:
+    clean_project_id = validate_project_id(project_id)
+    read_project(clean_project_id)
+    context_id = generate_context_id()
+    markdown = build_context_pack_markdown_for_project(context_id, clean_project_id)
+    write_context_pack(context_id, markdown)
+    log_event("context_pack_created", context_id=context_id, source_project_id=clean_project_id)
+    return f"""Context Pack created: {context_id}
+- source_project_id: {clean_project_id}
+- path: workbench/context_packs/{context_id}.md
+- runtime_injection_enabled: false
+- external_execution_enabled: false
+- next: /context show {context_id}"""
+
+
+def build_context_show_reply(context_id: str) -> str:
+    normalized_context_id = normalize_context_id(context_id)
+    text = read_context_pack(normalized_context_id)
+    meta = task_metadata(text)
+    return f"""Context Pack: {normalized_context_id}
+- title: {context_title_from_text(normalized_context_id, text)}
+- status: {meta.get('status', 'active')}
+- target: {meta.get('target', 'generic')}
+- source_task_id: {meta.get('source_task_id', '') or 'none'}
+- source_project_id: {meta.get('source_project_id', '') or 'unassigned'}
+- task_summary: {safe_preview(task_section(text, 'Task Summary'), 260)}
+- evidence_gaps: {safe_preview(task_section(text, 'Evidence Gaps'), 260)}
+- playbook_advisory: {safe_preview(task_section(text, 'Playbook Advisory'), 260)}
+- recommended_next_action: {safe_preview(task_section(text, 'Recommended Next Action'), 220)}
+- runtime_injection_enabled: false
+- external_execution_enabled: false"""
+
+
+def build_context_list_reply() -> str:
+    records = context_records()
+    if not records:
+        return "Context Packs:\n- none."
+    lines = ["Context Packs:"]
+    for record in records[:10]:
+        lines.append(
+            f"- {record['context_id']} | {record.get('status')} | target={record.get('target')} | task={record.get('source_task_id') or 'none'} | project={record.get('source_project_id') or 'unassigned'} | {record.get('created_at')} | {record.get('title')}"
+        )
+    return "\n".join(lines)
+
+
+def build_context_archive_reply(context_id: str) -> str:
+    normalized_context_id = normalize_context_id(context_id)
+    text = read_context_pack(normalized_context_id)
+    text = replace_task_field(text, "status", "archived")
+    text = append_to_section(text, "Archive Record", f"- archived_at: {iso_now()}")
+    write_context_pack(normalized_context_id, text)
+    log_event("context_pack_archived", context_id=normalized_context_id)
+    return f"""Context Pack archived: {normalized_context_id}
+- status: archived
+- file retained: workbench/context_packs/{normalized_context_id}.md"""
+
+
+def build_copyable_handoff_context(task_id: str, platform: str, advisory: str = "", create_file: bool = False) -> str:
+    normalized_task_id = normalize_task_id(task_id)
+    target = platform.strip().lower()
+    if target not in {"codex", "kiro", "generic"}:
+        raise ValueError("target must be codex, kiro, or generic")
+    task_text, _project_text, task_summary, project_summary, evidence_summary, evidence_gaps, project_id, _status = task_summary_block(normalized_task_id)
+    display_target = "Codex" if target == "codex" else ("Kiro" if target == "kiro" else "Generic")
+    advisory_text = advisory or playbook_advisory_for_task(normalized_task_id)
+    context_file_line = "- context_file: not created"
+    if create_file:
+        context_id = generate_context_id()
+        write_context_pack(context_id, build_context_pack_markdown_for_task(context_id, normalized_task_id, target=target))
+        context_file_line = f"- context_file: workbench/context_packs/{context_id}.md"
+    return sanitize_sensitive_text(f"""# Handoff Context for {display_target}
+
+Execution target: {display_target}
+task_id: {normalized_task_id}
+project_id: {project_id or 'unassigned'}
+{context_file_line}
+
+## Context Summary
+{task_summary}
+
+## Project Context
+{project_summary}
+
+## Evidence Status
+{evidence_summary}
+
+## Evidence Gaps
+{evidence_gaps}
+
+## Playbook Advisory
+{advisory_text}
+
+## Forbidden
+- Do not read or print .env, tokens, cookies, or secrets.
+- Do not modify unauthorized project files.
+- Do not claim completion without evidence.
+- Do not treat Playbook as runtime instructions.
+
+## Return Report Format
+- Modified files
+- Commands
+- Test results
+- Evidence or logs
+- Unverified items
+- Unresolved risks
+- Rollback notes
+
+This is not sent automatically. It is copy-only context for manual handoff.
+""")
+
+
+def build_context_handoff_reply(task_id: str, platform: str) -> str:
+    target = platform.strip().lower()
+    if target not in {"codex", "kiro"}:
+        return "Usage: /context handoff <task_id> codex|kiro"
+    return build_copyable_handoff_context(task_id, target, create_file=False)
+
+
+def handle_context_command(user_text: str) -> str | None:
+    first_line = user_text.strip().splitlines()[0] if user_text.strip() else ""
+    parts = first_line.split(maxsplit=3)
+    if len(parts) < 2 or parts[0].lower() != "/context":
+        return None
+    subcommand = parts[1].lower()
+    try:
+        if subcommand == "help":
+            return build_context_help_reply()
+        if subcommand == "pack":
+            if len(parts) < 4:
+                return "Usage: /context pack task <task_id> OR /context pack project <project_id>"
+            kind = parts[2].lower()
+            if kind == "task":
+                return build_context_pack_task_reply(parts[3])
+            if kind == "project":
+                return build_context_pack_project_reply(parts[3])
+            return "Usage: /context pack task <task_id> OR /context pack project <project_id>"
+        if subcommand == "show":
+            return build_context_show_reply(parts[2] if len(parts) > 2 else "")
+        if subcommand == "list":
+            return build_context_list_reply()
+        if subcommand == "archive":
+            return build_context_archive_reply(parts[2] if len(parts) > 2 else "")
+        if subcommand == "handoff":
+            handoff_parts = (parts[2] + (" " + parts[3] if len(parts) > 3 else "")).split()
+            if len(handoff_parts) != 2:
+                return "Usage: /context handoff <task_id> codex|kiro"
+            return build_context_handoff_reply(handoff_parts[0], handoff_parts[1])
+        return build_context_help_reply()
+    except FileNotFoundError as exc:
+        return f"context source not found: {safe_preview(str(exc), 180)}"
+    except ValueError as exc:
+        return f"context operation refused: {safe_preview(str(exc), 220)}"
+    except Exception as exc:
+        return f"context operation failed: {safe_preview(str(exc), 180)}"
+
+
+def generate_dispatch_id() -> str:
+    ensure_workbench_dirs()
+    base = datetime.now().strftime("DISPATCH-%Y%m%d-%H%M%S")
+    if not dispatch_path(base).exists():
+        return base
+    for index in range(1, 100):
+        candidate = f"{base}-{index:02d}"
+        if not dispatch_path(candidate).exists():
+            return candidate
+    raise RuntimeError("could not generate unique dispatch_id")
+
+
+def read_dispatch(dispatch_id: str) -> str:
+    path = dispatch_path(dispatch_id)
+    if not path.exists():
+        raise FileNotFoundError(f"dispatch not found: {dispatch_id}")
+    return path.read_text(encoding="utf-8")
+
+
+def write_dispatch(dispatch_id: str, text: str) -> None:
+    dispatch_path(dispatch_id).write_text(sanitize_sensitive_text(text), encoding="utf-8")
+
+
+def dispatch_title_from_text(dispatch_id: str, text: str) -> str:
+    first_line = text.splitlines()[0] if text.splitlines() else ""
+    prefix = f"# {dispatch_id} "
+    if first_line.startswith(prefix):
+        return first_line[len(prefix):].strip()
+    return "untitled dispatch"
+
+
+def quote_markdown_block(text: str) -> str:
+    clean = sanitize_sensitive_text(text).strip()
+    if not clean:
+        return "> not available"
+    return "\n".join(f"> {line}" if line else ">" for line in clean.splitlines())
+
+
+def dispatch_is_stale_record(record: dict, now: datetime | None = None) -> bool:
+    if record.get("status") != "sent":
+        return False
+    timestamp = record.get("sent_at") or record.get("updated_at") or record.get("created_at")
+    if not timestamp:
+        return False
+    try:
+        baseline = datetime.fromisoformat(timestamp)
+    except ValueError:
+        return False
+    current = now or datetime.now().astimezone()
+    if baseline.tzinfo is None:
+        baseline = baseline.astimezone()
+    return current - baseline > timedelta(hours=24)
+
+
+def dispatch_records() -> list[dict]:
+    ensure_workbench_dirs()
+    records = []
+    for path in sorted(DISPATCHES_DIR.glob("DISPATCH-*.md")):
+        dispatch_id = path.stem
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        meta = task_metadata(text)
+        record = {
+            "dispatch_id": dispatch_id,
+            "title": dispatch_title_from_text(dispatch_id, text),
+            "status": meta.get("status", "unknown"),
+            "created_at": meta.get("created_at", ""),
+            "updated_at": meta.get("updated_at", ""),
+            "sent_at": meta.get("sent_at", ""),
+            "task_id": meta.get("task_id", ""),
+            "project_id": meta.get("project_id", ""),
+            "target_executor": meta.get("target_executor", ""),
+            "context_id": meta.get("context_id", ""),
+            "path": path,
+            "text": text,
+        }
+        record["stale"] = dispatch_is_stale_record(record)
+        records.append(record)
+    return sorted(records, key=lambda item: item.get("updated_at", ""), reverse=True)
+
+
+def latest_dispatch_for_task(task_id: str) -> dict | None:
+    normalized_task_id = normalize_task_id(task_id)
+    matches = [record for record in dispatch_records() if record.get("task_id") == normalized_task_id]
+    status_rank = {
+        "returned": 70,
+        "qa_ready": 65,
+        "needs_evidence": 60,
+        "sent": 55,
+        "reviewed": 50,
+        "ready": 40,
+        "failed": 20,
+        "cancelled": 10,
+        "closed": 0,
+    }
+    matches = sorted(
+        matches,
+        key=lambda item: (item.get("updated_at", ""), status_rank.get(item.get("status", ""), 0)),
+        reverse=True,
+    )
+    return matches[0] if matches else None
+
+
+def dispatch_counts(records: list[dict] | None = None) -> dict:
+    items = records if records is not None else dispatch_records()
+    return {
+        "dispatch_count": len(items),
+        "dispatch_ready_count": sum(1 for item in items if item.get("status") == "ready"),
+        "dispatch_sent_count": sum(1 for item in items if item.get("status") == "sent"),
+        "dispatch_returned_count": sum(1 for item in items if item.get("status") == "returned"),
+        "dispatch_qa_ready_count": sum(1 for item in items if item.get("status") == "qa_ready"),
+        "dispatch_needs_evidence_count": sum(1 for item in items if item.get("status") == "needs_evidence"),
+        "dispatch_failed_count": sum(1 for item in items if item.get("status") == "failed"),
+        "dispatch_stale_count": sum(1 for item in items if item.get("stale")),
+    }
+
+
+def dispatches_for_project(project_id: str) -> list[dict]:
+    clean_project_id = validate_project_id(project_id)
+    return [record for record in dispatch_records() if record.get("project_id") == clean_project_id]
+
+
+def dispatch_context_summary(context_id: str) -> str:
+    if not context_id:
+        return "- context_id: none\n- context pack: not created"
+    try:
+        text = read_context_pack(context_id)
+    except Exception as exc:
+        return f"- context_id: {context_id}\n- context_error: {safe_preview(str(exc), 160)}"
+    return f"""- context_id: {context_id}
+- file: workbench/context_packs/{context_id}.md
+- task_summary: {safe_preview(task_section(text, 'Task Summary'), 240)}
+- evidence_gaps: {safe_preview(task_section(text, 'Evidence Gaps'), 240)}
+- playbook_advisory: {safe_preview(task_section(text, 'Playbook Advisory'), 240)}"""
+
+
+def build_dispatch_markdown(dispatch_id: str, task_id: str, target: str, with_context: bool) -> str:
+    normalized_task_id = normalize_task_id(task_id)
+    task_text, _project_text, task_summary, _project_summary, _evidence_summary, _evidence_gaps, project_id, _status = task_summary_block(normalized_task_id)
+    clean_target = target.strip().lower()
+    if clean_target not in {"codex", "kiro"}:
+        raise ValueError("target_executor must be codex or kiro")
+    title = task_title_from_text(normalized_task_id, task_text)
+    now = iso_now()
+    context_id = ""
+    if with_context:
+        context_id = generate_context_id()
+        write_context_pack(context_id, build_context_pack_markdown_for_task(context_id, normalized_task_id, target=clean_target))
+    advisory = playbook_advisory_for_task(normalized_task_id)
+    handoff = build_task_handoff_reply(normalized_task_id, clean_target)
+    return sanitize_sensitive_text(f"""# {dispatch_id} {sanitize_title(title)}
+
+dispatch_id: {dispatch_id}
+status: ready
+created_at: {now}
+updated_at: {now}
+sent_at:
+task_id: {normalized_task_id}
+project_id: {project_id}
+target_executor: {clean_target}
+context_id: {context_id}
+mode: manual
+external_execution_enabled: false
+runtime_injection_enabled: false
+owner: local
+
+## Task Summary
+{task_summary}
+
+## Handoff Package
+{quote_markdown_block(handoff)}
+
+## Context Pack Summary
+{dispatch_context_summary(context_id)}
+
+## Playbook Advisory
+{advisory}
+
+## Execution Window
+- status: ready
+- manual_copy_required: true
+- external_execution_enabled: false
+
+## Sent Record
+- not sent.
+
+## Return Report
+- not returned.
+
+## QA Result
+- not checked.
+
+## Atlas Review Link
+- task_review: workbench/tasks/{normalized_task_id}.md#Atlas-Review
+
+## User Decision Link
+- task_decision: workbench/tasks/{normalized_task_id}.md#User-Decision
+
+## Evidence Links
+- task_file: workbench/tasks/{normalized_task_id}.md
+- context_file: {('workbench/context_packs/' + context_id + '.md') if context_id else 'not created'}
+
+## Status Timeline
+- {now} dispatch created; status ready; target_executor={clean_target}; with_context={str(with_context).lower()}.
+
+## Safety Boundary
+- Dispatch may read workbench task, evidence, context, retro, learning, and playbook materials only.
+- Dispatch writes only workbench/dispatches and may create workbench/context_packs when requested.
+- Do not read .env.
+- Do not write Hermes, Memory, SkillRepo, system prompts, Octo Docker, or user project code.
+- Do not print tokens, cookies, passwords, api keys, or secrets.
+
+## Do Not Auto-Execute
+- This dispatch does not call Codex or Kiro.
+- This dispatch does not run commands.
+- This dispatch does not modify user project files.
+- It only records manual copy, manual sent status, manual return reports, QA notes, and review links.
+""")
+
+
+def build_dispatch_help_reply() -> str:
+    return """Atlas Dispatch commands
+- /dispatch help
+- /dispatch create <task_id> codex|kiro [--with-context]
+- /dispatch list [--status <status>]
+- /dispatch show <dispatch_id>
+- /dispatch package <dispatch_id>
+- /dispatch mark <dispatch_id> sent <note>
+- /dispatch receive <dispatch_id>
+  <pasted Codex/Kiro return report>
+- /dispatch qa <dispatch_id>
+- /dispatch link-review <dispatch_id>
+- /dispatch close <dispatch_id>
+- /dispatch cancel <dispatch_id> <note>
+- /dispatch fail <dispatch_id> <note>
+- /dispatch dashboard
+- /dispatch stale
+
+Boundary: manual dispatch ledger only. It does not call Codex/Kiro, does not run commands, does not modify user project files, and writes only workbench dispatch/context/task evidence records."""
+
+
+def build_dispatch_create_reply(tail: str) -> str:
+    parts = str(tail or "").strip().split()
+    if len(parts) < 2:
+        return "Usage: /dispatch create <task_id> codex|kiro [--with-context]"
+    task_id = normalize_task_id(parts[0])
+    target = parts[1].lower()
+    if target not in {"codex", "kiro"}:
+        return "Usage: /dispatch create <task_id> codex|kiro [--with-context]"
+    with_context = "--with-context" in [part.lower() for part in parts[2:]]
+    read_task(task_id)
+    dispatch_id = generate_dispatch_id()
+    markdown = build_dispatch_markdown(dispatch_id, task_id, target, with_context)
+    write_dispatch(dispatch_id, markdown)
+    meta = task_metadata(markdown)
+    log_event("dispatch_created", dispatch_id=dispatch_id, task_id=task_id, target_executor=target)
+    return f"""Dispatch created: {dispatch_id}
+- status: ready
+- task_id: {task_id}
+- target_executor: {target}
+- context_id: {meta.get('context_id') or 'none'}
+- path: workbench/dispatches/{dispatch_id}.md
+- external_execution_enabled: false
+- runtime_injection_enabled: false
+- next: /dispatch package {dispatch_id} and manually copy it to {target}"""
+
+
+def build_dispatch_list_reply(tail: str = "") -> str:
+    parts = str(tail or "").strip().split()
+    status_filter = ""
+    if parts:
+        if len(parts) == 2 and parts[0] == "--status":
+            status_filter = parts[1].lower()
+            if status_filter not in DISPATCH_STATUSES:
+                return "Invalid status. Use: draft/ready/sent/returned/qa_ready/reviewed/needs_evidence/failed/cancelled/closed"
+        else:
+            return "Usage: /dispatch list [--status <status>]"
+    records = dispatch_records()
+    if status_filter:
+        records = [record for record in records if record.get("status") == status_filter]
+    if not records:
+        return "Dispatches:\n- none."
+    lines = ["Dispatches:"]
+    for record in records[:20]:
+        stale = " stale" if record.get("stale") else ""
+        lines.append(
+            f"- {record['dispatch_id']} | {record.get('status')}{stale} | task={record.get('task_id')} | target={record.get('target_executor')} | updated={record.get('updated_at')} | {record.get('title')}"
+        )
+    return "\n".join(lines)
+
+
+def build_dispatch_show_reply(dispatch_id: str) -> str:
+    normalized_dispatch_id = normalize_dispatch_id(dispatch_id)
+    text = read_dispatch(normalized_dispatch_id)
+    meta = task_metadata(text)
+    task_id = meta.get("task_id", "")
+    task_status_value = "unknown"
+    task_next = "unknown"
+    if task_id:
+        try:
+            task_text = read_task(task_id)
+            task_status_value = task_metadata(task_text).get("status", "unknown")
+            task_next = safe_preview(build_task_next_reply(task_id), 180)
+        except Exception as exc:
+            task_next = f"task error: {safe_preview(str(exc), 120)}"
+    record = {
+        "status": meta.get("status", "unknown"),
+        "sent_at": meta.get("sent_at", ""),
+        "updated_at": meta.get("updated_at", ""),
+        "created_at": meta.get("created_at", ""),
+    }
+    stale = dispatch_is_stale_record(record)
+    return f"""Dispatch summary: {normalized_dispatch_id}
+- status: {meta.get('status', 'unknown')}
+- task_id: {task_id or 'none'}
+- task_status: {task_status_value}
+- project_id: {meta.get('project_id') or 'unassigned'}
+- target_executor: {meta.get('target_executor') or 'unknown'}
+- context_id: {meta.get('context_id') or 'none'}
+- updated_at: {meta.get('updated_at', '')}
+- stale: {str(stale).lower()}
+- return_report: {safe_preview(task_section(text, 'Return Report'), 240)}
+- qa_result: {safe_preview(task_section(text, 'QA Result'), 240)}
+- next: {task_next}"""
+
+
+def build_dispatch_package_reply(dispatch_id: str) -> str:
+    normalized_dispatch_id = normalize_dispatch_id(dispatch_id)
+    text = read_dispatch(normalized_dispatch_id)
+    meta = task_metadata(text)
+    task_id = normalize_task_id(meta.get("task_id", ""))
+    target = meta.get("target_executor", "").strip().lower()
+    if target not in {"codex", "kiro"}:
+        return "Dispatch target is invalid. Expected codex or kiro."
+    task_text = read_task(task_id)
+    display_target = "Codex" if target == "codex" else "Kiro"
+    return sanitize_sensitive_text(f"""# Manual Dispatch Package for {display_target}
+
+dispatch_id: {normalized_dispatch_id}
+task_id: {task_id}
+target_executor: {target}
+manual_copy_required: true
+external_execution_enabled: false
+runtime_injection_enabled: false
+
+This package is for manual copy only. Atlas/Bridge has not sent it and will not call {display_target}.
+
+## Task Title
+{task_title_from_text(task_id, task_text)}
+
+## Goal
+{optional_section('Goal', task_section(task_text, 'Goal'))}
+
+## Scope
+{optional_section('Scope', task_section(task_text, 'Scope'))}
+
+## Execution Boundary
+{optional_section('Execution Boundary', task_section(task_text, 'Execution Boundary'))}
+
+## Forbidden
+- Do not read, print, log, commit, or leak .env, tokens, cookies, passwords, api keys, or secrets.
+- Do not modify unauthorized projects.
+- Do not change Octo Docker or Hermes main code.
+- Do not claim completion without evidence.
+
+## Suggested Checks
+- Confirm working directory and current repo state before changes.
+- Keep changes minimal and inside the authorized scope.
+- Run relevant compile, smoke, or test commands.
+- Collect files, commands, test results, logs/screenshots, unverified items, and unresolved risks.
+
+## Acceptance Criteria
+{optional_section('Acceptance Criteria', task_section(task_text, 'Acceptance Criteria'))}
+
+## Context Pack Summary
+{dispatch_context_summary(meta.get('context_id', ''))}
+
+## Playbook Advisory
+{playbook_advisory_for_task(task_id)}
+
+## Return Report Format
+Task id: {task_id}
+Dispatch id: {normalized_dispatch_id}
+
+Execution summary:
+-
+
+Modified files:
+-
+
+Commands:
+-
+
+Test results:
+-
+
+Key logs or screenshots:
+-
+
+Unverified:
+-
+
+Unresolved risks:
+-
+
+Rollback notes:
+-
+
+## Sensitive Information Handling
+- Redact tokens, cookies, Authorization headers, passwords, api keys, and secrets before returning.
+- Do not paste .env content.
+
+## User Final Acceptance
+- The user will paste your report back with /dispatch receive {normalized_dispatch_id}.
+- Atlas will then run /dispatch qa, /task review, and wait for the user's final /task decide.
+""")
+
+
+def update_dispatch_status(dispatch_id: str, status: str, timeline: str, extra_fields: dict[str, str] | None = None) -> str:
+    if status not in DISPATCH_STATUSES:
+        raise ValueError("invalid dispatch status")
+    normalized_dispatch_id = normalize_dispatch_id(dispatch_id)
+    text = read_dispatch(normalized_dispatch_id)
+    now = iso_now()
+    text = replace_task_field(text, "status", status)
+    text = replace_task_field(text, "updated_at", now)
+    if extra_fields:
+        for key, value in extra_fields.items():
+            text = replace_task_field(text, key, value)
+    text = append_to_section(text, "Status Timeline", f"- {now} {timeline}")
+    write_dispatch(normalized_dispatch_id, text)
+    return text
+
+
+def build_dispatch_mark_reply(tail: str) -> str:
+    parts = str(tail or "").strip().split(maxsplit=3)
+    if len(parts) < 2 or parts[1].lower() != "sent":
+        return "Usage: /dispatch mark <dispatch_id> sent <note>"
+    dispatch_id = normalize_dispatch_id(parts[0])
+    note = sanitize_sensitive_text(parts[2] if len(parts) > 2 else "").strip() or "manual sent recorded"
+    now = iso_now()
+    text = update_dispatch_status(dispatch_id, "sent", f"marked sent: {note}", {"sent_at": now})
+    text = set_section_body(text, "Sent Record", f"- sent_at: {now}\n- note: {note}\n- manual_copy_only: true")
+    write_dispatch(dispatch_id, text)
+    log_event("dispatch_sent", dispatch_id=dispatch_id)
+    return f"""Dispatch marked sent: {dispatch_id}
+- status: sent
+- sent_at: {now}
+- note: {note}
+- next: wait for manual report, then /dispatch receive {dispatch_id}"""
+
+
+def build_dispatch_receive_reply(dispatch_id: str, report: str) -> str:
+    normalized_dispatch_id = normalize_dispatch_id(dispatch_id)
+    text = read_dispatch(normalized_dispatch_id)
+    meta = task_metadata(text)
+    task_id = normalize_task_id(meta.get("task_id", ""))
+    clean_report = sanitize_sensitive_text(report).strip() or "- empty return report; needs evidence."
+    now = iso_now()
+    text = replace_task_field(text, "status", "returned")
+    text = replace_task_field(text, "updated_at", now)
+    text = append_to_section(text, "Return Report", f"### Return at {now}\n{clean_report}")
+    text = append_to_section(text, "Status Timeline", f"- {now} return report received; status returned; synced to task report.")
+    write_dispatch(normalized_dispatch_id, text)
+    task_reply = build_task_report_reply(task_id, report)
+    log_event("dispatch_returned", dispatch_id=normalized_dispatch_id, task_id=task_id)
+    return f"""Dispatch return recorded: {normalized_dispatch_id}
+- status: returned
+- task_id: {task_id}
+- synced_task_report: true
+- path: workbench/dispatches/{normalized_dispatch_id}.md
+- next: /dispatch qa {normalized_dispatch_id}, then /task review {task_id}
+
+Task sync:
+{safe_preview(task_reply, 360)}"""
+
+
+def dispatch_qa_conclusion(qa_text: str) -> str:
+    for line in qa_text.splitlines()[:12]:
+        lowered = line.lower()
+        if "needs_evidence" in lowered:
+            return "needs_evidence"
+        if "pass" in lowered and any(marker in lowered for marker in ("quality", "conclusion", "recommendation", "status")):
+            return "pass"
+        if "pass" in lowered and any(marker in line for marker in ("质检", "结论", "推荐", "状态")):
+            return "pass"
+    return "needs_evidence"
+
+
+def build_dispatch_qa_reply(dispatch_id: str) -> str:
+    normalized_dispatch_id = normalize_dispatch_id(dispatch_id)
+    text = read_dispatch(normalized_dispatch_id)
+    meta = task_metadata(text)
+    task_id = normalize_task_id(meta.get("task_id", ""))
+    return_report = task_section(text, "Return Report")
+    if "### Return at" not in return_report:
+        qa_text = """Quality conclusion: needs_evidence
+
+Satisfied:
+- none
+
+Missing:
+- Return Report
+- Modified files
+- Commands
+- Test results
+- Key logs or screenshots
+- Unverified items
+- Unresolved risks
+
+Risks:
+- No return report is recorded, so the dispatch cannot support acceptance.
+
+Recommended decision: needs_evidence"""
+        status = "needs_evidence"
+    else:
+        qa_text = build_task_qa_reply(task_id)
+        conclusion = dispatch_qa_conclusion(qa_text)
+        status = "qa_ready" if conclusion == "pass" else "needs_evidence"
+        qa_text = f"dispatch_id: {normalized_dispatch_id}\n{qa_text}\n\nDispatch QA note:\n- observed evidence is not verified automatically.\n- Recommended: /evidence mark <task_id> <evidence_id> verified, then /task review {task_id}."
+    now = iso_now()
+    text = read_dispatch(normalized_dispatch_id)
+    text = replace_task_field(text, "status", status)
+    text = replace_task_field(text, "updated_at", now)
+    text = append_to_section(text, "QA Result", f"### QA at {now}\n{qa_text}")
+    text = append_to_section(text, "Status Timeline", f"- {now} dispatch QA generated; status {status}.")
+    write_dispatch(normalized_dispatch_id, text)
+    log_event("dispatch_qa", dispatch_id=normalized_dispatch_id, status=status)
+    return f"""Dispatch QA: {normalized_dispatch_id}
+- status: {status}
+- task_id: {task_id}
+
+{qa_text}
+
+Next:
+- /task review {task_id}
+- /dispatch link-review {normalized_dispatch_id}"""
+
+
+def build_dispatch_link_review_reply(dispatch_id: str) -> str:
+    normalized_dispatch_id = normalize_dispatch_id(dispatch_id)
+    text = read_dispatch(normalized_dispatch_id)
+    meta = task_metadata(text)
+    task_id = normalize_task_id(meta.get("task_id", ""))
+    task_text = read_task(task_id)
+    review = task_section(task_text, "Atlas Review")
+    decision = task_section(task_text, "User Decision")
+    has_review = "Review at" in review or "å®¡æŸ¥" in review
+    now = iso_now()
+    link_body = f"""- linked_at: {now}
+- task_file: workbench/tasks/{task_id}.md
+- atlas_review_summary: {safe_preview(review, 420) or 'not reviewed'}
+- user_decision_summary: {safe_preview(decision, 220) or 'not decided'}"""
+    text = set_section_body(text, "Atlas Review Link", link_body)
+    text = append_to_section(text, "Status Timeline", f"- {now} linked task review; has_review={str(has_review).lower()}.")
+    if has_review:
+        text = replace_task_field(text, "status", "reviewed")
+        text = replace_task_field(text, "updated_at", now)
+    write_dispatch(normalized_dispatch_id, text)
+    return f"""Dispatch review link updated: {normalized_dispatch_id}
+- task_id: {task_id}
+- has_review: {str(has_review).lower()}
+- status: {'reviewed' if has_review else meta.get('status', 'unknown')}
+- next: /task decide {task_id} pass|needs_evidence|blocked|cancelled <note>"""
+
+
+def build_dispatch_close_reply(dispatch_id: str) -> str:
+    normalized_dispatch_id = normalize_dispatch_id(dispatch_id)
+    text = read_dispatch(normalized_dispatch_id)
+    meta = task_metadata(text)
+    task_id = meta.get("task_id", "")
+    dispatch_status_value = meta.get("status", "unknown")
+    task_status_value = "unknown"
+    if task_id:
+        task_status_value = task_status(task_id)
+    if dispatch_status_value not in {"cancelled", "failed", "closed"} and task_status_value not in {"passed", "cancelled", "archived"}:
+        return (
+            f"Cannot close dispatch {normalized_dispatch_id}: dispatch_status={dispatch_status_value}, "
+            f"task_status={task_status_value}. Close only after task passed/cancelled/archived or dispatch cancelled/failed."
+        )
+    update_dispatch_status(normalized_dispatch_id, "closed", f"dispatch closed; previous_status={dispatch_status_value}; task_status={task_status_value}.")
+    log_event("dispatch_closed", dispatch_id=normalized_dispatch_id)
+    return f"""Dispatch closed: {normalized_dispatch_id}
+- status: closed
+- task_id: {task_id or 'none'}
+- task_status: {task_status_value}"""
+
+
+def build_dispatch_terminal_reply(tail: str, status: str) -> str:
+    parts = str(tail or "").strip().split(maxsplit=1)
+    if not parts:
+        return f"Usage: /dispatch {status} <dispatch_id> <note>"
+    dispatch_id = normalize_dispatch_id(parts[0])
+    note = sanitize_sensitive_text(parts[1] if len(parts) > 1 else "").strip() or f"manual {status}"
+    update_dispatch_status(dispatch_id, status, f"marked {status}: {note}")
+    log_event(f"dispatch_{status}", dispatch_id=dispatch_id)
+    return f"""Dispatch marked {status}: {dispatch_id}
+- status: {status}
+- note: {note}
+- manual ledger only: true"""
+
+
+def build_dispatch_dashboard_reply() -> str:
+    records = dispatch_records()
+    counts = dispatch_counts(records)
+    ready = [record for record in records if record.get("status") == "ready"][:10]
+    sent = [record for record in records if record.get("status") == "sent"][:10]
+    returned = [record for record in records if record.get("status") == "returned"][:10]
+    failed = [record for record in records if record.get("status") == "failed"][:10]
+    lines = [
+        "Atlas Dispatch Dashboard",
+        f"- dispatch_count: {counts['dispatch_count']}",
+        f"- dispatch_ready_count: {counts['dispatch_ready_count']}",
+        f"- dispatch_sent_count: {counts['dispatch_sent_count']}",
+        f"- dispatch_returned_count: {counts['dispatch_returned_count']}",
+        f"- dispatch_needs_evidence_count: {counts['dispatch_needs_evidence_count']}",
+        f"- dispatch_failed_count: {counts['dispatch_failed_count']}",
+        f"- dispatch_stale_count: {counts['dispatch_stale_count']}",
+        "- external_execution_enabled: false",
+        "",
+        "Ready:",
+    ]
+    lines.extend([f"- {item['dispatch_id']} | task={item.get('task_id')} | target={item.get('target_executor')}" for item in ready] or ["- none"])
+    lines.append("")
+    lines.append("Sent not returned:")
+    lines.extend([f"- {item['dispatch_id']} | task={item.get('task_id')} | stale={str(item.get('stale')).lower()}" for item in sent] or ["- none"])
+    lines.append("")
+    lines.append("Returned pending QA:")
+    lines.extend([f"- {item['dispatch_id']} | task={item.get('task_id')} | target={item.get('target_executor')}" for item in returned] or ["- none"])
+    lines.append("")
+    lines.append("Failed:")
+    lines.extend([f"- {item['dispatch_id']} | task={item.get('task_id')} | {item.get('title')}" for item in failed] or ["- none"])
+    lines.append("")
+    lines.append("Suggested next actions:")
+    if ready:
+        lines.append(f"- Package and manually copy: /dispatch package {ready[0]['dispatch_id']}")
+    if sent:
+        lines.append(f"- If report is back, record it: /dispatch receive {sent[0]['dispatch_id']}")
+    if returned:
+        lines.append(f"- QA returned report: /dispatch qa {returned[0]['dispatch_id']}")
+    if not (ready or sent or returned):
+        lines.append("- Create a manual dispatch: /dispatch create <task_id> codex --with-context")
+    return "\n".join(lines)
+
+
+def build_dispatch_stale_reply() -> str:
+    stale = [record for record in dispatch_records() if record.get("stale")]
+    if not stale:
+        return "Stale dispatches:\n- none. Rule: status=sent and sent/updated time older than 24 hours."
+    lines = ["Stale dispatches (sent > 24h):"]
+    for record in stale[:20]:
+        lines.append(
+            f"- {record['dispatch_id']} | task={record.get('task_id')} | target={record.get('target_executor')} | sent_at={record.get('sent_at') or record.get('updated_at')} | next=/dispatch receive {record['dispatch_id']} OR /dispatch fail {record['dispatch_id']} <note>"
+        )
+    return "\n".join(lines)
+
+
+def handle_dispatch_command(user_text: str) -> str | None:
+    lines = user_text.strip().splitlines()
+    first_line = lines[0] if lines else ""
+    parts = first_line.split(maxsplit=2)
+    if len(parts) < 2 or parts[0].lower() != "/dispatch":
+        return None
+    subcommand = parts[1].lower()
+    tail = parts[2] if len(parts) > 2 else ""
+    try:
+        if subcommand == "help":
+            return build_dispatch_help_reply()
+        if subcommand == "create":
+            return build_dispatch_create_reply(tail)
+        if subcommand == "list":
+            return build_dispatch_list_reply(tail)
+        if subcommand == "show":
+            return build_dispatch_show_reply(tail)
+        if subcommand == "package":
+            return build_dispatch_package_reply(tail)
+        if subcommand == "mark":
+            return build_dispatch_mark_reply(tail)
+        if subcommand == "receive":
+            receive_parts = tail.split(maxsplit=1)
+            if not receive_parts:
+                return "Usage: /dispatch receive <dispatch_id>\n<pasted return report>"
+            dispatch_id = receive_parts[0]
+            inline = receive_parts[1] if len(receive_parts) > 1 else ""
+            body = "\n".join(lines[1:]).strip()
+            return build_dispatch_receive_reply(dispatch_id, body or inline)
+        if subcommand == "qa":
+            return build_dispatch_qa_reply(tail)
+        if subcommand == "link-review":
+            return build_dispatch_link_review_reply(tail)
+        if subcommand == "close":
+            return build_dispatch_close_reply(tail)
+        if subcommand == "cancel":
+            return build_dispatch_terminal_reply(tail, "cancelled")
+        if subcommand == "fail":
+            return build_dispatch_terminal_reply(tail, "failed")
+        if subcommand == "dashboard":
+            return build_dispatch_dashboard_reply()
+        if subcommand == "stale":
+            return build_dispatch_stale_reply()
+        return build_dispatch_help_reply()
+    except FileNotFoundError as exc:
+        return f"dispatch source not found: {safe_preview(str(exc), 180)}"
+    except ValueError as exc:
+        return f"dispatch operation refused: {safe_preview(str(exc), 220)}"
+    except Exception as exc:
+        return f"dispatch operation failed: {safe_preview(str(exc), 180)}"
+
+
+def generate_pilot_id() -> str:
+    ensure_workbench_dirs()
+    base = datetime.now().strftime("PILOT-%Y%m%d-%H%M%S")
+    if not pilot_path(base).exists():
+        return base
+    for index in range(1, 100):
+        candidate = f"{base}-{index:02d}"
+        if not pilot_path(candidate).exists():
+            return candidate
+    raise RuntimeError("could not generate unique pilot_id")
+
+
+def read_pilot(pilot_id: str) -> str:
+    path = pilot_path(pilot_id)
+    if not path.exists():
+        raise FileNotFoundError(f"pilot not found: {pilot_id}")
+    return path.read_text(encoding="utf-8")
+
+
+def write_pilot(pilot_id: str, text: str) -> None:
+    pilot_path(pilot_id).write_text(sanitize_sensitive_text(text), encoding="utf-8")
+
+
+def pilot_title_from_text(pilot_id: str, text: str) -> str:
+    first_line = text.splitlines()[0] if text.splitlines() else ""
+    prefix = f"# {pilot_id} "
+    if first_line.startswith(prefix):
+        return first_line[len(prefix):].strip()
+    return "untitled pilot"
+
+
+def build_pilot_markdown(pilot_id: str, project_id: str, title: str) -> str:
+    clean_project_id = validate_project_id(project_id)
+    project_text = read_project(clean_project_id)
+    now = iso_now()
+    clean_title = sanitize_title(title)
+    return sanitize_sensitive_text(f"""# {pilot_id} {clean_title}
+
+status: active
+created_at: {now}
+updated_at: {now}
+project_id: {clean_project_id}
+mode: consultation
+external_execution_enabled: false
+
+## Goal
+- Use the existing Atlas Workbench loop on a real project and record whether it improves delivery clarity, evidence quality, and coordination speed.
+- project: {clean_project_id} {project_title_from_text(clean_project_id, project_text)}
+
+## Scope
+- Record operational metrics for project/task/context/dispatch usage.
+- Keep all records inside workbench/pilots and existing workbench ledgers.
+- Do not call Codex/Kiro automatically, do not run commands, do not modify external projects.
+
+## Baseline
+- live_debt: Octo UI live validation has been skipped in earlier phases and must be tracked as an evidence gap until manually verified.
+- project_status: {project_metadata(project_text).get('status', 'unknown')}
+- pilot_started_at: {now}
+
+## Metrics
+- task_count: 0
+- dispatch_count: 0
+- returned_count: 0
+- qa_pass_count: 0
+- needs_evidence_count: 0
+- closed_count: 0
+- evidence_gap_count: 0
+- context_pack_count: 0
+- manual_copy_count: 0
+- estimated_time_saved: 0 min
+- main_friction: none yet
+
+## Tasks Included
+- none.
+
+## Dispatches
+- none.
+
+## Reports
+- none yet.
+
+## Evidence Gaps
+- live_debt: Octo UI live validation still needs a real user check.
+
+## Decisions
+- none yet.
+
+## Time Saved Estimate
+- 0 min rough estimate; update with /pilot metrics after tasks and dispatches are linked.
+
+## Friction Log
+- none yet.
+
+## Lessons Learned
+- none yet.
+
+## Next Actions
+- Add project tasks with /pilot add-task {pilot_id} <task_id>.
+- Add manual dispatches with /pilot add-dispatch {pilot_id} <dispatch_id>.
+- Check metrics with /pilot metrics {pilot_id}.
+""")
+
+
+def create_pilot(project_id: str, title: str) -> tuple[str, str]:
+    clean_project_id = validate_project_id(project_id)
+    read_project(clean_project_id)
+    pilot_id = generate_pilot_id()
+    text = build_pilot_markdown(pilot_id, clean_project_id, title)
+    write_pilot(pilot_id, text)
+    log_event("pilot_started", pilot_id=pilot_id, project_id=clean_project_id)
+    return pilot_id, text
+
+
+def pilot_records() -> list[dict]:
+    ensure_workbench_dirs()
+    records = []
+    for path in sorted(PILOTS_DIR.glob("PILOT-*.md")):
+        pilot_id = path.stem
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        meta = task_metadata(text)
+        records.append(
+            {
+                "pilot_id": pilot_id,
+                "title": pilot_title_from_text(pilot_id, text),
+                "status": meta.get("status", "unknown"),
+                "created_at": meta.get("created_at", ""),
+                "updated_at": meta.get("updated_at", ""),
+                "project_id": meta.get("project_id", ""),
+                "path": path,
+                "text": text,
+            }
+        )
+    return sorted(records, key=lambda item: item.get("updated_at", ""), reverse=True)
+
+
+def ids_from_section(text: str, heading: str, pattern: str) -> list[str]:
+    found = []
+    for match in re.finditer(pattern, task_section(text, heading)):
+        value = match.group(0)
+        if value not in found:
+            found.append(value)
+    return found
+
+
+def pilot_task_ids(text: str) -> list[str]:
+    return ids_from_section(text, "Tasks Included", r"OHB-\d{8}-\d{6}(?:-\d{2})?")
+
+
+def pilot_dispatch_ids(text: str) -> list[str]:
+    return ids_from_section(text, "Dispatches", r"DISPATCH-\d{8}-\d{6}(?:-\d{2})?")
+
+
+def last_meaningful_line(section: str) -> str:
+    for line in reversed(section.splitlines()):
+        stripped = line.strip()
+        if stripped and stripped not in {"- none.", "- none yet."}:
+            return stripped
+    return ""
+
+
+def validate_pilot_project_link(pilot_text: str, project_id: str) -> str:
+    pilot_project_id = task_metadata(pilot_text).get("project_id", "")
+    if validate_project_id(project_id) != validate_project_id(pilot_project_id):
+        raise ValueError(f"item belongs to project {project_id}, not pilot project {pilot_project_id}")
+    return pilot_project_id
+
+
+def add_unique_pilot_line(text: str, heading: str, item_id: str, line: str) -> str:
+    current = task_section(text, heading)
+    if item_id in current:
+        return text
+    existing = [
+        item for item in current.splitlines()
+        if item.strip() and item.strip() not in {"- none.", "- none yet."}
+    ]
+    existing.append(line)
+    return set_section_body(text, heading, "\n".join(existing))
+
+
+def pilot_metrics_data(pilot_id: str) -> dict:
+    normalized_pilot_id = normalize_pilot_id(pilot_id)
+    text = read_pilot(normalized_pilot_id)
+    meta = task_metadata(text)
+    project_id = meta.get("project_id", "")
+    task_ids = pilot_task_ids(text)
+    dispatch_ids = pilot_dispatch_ids(text)
+    tasks = []
+    for task_id in task_ids:
+        try:
+            task_text = read_task(task_id)
+        except Exception:
+            continue
+        task_meta = task_metadata(task_text)
+        tasks.append({"task_id": task_id, "text": task_text, "meta": task_meta})
+    dispatches = []
+    for dispatch_id in dispatch_ids:
+        try:
+            dispatch_text = read_dispatch(dispatch_id)
+        except Exception:
+            continue
+        dispatch_meta = task_metadata(dispatch_text)
+        dispatches.append({"dispatch_id": dispatch_id, "text": dispatch_text, "meta": dispatch_meta})
+    returned_count = sum(
+        1 for item in dispatches
+        if item["meta"].get("status") in {"returned", "qa_ready", "reviewed", "needs_evidence", "closed"}
+        or "### Return at" in task_section(item["text"], "Return Report")
+    )
+    qa_pass_count = sum(
+        1 for item in dispatches
+        if item["meta"].get("status") == "qa_ready"
+        or ("pass" in task_section(item["text"], "QA Result").lower() and "needs_evidence" not in task_section(item["text"], "QA Result").lower())
+    )
+    needs_evidence_count = sum(1 for item in tasks if item["meta"].get("status") == "needs_evidence") + sum(
+        1 for item in dispatches if item["meta"].get("status") == "needs_evidence"
+    )
+    closed_count = sum(1 for item in tasks if item["meta"].get("status") in {"passed", "archived", "cancelled"}) + sum(
+        1 for item in dispatches if item["meta"].get("status") == "closed"
+    )
+    evidence_gap_count = 0
+    for item in tasks:
+        try:
+            if evidence_analysis(item["task_id"]).get("has_gaps"):
+                evidence_gap_count += 1
+        except Exception:
+            evidence_gap_count += 1
+    context_pack_count = sum(
+        1 for record in context_records()
+        if record.get("source_task_id") in set(task_ids) or (project_id and record.get("source_project_id") == project_id)
+    )
+    manual_copy_count = sum(
+        1 for item in dispatches
+        if item["meta"].get("status") in {"sent", "returned", "qa_ready", "reviewed", "needs_evidence", "closed"}
+        or "manual_copy_only: true" in task_section(item["text"], "Sent Record")
+    )
+    estimated_minutes = len(task_ids) * 15 + len(dispatch_ids) * 10 + context_pack_count * 5 + returned_count * 5
+    friction = last_meaningful_line(task_section(text, "Friction Log")) or "none recorded"
+    return {
+        "pilot_id": normalized_pilot_id,
+        "text": text,
+        "meta": meta,
+        "task_ids": task_ids,
+        "dispatch_ids": dispatch_ids,
+        "task_count": len(task_ids),
+        "dispatch_count": len(dispatch_ids),
+        "returned_count": returned_count,
+        "qa_pass_count": qa_pass_count,
+        "needs_evidence_count": needs_evidence_count,
+        "closed_count": closed_count,
+        "evidence_gap_count": evidence_gap_count,
+        "context_pack_count": context_pack_count,
+        "manual_copy_count": manual_copy_count,
+        "estimated_minutes": estimated_minutes,
+        "estimated_time_saved": f"{estimated_minutes} min",
+        "main_friction": safe_preview(friction, 220),
+    }
+
+
+def build_pilot_metrics_body(data: dict) -> str:
+    return f"""- task_count: {data['task_count']}
+- dispatch_count: {data['dispatch_count']}
+- returned_count: {data['returned_count']}
+- qa_pass_count: {data['qa_pass_count']}
+- needs_evidence_count: {data['needs_evidence_count']}
+- closed_count: {data['closed_count']}
+- evidence_gap_count: {data['evidence_gap_count']}
+- context_pack_count: {data['context_pack_count']}
+- manual_copy_count: {data['manual_copy_count']}
+- estimated_time_saved: {data['estimated_time_saved']}
+- main_friction: {data['main_friction']}"""
+
+
+def build_pilot_help_reply() -> str:
+    return """Atlas Pilot commands
+- /pilot help
+- /pilot start <project_id> <title>
+- /pilot list
+- /pilot show <pilot_id>
+- /pilot add-task <pilot_id> <task_id>
+- /pilot add-dispatch <pilot_id> <dispatch_id>
+- /pilot note <pilot_id> <single-line note>
+- /pilot metrics <pilot_id>
+- /pilot complete <pilot_id> <note>
+- /pilot dashboard
+
+Boundary: pilot is an operational record layer only. It writes workbench/pilots, reads existing workbench ledgers, does not read .env, does not call Codex/Kiro, and does not run commands."""
+
+
+def build_pilot_start_reply(tail: str) -> str:
+    parts = str(tail or "").strip().split(maxsplit=1)
+    if len(parts) != 2:
+        return "Usage: /pilot start <project_id> <title>"
+    project_id = validate_project_id(parts[0])
+    pilot_id, _text = create_pilot(project_id, parts[1])
+    return f"""Pilot started: {pilot_id}
+- status: active
+- project_id: {project_id}
+- path: workbench/pilots/{pilot_id}.md
+- external_execution_enabled: false
+- next: run real Workbench tasks, then /pilot add-task {pilot_id} <task_id> and /pilot metrics {pilot_id}"""
+
+
+def build_pilot_list_reply() -> str:
+    records = pilot_records()
+    if not records:
+        return "Pilots:\n- none."
+    lines = ["Pilots:"]
+    for record in records[:10]:
+        lines.append(
+            f"- {record['pilot_id']} | {record.get('status')} | project={record.get('project_id')} | updated={record.get('updated_at')} | {record.get('title')}"
+        )
+    return "\n".join(lines)
+
+
+def build_pilot_show_reply(pilot_id: str) -> str:
+    normalized_pilot_id = normalize_pilot_id(pilot_id)
+    data = pilot_metrics_data(normalized_pilot_id)
+    meta = data["meta"]
+    return f"""Pilot summary: {normalized_pilot_id}
+- status: {meta.get('status', 'unknown')}
+- title: {pilot_title_from_text(normalized_pilot_id, data['text'])}
+- project_id: {meta.get('project_id', '')}
+- updated_at: {meta.get('updated_at', '')}
+- goal: {safe_preview(task_section(data['text'], 'Goal'), 240)}
+- scope: {safe_preview(task_section(data['text'], 'Scope'), 240)}
+{build_pilot_metrics_body(data)}
+- next_actions: {safe_preview(task_section(data['text'], 'Next Actions'), 240)}"""
+
+
+def build_pilot_add_task_reply(tail: str) -> str:
+    parts = str(tail or "").strip().split(maxsplit=1)
+    if len(parts) != 2:
+        return "Usage: /pilot add-task <pilot_id> <task_id>"
+    pilot_id = normalize_pilot_id(parts[0])
+    task_id = normalize_task_id(parts[1])
+    text = read_pilot(pilot_id)
+    task_text = read_task(task_id)
+    task_meta = task_metadata(task_text)
+    task_project = task_meta.get("project_id", "")
+    if task_project:
+        validate_pilot_project_link(text, task_project)
+    now = iso_now()
+    line = f"- {task_id} | {task_meta.get('status', 'unknown')} | {task_title_from_text(task_id, task_text)}"
+    text = add_unique_pilot_line(text, "Tasks Included", task_id, line)
+    text = replace_task_field(text, "updated_at", now)
+    text = append_to_section(text, "Reports", f"- {now} task linked: {task_id} status={task_meta.get('status', 'unknown')}.")
+    write_pilot(pilot_id, text)
+    log_event("pilot_task_added", pilot_id=pilot_id, task_id=task_id)
+    return f"""Pilot task linked: {pilot_id}
+- task_id: {task_id}
+- task_status: {task_meta.get('status', 'unknown')}
+- next: /pilot metrics {pilot_id}"""
+
+
+def build_pilot_add_dispatch_reply(tail: str) -> str:
+    parts = str(tail or "").strip().split(maxsplit=1)
+    if len(parts) != 2:
+        return "Usage: /pilot add-dispatch <pilot_id> <dispatch_id>"
+    pilot_id = normalize_pilot_id(parts[0])
+    dispatch_id = normalize_dispatch_id(parts[1])
+    text = read_pilot(pilot_id)
+    dispatch_text = read_dispatch(dispatch_id)
+    dispatch_meta = task_metadata(dispatch_text)
+    dispatch_project = dispatch_meta.get("project_id", "")
+    if dispatch_project:
+        validate_pilot_project_link(text, dispatch_project)
+    now = iso_now()
+    line = (
+        f"- {dispatch_id} | {dispatch_meta.get('status', 'unknown')} | "
+        f"task={dispatch_meta.get('task_id', '')} | target={dispatch_meta.get('target_executor', '')}"
+    )
+    text = add_unique_pilot_line(text, "Dispatches", dispatch_id, line)
+    text = replace_task_field(text, "updated_at", now)
+    text = append_to_section(text, "Reports", f"- {now} dispatch linked: {dispatch_id} status={dispatch_meta.get('status', 'unknown')}.")
+    write_pilot(pilot_id, text)
+    log_event("pilot_dispatch_added", pilot_id=pilot_id, dispatch_id=dispatch_id)
+    return f"""Pilot dispatch linked: {pilot_id}
+- dispatch_id: {dispatch_id}
+- dispatch_status: {dispatch_meta.get('status', 'unknown')}
+- target_executor: {dispatch_meta.get('target_executor', '')}
+- next: /pilot metrics {pilot_id}"""
+
+
+def build_pilot_note_reply(tail: str) -> str:
+    parts = str(tail or "").strip().split(maxsplit=1)
+    if len(parts) != 2:
+        return "Usage: /pilot note <pilot_id> <single-line note>"
+    pilot_id = normalize_pilot_id(parts[0])
+    note = sanitize_sensitive_text(parts[1].splitlines()[0]).strip()
+    if not note:
+        return "Pilot note is empty; nothing written."
+    now = iso_now()
+    text = read_pilot(pilot_id)
+    text = append_to_section(text, "Friction Log", f"- {now} {note}")
+    text = replace_task_field(text, "updated_at", now)
+    write_pilot(pilot_id, text)
+    log_event("pilot_note_added", pilot_id=pilot_id)
+    return f"""Pilot note recorded: {pilot_id}
+- note: {safe_preview(note, 160)}
+- path: workbench/pilots/{pilot_id}.md"""
+
+
+def build_pilot_metrics_reply(pilot_id: str) -> str:
+    normalized_pilot_id = normalize_pilot_id(pilot_id)
+    data = pilot_metrics_data(normalized_pilot_id)
+    now = iso_now()
+    text = data["text"]
+    body = build_pilot_metrics_body(data)
+    text = set_section_body(text, "Metrics", body)
+    text = set_section_body(text, "Time Saved Estimate", f"- {data['estimated_time_saved']} rough estimate based on linked tasks, dispatches, contexts, and return reports.")
+    text = replace_task_field(text, "updated_at", now)
+    write_pilot(normalized_pilot_id, text)
+    return f"""Pilot metrics: {normalized_pilot_id}
+{body}
+
+Notes:
+- estimated_time_saved is a rough operational estimate, not a verified time log.
+- report quality and evidence gaps still require /dispatch qa, /task review, and user decision."""
+
+
+def build_pilot_complete_summary(pilot_id: str, note: str, data: dict) -> str:
+    useful = ["/task new", "/dispatch create", "/dispatch package", "/dispatch receive", "/dispatch qa", "/task review", "/task decide", "/pilot metrics"]
+    if data["context_pack_count"]:
+        useful.insert(1, "/context pack task")
+    unused = []
+    if not data["context_pack_count"]:
+        unused.append("/context pack task")
+    if data["qa_pass_count"] == 0:
+        unused.append("qa_pass outcome")
+    if data["closed_count"] == 0:
+        unused.append("/task close or /dispatch close")
+    worth = "yes, continue real-use validation" if data["task_count"] and data["dispatch_count"] else "not enough data yet"
+    if data["evidence_gap_count"] or data["needs_evidence_count"]:
+        worth = "yes, but prioritize evidence-gap reduction before new features"
+    return sanitize_sensitive_text(f"""### Pilot completed at {iso_now()}
+
+completion_note: {note}
+
+哪些地方提效:
+- Work orders and dispatch packages reduced manual restructuring; linked tasks={data['task_count']}, dispatches={data['dispatch_count']}.
+- Context and dispatch records made handoff/return status easier to inspect; context_pack_count={data['context_pack_count']}.
+- Estimated time saved: {data['estimated_time_saved']}.
+
+哪些地方仍然麻烦:
+- main_friction: {data['main_friction']}
+- evidence_gap_count: {data['evidence_gap_count']}
+- live_debt: Octo UI live validation still needs manual proof if not already recorded.
+
+哪些命令最有用:
+- {', '.join(useful)}
+
+哪些命令没用上:
+- {', '.join(unused) if unused else 'none obvious from this pilot'}
+
+是否值得继续扩展:
+- {worth}
+
+下一阶段建议:
+- Run one more real project pilot before adding new automation.
+- Close live debt with explicit Octo UI evidence.
+- Improve only the commands that caused recorded friction, not the execution boundary.
+""")
+
+
+def build_pilot_complete_reply(tail: str) -> str:
+    parts = str(tail or "").strip().split(maxsplit=1)
+    if len(parts) != 2:
+        return "Usage: /pilot complete <pilot_id> <note>"
+    pilot_id = normalize_pilot_id(parts[0])
+    note = sanitize_sensitive_text(parts[1]).strip() or "completed"
+    data = pilot_metrics_data(pilot_id)
+    summary = build_pilot_complete_summary(pilot_id, note, data)
+    text = data["text"]
+    now = iso_now()
+    text = set_section_body(text, "Metrics", build_pilot_metrics_body(data))
+    text = append_to_section(text, "Lessons Learned", summary)
+    text = set_section_body(
+        text,
+        "Next Actions",
+        "- Review pilot evidence gaps and live debt.\n- Decide whether another real pilot is needed before adding features.",
+    )
+    text = replace_task_field(text, "status", "completed")
+    text = replace_task_field(text, "updated_at", now)
+    write_pilot(pilot_id, text)
+    log_event("pilot_completed", pilot_id=pilot_id)
+    return f"""Pilot completed: {pilot_id}
+- status: completed
+
+{summary}"""
+
+
+def build_pilot_dashboard_reply() -> str:
+    records = [record for record in pilot_records() if record.get("status") in {"active", "completed"}]
+    if not records:
+        return "Pilot dashboard:\n- none."
+    lines = ["Pilot dashboard:"]
+    for record in records[:20]:
+        try:
+            data = pilot_metrics_data(record["pilot_id"])
+            metrics = f"tasks={data['task_count']} dispatches={data['dispatch_count']} returned={data['returned_count']} gaps={data['evidence_gap_count']} saved={data['estimated_time_saved']}"
+        except Exception:
+            metrics = "metrics=unavailable"
+        lines.append(
+            f"- {record['pilot_id']} | {record.get('status')} | project={record.get('project_id')} | {metrics} | {record.get('title')}"
+        )
+    return "\n".join(lines)
+
+
+def handle_pilot_command(user_text: str) -> str | None:
+    lines = user_text.strip().splitlines()
+    first_line = lines[0] if lines else ""
+    parts = first_line.split(maxsplit=2)
+    if len(parts) < 2 or parts[0].lower() != "/pilot":
+        return None
+    subcommand = parts[1].lower()
+    tail = parts[2] if len(parts) > 2 else ""
+    try:
+        if subcommand == "help":
+            return build_pilot_help_reply()
+        if subcommand == "start":
+            return build_pilot_start_reply(tail)
+        if subcommand == "list":
+            return build_pilot_list_reply()
+        if subcommand == "show":
+            return build_pilot_show_reply(tail)
+        if subcommand == "add-task":
+            return build_pilot_add_task_reply(tail)
+        if subcommand == "add-dispatch":
+            return build_pilot_add_dispatch_reply(tail)
+        if subcommand == "note":
+            return build_pilot_note_reply(tail)
+        if subcommand == "metrics":
+            return build_pilot_metrics_reply(tail)
+        if subcommand == "complete":
+            return build_pilot_complete_reply(tail)
+        if subcommand == "dashboard":
+            return build_pilot_dashboard_reply()
+        return build_pilot_help_reply()
+    except FileNotFoundError as exc:
+        return f"pilot source not found: {safe_preview(str(exc), 180)}"
+    except ValueError as exc:
+        return f"pilot operation refused: {safe_preview(str(exc), 220)}"
+    except Exception as exc:
+        return f"pilot operation failed: {safe_preview(str(exc), 180)}"
 
 
 def build_project_help_reply() -> str:
@@ -2617,6 +6873,12 @@ def build_project_brief_reply(project_id: str) -> str:
     project_retros = [record for record in retro_records() if record.get("project_id") == clean_project_id]
     recent_lessons = " ".join(task_section(record.get("text", ""), "Lessons Learned") for record in project_retros[:3])
     candidate_improvements = " ".join(task_section(record.get("text", ""), "Candidate Improvements") for record in project_retros[:3])
+    learning_project = learning_project_counts(clean_project_id)
+    apply_project = project_apply_counts(clean_project_id)
+    project_contexts = [record for record in context_records() if record.get("source_project_id") == clean_project_id]
+    latest_context_pack = project_contexts[0]["context_id"] if project_contexts else "none"
+    playbook_advisory_count = sum(1 for line in playbook_advisory_for_project(clean_project_id).splitlines() if line.startswith("- ") and "no relevant" not in line)
+    project_learning = [record for record in learning_records() if record.get("source_project_id") == clean_project_id]
     retro_task_ids = {record["task_id"] for record in project_retros}
     suggested_retro_tasks = [
         record for record in records
@@ -2633,6 +6895,17 @@ def build_project_brief_reply(project_id: str) -> str:
         f"- needs_evidence：{len(needs_tasks)}",
         f"- live_skipped：{len(live_skipped_tasks)}",
         f"- retro_count：{len(project_retros)}",
+        f"- learning_proposal_count：{learning_project['proposal_count']}",
+        f"- approved_learning_count：{learning_project['approved_count']}",
+        f"- deferred_learning_count：{learning_project['deferred_count']}",
+        f"- not_applied_learning_count：{learning_project['not_applied_count']}",
+        f"- project_playbook_entries: {apply_project['playbook_entry_count']}",
+        f"- applied_learnings: {apply_project['applied_learning_count']}",
+        f"- reverted_learnings: {apply_project['reverted_learning_count']}",
+        f"- suggested_not_applied_learnings: {apply_project['suggested_not_applied_learnings']}",
+        f"- latest_context_pack: {latest_context_pack}",
+        f"- playbook_advisory_count: {playbook_advisory_count}",
+        f"- suggested_context_for_next_task: /context pack task <task_id>",
         "",
         "当前状态：",
         f"- {safe_preview(task_section(text, 'Current State'), 260) or '未填写'}",
@@ -2670,6 +6943,28 @@ def build_project_brief_reply(project_id: str) -> str:
         [f"- {record['task_id']} | {record['status']} | {record['title']}" for record in suggested_retro_tasks]
         or ["- 暂无。"]
     )
+    lines.append("")
+    lines.append("Learning 视角：")
+    lines.append(f"- 本项目 proposal 数：{learning_project['proposal_count']}")
+    lines.append(f"- approved：{learning_project['approved_count']}；deferred：{learning_project['deferred_count']}；not_applied：{learning_project['not_applied_count']}")
+    if project_learning:
+        lines.append(f"- 最近 learning：{project_learning[0]['learn_id']} | {project_learning[0]['status']} | {project_learning[0]['title']}")
+        lines.append("- 建议：进入 /learn review，确认 evidence、rollback、acceptance test 后再 approve。")
+    elif candidate_improvements:
+        lines.append("- 建议：已有 candidate improvements，可执行 /learn propose retro <task_id>。")
+    else:
+        lines.append("- 建议：暂无 learning review 候选。")
+    lines.append("")
+    lines.append("Playbook view:")
+    lines.append(f"- project_playbook_entries: {apply_project['playbook_entry_count']}")
+    lines.append(f"- applied_learnings: {apply_project['applied_learning_count']}")
+    lines.append(f"- reverted_learnings: {apply_project['reverted_learning_count']}")
+    lines.append(f"- suggested_not_applied_learnings: {apply_project['suggested_not_applied_learnings']}")
+    lines.append("")
+    lines.append("Context view:")
+    lines.append(f"- latest_context_pack: {latest_context_pack}")
+    lines.append(f"- playbook_advisory_count: {playbook_advisory_count}")
+    lines.append("- suggested_context_for_next_task: /context pack task <task_id>")
     lines.extend(
         [
             "",
@@ -2696,6 +6991,9 @@ def build_project_dashboard_reply() -> str:
     retros = retro_records()
     approved_retros = [record for record in retros if record.get("status") == "approved"]
     candidate_improvement_count = sum(1 for record in retros if task_section(record.get("text", ""), "Candidate Improvements").strip())
+    learn_counts = learning_counts()
+    apply_view = apply_counts()
+    context_view = context_counts()
     task_analysis_cache = {}
     for task in tasks:
         try:
@@ -2720,6 +7018,16 @@ def build_project_dashboard_reply() -> str:
         f"- approved_retro_count：{len(approved_retros)}",
         f"- unresolved_evidence_gap_count：{evidence_gap_count}",
         f"- candidate_improvement_count：{candidate_improvement_count}",
+        f"- learning_proposal_count：{learn_counts['learning_proposals']}",
+        f"- approved_learning_count：{learn_counts['learning_approved']}",
+        f"- deferred_learning_count：{learn_counts['learning_deferred']}",
+        f"- not_applied_learning_count：{learn_counts['learning_not_applied']}",
+        f"- playbook_entry_count: {apply_view['playbook_entries']}",
+        f"- applied_learning_count: {apply_view['applied_to_workbench_playbook']}",
+        f"- pending_apply_count: {apply_view['planned_count']}",
+        f"- context_pack_count: {context_view['context_pack_count']}",
+        f"- projects_with_context: {context_view['projects_with_context']}",
+        f"- projects_missing_context: {context_view['projects_missing_context']}",
         "",
         "项目：",
     ]
@@ -2732,8 +7040,10 @@ def build_project_dashboard_reply() -> str:
         project_gap_count = sum(1 for task in project_tasks if task_analysis_cache.get(task["task_id"], {}).get("has_gaps"))
         project_live_count = sum(1 for task in project_tasks if task_analysis_cache.get(task["task_id"], {}).get("live_skipped"))
         project_retro_count = sum(1 for record in retros if record.get("project_id") == project["project_id"])
+        project_learning = learning_project_counts(project["project_id"])
+        project_apply = project_apply_counts(project["project_id"])
         lines.append(
-            f"- {project['project_id']} | {project['status']} | {project['priority'] or 'P?'} | open={open_count} | needs_evidence={needs_count} | evidence_gaps={project_gap_count} | live_skipped={project_live_count} | retro_count={project_retro_count} | {project['title']}"
+            f"- {project['project_id']} | {project['status']} | {project['priority'] or 'P?'} | open={open_count} | needs_evidence={needs_count} | evidence_gaps={project_gap_count} | live_skipped={project_live_count} | retro_count={project_retro_count} | learning_proposal_count={project_learning['proposal_count']} | approved_learning_count={project_learning['approved_count']} | deferred_learning_count={project_learning['deferred_count']} | not_applied_learning_count={project_learning['not_applied_count']} | playbook_entry_count={project_apply['playbook_entry_count']} | applied_learning_count={project_apply['applied_learning_count']} | pending_apply_count={project_apply['pending_apply_count']} | {project['title']}"
         )
         if project.get("priority") in {"P0", "P1"} and project_gap_count:
             lines.append(f"  priority_hint: P0/P1 项目存在证据缺口，优先补 {project['project_id']}。")
@@ -2753,6 +7063,58 @@ def build_project_dashboard_reply() -> str:
     else:
         lines.append("- 暂无必须复盘任务。")
     return "\n".join(lines)
+
+
+_build_project_brief_reply_base = build_project_brief_reply
+
+
+def build_project_brief_reply(project_id: str) -> str:
+    clean_project_id = validate_project_id(project_id)
+    base = _build_project_brief_reply_base(clean_project_id)
+    records = dispatches_for_project(clean_project_id)
+    ready = [record for record in records if record.get("status") == "ready"]
+    sent = [record for record in records if record.get("status") == "sent"]
+    returned = [record for record in records if record.get("status") == "returned"]
+    failed = [record for record in records if record.get("status") == "failed"]
+    lines = [
+        "",
+        "Dispatch view:",
+        f"- ready: {len(ready)}",
+        f"- sent_not_returned: {len(sent)}",
+        f"- returned_pending_qa: {len(returned)}",
+        f"- failed: {len(failed)}",
+        "- suggested_next_actions:",
+    ]
+    if ready:
+        lines.append(f"- /dispatch package {ready[0]['dispatch_id']}")
+    if sent:
+        lines.append(f"- /dispatch receive {sent[0]['dispatch_id']} when report is back")
+    if returned:
+        lines.append(f"- /dispatch qa {returned[0]['dispatch_id']}")
+    if failed:
+        lines.append(f"- inspect or recreate dispatch: {failed[0]['dispatch_id']}")
+    if not records:
+        lines.append("- create dispatch for active task: /dispatch create <task_id> codex --with-context")
+    return base + "\n" + "\n".join(lines)
+
+
+_build_project_dashboard_reply_base = build_project_dashboard_reply
+
+
+def build_project_dashboard_reply() -> str:
+    base = _build_project_dashboard_reply_base()
+    counts = dispatch_counts()
+    lines = [
+        "",
+        "Dispatch summary:",
+        f"- dispatch_ready_count: {counts['dispatch_ready_count']}",
+        f"- dispatch_sent_count: {counts['dispatch_sent_count']}",
+        f"- dispatch_returned_count: {counts['dispatch_returned_count']}",
+        f"- dispatch_failed_count: {counts['dispatch_failed_count']}",
+        f"- dispatch_stale_count: {counts['dispatch_stale_count']}",
+        "- external_execution_enabled: false",
+    ]
+    return base + "\n" + "\n".join(lines)
 
 
 def handle_project_command(user_text: str) -> str | None:
@@ -2857,7 +7219,7 @@ def handle_task_command(user_text: str) -> str | None:
         if subcommand == "handoff":
             handoff_parts = tail.split(maxsplit=1)
             if len(handoff_parts) != 2:
-                return "用法：/task handoff <task_id> codex|kiro"
+                return "用法：/task handoff <task_id> codex|kiro [--with-context]"
             return build_task_handoff_reply(handoff_parts[0], handoff_parts[1])
         if subcommand == "report":
             report_parts = tail.split(maxsplit=1)
@@ -3132,6 +7494,26 @@ def build_status_reply(context: dict) -> str:
         f"- active_projects：{counts['active_projects']}",
         f"- paused_projects：{counts['paused_projects']}",
         f"- archived_projects：{counts['archived_projects']}",
+        f"- learning_proposals：{counts['learning_proposals']}",
+        f"- learning_approved：{counts['learning_approved']}",
+        f"- learning_not_applied：{counts['learning_not_applied']}",
+        f"- apply_plans: {counts['apply_plans']}",
+        f"- playbook_entries: {counts['playbook_entries']}",
+        f"- applied_to_workbench_playbook: {counts['applied_to_workbench_playbook']}",
+        f"- context_pack_count: {counts['context_pack_count']}",
+        f"- latest_context_id: {counts['latest_context_id'] or 'none'}",
+        f"- dispatch_count: {counts['dispatch_count']}",
+        f"- dispatch_sent: {counts['dispatch_sent']}",
+        f"- dispatch_returned: {counts['dispatch_returned']}",
+        f"- dispatch_needs_evidence: {counts['dispatch_needs_evidence']}",
+        f"- dispatch_ready_count: {counts['dispatch_ready_count']}",
+        f"- dispatch_failed_count: {counts['dispatch_failed_count']}",
+        f"- dispatch_stale_count: {counts['dispatch_stale_count']}",
+        "- learning_dir：workbench/learning/",
+        f"- application_enabled：{str(APPLICATION_ENABLED).lower()}",
+        f"- runtime_injection_enabled: {str(RUNTIME_INJECTION_ENABLED).lower()}",
+        f"- external_application_enabled: {str(EXTERNAL_APPLICATION_ENABLED).lower()}",
+        f"- external_execution_enabled: {str(EXTERNAL_EXECUTION_ENABLED).lower()}",
         f"- 最近 task_id：{counts['recent_task_id'] or 'none'}",
         f"- 日志：logs/bridge.log",
         "- heartbeat：runtime/heartbeat.json",
@@ -3158,6 +7540,10 @@ def build_help_reply() -> str:
 - /task help：查看本地任务账本命令。
 - /evidence help：查看证据链命令。
 - /retro help：查看任务复盘命令。
+- /learn help：查看受控学习循环命令。
+- /apply help: view Workbench-only apply commands.
+- /playbook help: view local Playbook reference commands.
+- /context help: view Context Pack commands.
 - /daily brief：汇总今日待处理任务。
 - /template wo：返回工作单模板。
 - /template report：返回 Codex/Kiro 回传模板。
@@ -3171,6 +7557,41 @@ def build_help_reply() -> str:
 - 执行类请求：只生成工作单和验收标准，不运行命令、不修改文件、不提交或发布。"""
 
 
+def build_help_reply() -> str:
+    return """Octo-Hermes Bridge help
+- /status: bridge status, heartbeat, workbench counts, and safety boundary.
+- /help: show this help.
+- /workflow: Atlas workflow overview.
+- /project help: project index and cross-task dashboard.
+- /task help: local task ledger commands.
+- /dispatch help: manual dispatch queue and execution session ledger.
+- /pilot help: real-project pilot metrics and operating notes.
+- /context help: Context Pack commands.
+- /playbook help: local Playbook reference commands.
+- /evidence help: evidence chain commands.
+- /retro help: task retro commands.
+- /learn help: controlled learning loop commands.
+- /apply help: Workbench-only apply commands.
+- /daily brief: summarize today's active tasks.
+- /template wo/report/review: workflow templates.
+- 推荐用法：生成工作单：检查 Kiro 反代当前状态
+- 推荐用法：审查这份 Codex 返回报告：<粘贴报告>
+- 推荐用法：判断下一步优先级：<粘贴候选事项>
+- 推荐用法：把这个报错整理成 Kiro/Codex 可执行任务：<粘贴报错>
+- 推荐用法：根据以下证据判断是否完成：<粘贴证据>
+- æŽ¨èç”¨æ³•ï¼šç”Ÿæˆå·¥ä½œå•ï¼šæ£€æŸ¥ Kiro åä»£å½“å‰çŠ¶æ€
+- æŽ¨èç”¨æ³•ï¼šå®¡æŸ¥è¿™ä»½ Codex è¿”å›žæŠ¥å‘Šï¼š<ç²˜è´´æŠ¥å‘Š>
+- æŽ¨èç”¨æ³•ï¼šåˆ¤æ–­ä¸‹ä¸€æ­¥ä¼˜å…ˆçº§ï¼š<ç²˜è´´å€™é€‰äº‹é¡¹>
+- æŽ¨èç”¨æ³•ï¼šæŠŠè¿™ä¸ªæŠ¥é”™æ•´ç†æˆ Kiro/Codex å¯æ‰§è¡Œä»»åŠ¡ï¼š<ç²˜è´´æŠ¥é”™>
+- æŽ¨èç”¨æ³•ï¼šæ ¹æ®ä»¥ä¸‹è¯æ®åˆ¤æ–­æ˜¯å¦å®Œæˆï¼š<ç²˜è´´è¯æ®>
+- Recommended: /dispatch create <task_id> codex --with-context
+- Recommended: /dispatch package <dispatch_id>
+- Recommended: /dispatch receive <dispatch_id> then paste report.
+- Recommended: /dispatch qa <dispatch_id>, /task review <task_id>, /task decide ...
+- Recommended: /pilot start <project_id> <title>, then /pilot metrics <pilot_id>.
+- Execution requests only create work orders; Bridge does not run commands, modify project files, call Codex/Kiro, or claim completion without evidence."""
+
+
 def build_template_help_reply() -> str:
     return """模板命令
 - /template wo：工作单模板
@@ -3181,6 +7602,18 @@ def build_template_help_reply() -> str:
 def handle_local_command(user_text: str, context: dict) -> str | None:
     parts = user_text.strip().split(maxsplit=1)
     command = parts[0].lower() if parts else ""
+    if command == "/apply":
+        return handle_apply_command(user_text)
+    if command == "/playbook":
+        return handle_playbook_command(user_text)
+    if command == "/context":
+        return handle_context_command(user_text)
+    if command == "/dispatch":
+        return handle_dispatch_command(user_text)
+    if command == "/pilot":
+        return handle_pilot_command(user_text)
+    if command == "/learn":
+        return handle_learn_command(user_text)
     if command == "/retro":
         return handle_retro_command(user_text)
     if command == "/evidence":
