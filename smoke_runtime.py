@@ -31,6 +31,14 @@ def main() -> int:
     old_log_dir = bridge.LOG_DIR
     old_log_file = bridge.LOG_FILE
     old_rotate_bytes = bridge.LOG_ROTATE_BYTES
+    old_workbench_dir = bridge.WORKBENCH_DIR
+    old_tasks_dir = bridge.TASKS_DIR
+    old_projects_dir = bridge.PROJECTS_DIR
+    old_evidence_dir = bridge.EVIDENCE_DIR
+    old_retros_dir = bridge.RETROS_DIR
+    old_decisions_dir = bridge.DECISIONS_DIR
+    old_daily_dir = bridge.DAILY_DIR
+    old_archive_dir = bridge.ARCHIVE_DIR
 
     full_token = "bf_smoke_secret_token_123456"
     full_robot_id = "robot-full-id-1234567890"
@@ -44,6 +52,14 @@ def main() -> int:
             bridge.LOG_DIR = root / "logs"
             bridge.LOG_FILE = bridge.LOG_DIR / "bridge.log"
             bridge.LOG_ROTATE_BYTES = 16
+            bridge.WORKBENCH_DIR = root / "workbench"
+            bridge.TASKS_DIR = bridge.WORKBENCH_DIR / "tasks"
+            bridge.PROJECTS_DIR = bridge.WORKBENCH_DIR / "projects"
+            bridge.EVIDENCE_DIR = bridge.WORKBENCH_DIR / "evidence"
+            bridge.RETROS_DIR = bridge.WORKBENCH_DIR / "retros"
+            bridge.DECISIONS_DIR = bridge.WORKBENCH_DIR / "decisions"
+            bridge.DAILY_DIR = bridge.WORKBENCH_DIR / "daily"
+            bridge.ARCHIVE_DIR = bridge.WORKBENCH_DIR / "archive"
             bridge.LOG_DIR.mkdir()
             bridge.LOG_FILE.write_text("x" * 32, encoding="utf-8")
             reset_logger()
@@ -157,6 +173,14 @@ def main() -> int:
         bridge.LOG_DIR = old_log_dir
         bridge.LOG_FILE = old_log_file
         bridge.LOG_ROTATE_BYTES = old_rotate_bytes
+        bridge.WORKBENCH_DIR = old_workbench_dir
+        bridge.TASKS_DIR = old_tasks_dir
+        bridge.PROJECTS_DIR = old_projects_dir
+        bridge.EVIDENCE_DIR = old_evidence_dir
+        bridge.RETROS_DIR = old_retros_dir
+        bridge.DECISIONS_DIR = old_decisions_dir
+        bridge.DAILY_DIR = old_daily_dir
+        bridge.ARCHIVE_DIR = old_archive_dir
         reset_logger()
 
 

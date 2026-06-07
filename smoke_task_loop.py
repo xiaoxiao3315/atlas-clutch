@@ -50,6 +50,9 @@ def main() -> int:
     old_paths = {
         "WORKBENCH_DIR": bridge.WORKBENCH_DIR,
         "TASKS_DIR": bridge.TASKS_DIR,
+        "PROJECTS_DIR": bridge.PROJECTS_DIR,
+        "EVIDENCE_DIR": bridge.EVIDENCE_DIR,
+        "RETROS_DIR": bridge.RETROS_DIR,
         "DECISIONS_DIR": bridge.DECISIONS_DIR,
         "DAILY_DIR": bridge.DAILY_DIR,
         "ARCHIVE_DIR": bridge.ARCHIVE_DIR,
@@ -64,6 +67,9 @@ def main() -> int:
             root = Path(tmp)
             bridge.WORKBENCH_DIR = root / "workbench"
             bridge.TASKS_DIR = bridge.WORKBENCH_DIR / "tasks"
+            bridge.PROJECTS_DIR = bridge.WORKBENCH_DIR / "projects"
+            bridge.EVIDENCE_DIR = bridge.WORKBENCH_DIR / "evidence"
+            bridge.RETROS_DIR = bridge.WORKBENCH_DIR / "retros"
             bridge.DECISIONS_DIR = bridge.WORKBENCH_DIR / "decisions"
             bridge.DAILY_DIR = bridge.WORKBENCH_DIR / "daily"
             bridge.ARCHIVE_DIR = bridge.WORKBENCH_DIR / "archive"
@@ -177,6 +183,9 @@ secret: raw-secret-value
     finally:
         bridge.WORKBENCH_DIR = old_paths["WORKBENCH_DIR"]
         bridge.TASKS_DIR = old_paths["TASKS_DIR"]
+        bridge.PROJECTS_DIR = old_paths["PROJECTS_DIR"]
+        bridge.EVIDENCE_DIR = old_paths["EVIDENCE_DIR"]
+        bridge.RETROS_DIR = old_paths["RETROS_DIR"]
         bridge.DECISIONS_DIR = old_paths["DECISIONS_DIR"]
         bridge.DAILY_DIR = old_paths["DAILY_DIR"]
         bridge.ARCHIVE_DIR = old_paths["ARCHIVE_DIR"]
