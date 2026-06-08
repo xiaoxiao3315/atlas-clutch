@@ -341,7 +341,14 @@ def main() -> int:
                     raise AssertionError(f"write runner used unexpected command: {argv}")
                 assert_contains(input_text, "## Human Write Approval")
                 assert_contains(input_text, "## Workspace-Write Forbidden Actions")
-                assert_contains(input_text, "workbench/tmp/write-runner-live-smoke.txt")
+                if not any(
+                    path in input_text
+                    for path in (
+                        "workbench/tmp/write-runner-live-smoke.txt",
+                        "workbench/tmp/fast-write-approval-smoke.txt",
+                    )
+                ):
+                    raise AssertionError("write runner payload did not include the expected write target")
                 assert_contains(input_text, "Do not run git add.")
                 assert_contains(input_text, "Do not deploy.")
                 return {
@@ -388,6 +395,8 @@ def main() -> int:
             assert_contains(approved, "auto_decision: pass")
             assert_contains(approved, "auto_closed: true")
             assert_contains(approved, "auto_retro_created: true")
+            assert_contains(approved, f"approval_target: {manual_exec_id}")
+            assert_contains(approved, "created_exec_for_dispatch: false")
             if len(captured_runner_inputs) != write_capture_start + 1:
                 raise AssertionError("write approval must call runner exactly once")
             if external_commands[external_start:] != [["codex", "exec", "--sandbox", "workspace-write", "-"]]:
@@ -418,6 +427,38 @@ def main() -> int:
             if not write_retro_file.exists():
                 raise AssertionError("expected approved-write auto retro draft")
 
+            fast_write_task_reply, route = bridge.prepare_reply(
+                "/task new Create or update only workbench/tmp/fast-write-approval-smoke.txt. Do not modify source code. No git add/commit/push. --project auto_exec",
+                ctx,
+            )
+            assert route == "local_command"
+            fast_write_task_id = extract_task_id(fast_write_task_reply)
+            fast_write_dispatch_reply, route = bridge.prepare_reply(f"/dispatch create {fast_write_task_id} codex --with-context", ctx)
+            assert route == "local_command"
+            fast_write_dispatch_id = extract_dispatch_id(fast_write_dispatch_reply)
+            fast_write_capture_start = len(captured_runner_inputs)
+            fast_external_start = len(external_commands)
+            fast_approved, route = bridge.prepare_reply(f"/exec approve {fast_write_dispatch_id} write", ctx)
+            assert route == "local_command"
+            fast_exec_id = extract_exec_id(fast_approved)
+            assert_contains(fast_approved, "workspace-write runner returned")
+            assert_contains(fast_approved, "status: returned")
+            assert_contains(fast_approved, "runner_sandbox: workspace-write")
+            assert_contains(fast_approved, f"approval_target: {fast_write_dispatch_id}")
+            assert_contains(fast_approved, f"resolved_exec_id: {fast_exec_id}")
+            assert_contains(fast_approved, "created_exec_for_dispatch: true")
+            assert_contains(fast_approved, "Auto postprocess: pass")
+            if len(captured_runner_inputs) != fast_write_capture_start + 1:
+                raise AssertionError("dispatch-id write approval must call runner exactly once")
+            if external_commands[fast_external_start:] != [["codex", "exec", "--sandbox", "workspace-write", "-"]]:
+                raise AssertionError("dispatch-id write approval used non-workspace-write command")
+            fast_exec_text = (bridge.EXECUTIONS_DIR / f"{fast_exec_id}.md").read_text(encoding="utf-8")
+            assert_contains(fast_exec_text, "write_confirmed: true")
+            assert_contains(fast_exec_text, "runner_sandbox: workspace-write")
+            assert_contains(fast_exec_text, "explicit user write approval via dispatch_id")
+            assert_contains((bridge.DISPATCHES_DIR / f"{fast_write_dispatch_id}.md").read_text(encoding="utf-8"), "status: reviewed")
+            assert_contains((bridge.TASKS_DIR / f"{fast_write_task_id}.md").read_text(encoding="utf-8"), "status: archived")
+
             deploy_task_reply, route = bridge.prepare_reply(
                 "/task new Deploy app to production --project auto_exec",
                 ctx,
@@ -444,6 +485,7 @@ def main() -> int:
                 "reason": "smoke unavailable",
                 "command": [],
             }
+            unsupported_capture_start = len(captured_runner_inputs)
             unsupported_task_id, unsupported_dispatch_id = create_read_only_dispatch(ctx)
             unsupported, route = bridge.prepare_reply(f"/exec start {unsupported_dispatch_id}", ctx)
             assert route == "local_command"
@@ -452,7 +494,7 @@ def main() -> int:
             assert_contains(unsupported, "status: needs_manual_start")
             assert_contains(unsupported, "codex non-interactive unsupported")
             assert_contains((bridge.EXECUTIONS_DIR / f"{unsupported_exec_id}.md").read_text(encoding="utf-8"), "status: needs_manual_start")
-            if len(captured_runner_inputs) != write_capture_start + 1:
+            if len(captured_runner_inputs) != unsupported_capture_start:
                 raise AssertionError("unsupported Codex path must not call runner")
 
             bridge.probe_codex_noninteractive = lambda: {

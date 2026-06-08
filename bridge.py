@@ -6466,6 +6466,35 @@ def latest_exec_for_dispatch(dispatch_id: str) -> dict | None:
     return matches[0] if matches else None
 
 
+WRITE_APPROVAL_ELIGIBLE_STATUSES = {"prepared", "needs_manual_start"}
+
+
+def resolve_write_approval_target(target_id: str) -> tuple[str, str, bool]:
+    value = str(target_id or "").strip()
+    if re.fullmatch(r"DISPATCH-\d{8}-\d{6}(?:-\d{2})?", value):
+        dispatch_id = normalize_dispatch_id(value)
+        record = latest_exec_for_dispatch(dispatch_id)
+        if record:
+            status = record.get("status", "unknown")
+            if status not in WRITE_APPROVAL_ELIGIBLE_STATUSES:
+                raise ValueError(
+                    f"dispatch latest execution {record.get('exec_id', '')} status={status}; "
+                    "write approval requires prepared/needs_manual_start or no existing execution"
+                )
+            return normalize_exec_id(record.get("exec_id", "")), dispatch_id, False
+        target = task_metadata(read_dispatch(dispatch_id)).get("target_executor", "").lower()
+        if target != "codex":
+            raise ValueError("dispatch target_executor must be codex for workspace-write approval")
+        exec_id, _text = create_exec_session(dispatch_id)
+        return exec_id, dispatch_id, True
+    if re.fullmatch(r"EXEC-\d{8}-\d{6}(?:-\d{2})?", value):
+        exec_id = normalize_exec_id(value)
+        text = read_exec(exec_id)
+        dispatch_id = normalize_dispatch_id(task_metadata(text).get("dispatch_id", ""))
+        return exec_id, dispatch_id, False
+    raise ValueError("approval target must be an EXEC-* or DISPATCH-* id")
+
+
 def latest_exec_for_task(task_id: str) -> dict | None:
     normalized_task_id = normalize_task_id(task_id)
     matches = [record for record in exec_records() if record.get("task_id") == normalized_task_id]
@@ -7061,7 +7090,8 @@ def build_manual_start_hint(exec_id: str, dispatch_id: str, reason: str) -> str:
     return sanitize_sensitive_text(f"""Manual start required for {exec_id}
 - reason: {reason}
 - show package: /exec package {exec_id}
-- approve workspace-write runner: /exec approve {exec_id} write
+- approve workspace-write runner: /exec approve {dispatch_id} write
+- approve by execution id: /exec approve {exec_id} write
 - after manual return: /exec receive {exec_id}
 - dispatch fallback: /dispatch package {dispatch_id}
 - boundary: copy-only unless the user explicitly confirms executor-side actions.""")
@@ -7567,7 +7597,7 @@ def exec_next_action(record: dict | None) -> str:
     if status == "started":
         return f"wait for auto runner output; if stuck inspect /exec show {exec_id}"
     if status == "needs_manual_start":
-        return f"manual start required; approve workspace-write with /exec approve {exec_id} write or show payload with /exec package {exec_id}; then /exec receive {exec_id}"
+        return f"manual start required; approve workspace-write with /exec approve {record.get('dispatch_id', '')} write, or /exec approve {exec_id} write; then /exec receive {exec_id}"
     if status in {"opened", "copied"}:
         return f"wait for executor return; when ready use /exec receive {exec_id}"
     if status == "returned":
@@ -7583,7 +7613,7 @@ def build_exec_help_reply() -> str:
 - /exec help
 - /exec prepare <dispatch_id>
 - /exec start <dispatch_id>
-- /exec approve <exec_id> write
+- /exec approve <exec_id|dispatch_id> write
 - /exec package <exec_id>
 - /exec mark <exec_id> copied <note>
 - /exec mark <exec_id> opened <note>
@@ -7599,7 +7629,8 @@ def build_exec_help_reply() -> str:
 Boundary:
 - read-only auto-run only for dispatches with explicit read-only / no-code-change boundaries
 - write or modification tasks degrade to needs_manual_start
-- workspace-write runner requires explicit /exec approve <exec_id> write
+- workspace-write runner requires explicit /exec approve <exec_id|dispatch_id> write
+- dispatch-id approval is the fast path; it reuses a prepared/manual-start exec or creates one when no execution exists yet
 - human_confirm_required: true for write/modify/deploy tasks
 - external_execution_enabled: false
 - auto_execute_enabled: false for arbitrary tasks
@@ -7673,7 +7704,7 @@ def build_exec_start_reply(dispatch_id: str) -> str:
 - reason: {safe_preview(reason, 260)}
 - human_confirm_required: true
 - auto_execute_enabled: false
-- next: /exec approve {exec_id} write OR /exec package {exec_id}
+- next: /exec approve {normalized_dispatch_id} write OR /exec approve {exec_id} write OR /exec package {exec_id}
 
 {hint}"""
     probe = probe_codex_noninteractive()
@@ -7698,18 +7729,19 @@ def build_exec_start_reply(dispatch_id: str) -> str:
 def build_exec_approve_reply(tail: str) -> str:
     parts = str(tail or "").strip().split(maxsplit=2)
     if len(parts) < 2 or parts[1].lower() != "write":
-        return "Usage: /exec approve <exec_id> write"
-    exec_id = normalize_exec_id(parts[0])
-    approval_note = parts[2] if len(parts) > 2 else "explicit user write approval"
+        return "Usage: /exec approve <exec_id|dispatch_id> write"
+    exec_id, dispatch_id, created_from_dispatch = resolve_write_approval_target(parts[0])
+    approval_note = parts[2] if len(parts) > 2 else (
+        "explicit user write approval via dispatch_id" if parts[0].startswith("DISPATCH-") else "explicit user write approval"
+    )
     text = read_exec(exec_id)
     meta = task_metadata(text)
     status = meta.get("status", "unknown")
-    if status != "needs_manual_start":
+    if status not in WRITE_APPROVAL_ELIGIBLE_STATUSES:
         return f"""Execution approval refused: {exec_id}
 - status: {status}
-- required_status: needs_manual_start
-- reason: write approval is only accepted after /exec start stops for human confirmation"""
-    dispatch_id = normalize_dispatch_id(meta.get("dispatch_id", ""))
+- required_status: prepared OR needs_manual_start
+- reason: write approval requires an explicit prepared/manual-start execution or a dispatch id with no existing execution"""
     target_executor = meta.get("target_executor", "").lower()
     if target_executor != "codex":
         return f"""Execution approval refused: {exec_id}
@@ -7757,10 +7789,17 @@ def build_exec_approve_reply(tail: str) -> str:
 - status: needs_manual_start
 - runner_sandbox: workspace-write
 - reason: {safe_preview(reason, 260)}
+- created_exec_for_dispatch: {str(created_from_dispatch).lower()}
 - next: /exec package {exec_id}
 
 {hint}"""
-    return execute_exec_runner(exec_id, dispatch_id, probe, "workspace-write", approval_note)
+    runner_reply = execute_exec_runner(exec_id, dispatch_id, probe, "workspace-write", approval_note)
+    return f"""{runner_reply}
+
+Write approval UX:
+- approval_target: {parts[0]}
+- resolved_exec_id: {exec_id}
+- created_exec_for_dispatch: {str(created_from_dispatch).lower()}"""
 
 
 def build_exec_package_reply(exec_id: str) -> str:
