@@ -200,7 +200,7 @@ def main() -> int:
                 "Collections",
                 "Executions",
                 "Context Packs",
-                "Read-only local dashboard. No commands are executed.",
+                "Read-only local dashboard. Copy helpers do not execute commands.",
             ):
                 assert_contains(html, needle)
             for marker in forbidden_markers():

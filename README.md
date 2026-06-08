@@ -275,13 +275,17 @@ Execution ids use this shape:
 EXEC-YYYYMMDD-HHMMSS
 ```
 
-This layer wraps an existing dispatch package into an execution session. It does not call Codex/Kiro, does not run the prompt, does not inject runtime content, does not read `.env`, and does not pass secrets. It only records whether the user prepared, opened, copied, returned, cancelled, or failed a manual executor handoff.
+This layer wraps an existing dispatch package into an execution session. It does not read `.env`, does not pass secrets, does not stage or commit git changes, and does not deploy. OHB-AUTORUN-019 adds a guarded `/exec start` path for read-only dispatches only. Write, modify, deploy, commit, or unclear dispatches are marked `needs_manual_start` and remain manual.
 
 Recommended flow:
 
 ```text
 /dispatch create <task_id> codex --with-context
 /exec prepare <dispatch_id>
+/exec start <dispatch_id>
+
+If `/exec start` is not eligible or Codex non-interactive execution is unavailable:
+/exec approve <exec_id> write
 /exec package <exec_id>
 manually copy the package to Codex
 /exec mark <exec_id> copied copied into Codex window
@@ -299,6 +303,8 @@ Commands:
 ```text
 /exec help
 /exec prepare <dispatch_id>
+/exec start <dispatch_id>
+/exec approve <exec_id> write
 /exec package <exec_id>
 /exec mark <exec_id> copied <note>
 /exec mark <exec_id> opened <note>
@@ -313,13 +319,18 @@ Commands:
 
 Safety notes:
 
-- `human_confirm_required` is always `true`.
-- `external_execution_enabled` is always `false`.
-- `auto_execute_enabled` is always `false`.
 - `/exec prepare` writes only `workbench/executions/<exec_id>.md`.
+- `/exec start` first checks for explicit read-only boundaries such as no code changes, do not modify, or equivalent Chinese wording.
+- `/exec start` probes the local Codex command before using it. If non-interactive stdin execution is not supported, the execution status becomes `needs_manual_start` and the reply includes a manual package command.
+- `/exec start` injects the full execution payload through stdin using the Codex read-only exec shape, not as a title-only positional prompt.
+- `/exec start` only allows a narrow Codex read-only stdin command shape. It does not run git add, commit, push, merge, deploy, package managers, shells, or arbitrary commands.
+- Write, code-change, deployment, or unclear dispatches keep `human_confirm_required: true`.
+- `/exec approve <exec_id> write` is the only workspace-write runner path. It requires an existing `exec_id` in `needs_manual_start` and the exact `write` confirmation word.
+- The workspace-write runner uses the same stdin payload shape with `--sandbox workspace-write`; Bridge still forbids git add, commit, push, merge, deploy, and `.env` access in the payload.
+- After runner completion or failure, Bridge records runner metadata, stdout/stderr summaries, post-run `git status --short`, `git diff --stat`, cached diff stat, and a test-result summary in the execution record.
+- Eligible read-only auto runs are captured, sanitized, and passed through the existing `/dispatch receive` and `/task report` chain.
 - `/exec package` only displays a copy payload.
 - `/exec mark copied` can sync the dispatch status to `sent`, but it still does not send anything.
-- `/exec receive` syncs the pasted report through the existing `/dispatch receive` and `/task report` logic.
 - The bridge still waits for `/dispatch qa`, `/task review`, and the user's `/task decide`.
 
 ## Real Project Pilot
@@ -1054,10 +1065,33 @@ Safety boundary:
 Read-only pages:
 
 - `/` shows the dashboard HTML.
+- `/task/<task_id>` shows a read-only task drilldown with next Octo commands.
+- `/project/<project_id>` shows a read-only project drilldown.
+- `/dispatch/<dispatch_id>` shows a read-only dispatch drilldown.
+- `/pilot/<pilot_id>` shows a read-only pilot drilldown.
+- `/collection/<collection_id>` shows a read-only collection drilldown.
+- `/copy/dispatch/<dispatch_id>` shows a copy-only manual dispatch package.
+- `/copy/context/<task_id>/codex` shows a copy-only Codex context handoff.
+- `/copy/context/<task_id>/kiro` shows a copy-only Kiro context handoff.
 - `/api/summary` returns read-only summary JSON.
 - `/api/projects` returns read-only project summaries.
 - `/api/tasks` returns read-only task summaries.
 - `/api/dispatches` returns read-only dispatch summaries.
+- `/api/task/<task_id>` returns a read-only task detail JSON.
+- `/api/project/<project_id>` returns a read-only project detail JSON.
+- `/api/dispatch/<dispatch_id>` returns a read-only dispatch detail JSON.
+- `/api/pilot/<pilot_id>` returns a read-only pilot detail JSON.
+
+Dashboard Drilldown and Copy Helper:
+
+- Homepage IDs for projects, tasks, dispatches, pilots, and collections are links to local drilldown pages.
+- Drilldown pages show compact summaries only; they do not show full logs or full Workbench file bodies.
+- Recommended next actions are Octo slash command text only.
+- Copy helper buttons copy plain text to the browser clipboard only.
+- Copy helper buttons do not execute commands, do not call Codex/Kiro, and do not write Workbench data.
+- Copy package pages are manual-copy views for `/dispatch package` and `/context handoff` style text.
+- Do not expose this dashboard outside localhost.
+- If Workbench records contain sensitive-looking values, dashboard output is redacted before display.
 
 Stop it with `Ctrl+C` in the dashboard terminal.
 
@@ -1100,6 +1134,7 @@ python -m py_compile web_workbench_design_probe.py
 python -m py_compile smoke_web_design.py
 python -m py_compile dashboard_server.py
 python -m py_compile smoke_dashboard.py
+python -m py_compile smoke_dashboard_drilldown.py
 python smoke_consultation.py
 python smoke_runtime.py
 python smoke_workflow.py
@@ -1118,4 +1153,5 @@ python smoke_collect.py
 python smoke_exec.py
 python smoke_web_design.py
 python smoke_dashboard.py
+python smoke_dashboard_drilldown.py
 ```

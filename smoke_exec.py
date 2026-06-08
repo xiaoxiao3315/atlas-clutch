@@ -186,7 +186,15 @@ def main() -> int:
 
             help_text, route = bridge.prepare_reply("/exec help", ctx)
             assert route == "local_command"
-            for needle in ("semi-auto", "human_confirm_required: true", "auto_execute_enabled: false", "does not automatically call Codex/Kiro"):
+            for needle in (
+                "Atlas execution commands",
+                "/exec start <dispatch_id>",
+                "read-only auto-run only",
+                "needs_manual_start",
+                "human_confirm_required: true",
+                "read_only_auto_exec_enabled: true",
+                "probes Codex non-interactive support",
+            ):
                 assert_contains(help_text, needle)
 
             missing, route = bridge.prepare_reply("/exec prepare DISPATCH-20260607-000000", ctx)

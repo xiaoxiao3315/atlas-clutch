@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -95,9 +96,11 @@ DISPATCH_STATUSES = {
 }
 EXEC_STATUSES = {
     "prepared",
+    "started",
     "opened",
     "copied",
     "returned",
+    "needs_manual_start",
     "cancelled",
     "failed",
 }
@@ -108,6 +111,7 @@ EXTERNAL_APPLICATION_ENABLED = False
 EXTERNAL_EXECUTION_ENABLED = False
 HUMAN_CONFIRM_REQUIRED = True
 AUTO_EXECUTE_ENABLED = False
+READ_ONLY_AUTO_EXEC_ENABLED = True
 COLLECT_ENABLED = True
 COLLECT_MODE = "read_only_whitelist"
 ARBITRARY_COMMAND_ENABLED = False
@@ -115,6 +119,11 @@ COLLECT_OUTPUT_LIMIT = 6000
 COLLECT_TAIL_LINES = 80
 COLLECT_COMMAND_TIMEOUT = 20
 COLLECT_SMOKE_TIMEOUT = 60
+EXEC_START_TIMEOUT_SECONDS = 300
+RUNNER_OUTPUT_RECORD_LIMIT = 12000
+RUNNER_ERROR_RECORD_LIMIT = 8000
+RUNNER_SNAPSHOT_TIMEOUT_SECONDS = 20
+RUNNER_SANDBOX_MODES = {"read-only", "workspace-write"}
 OCTO_BRIDGE_SMOKE_ALLOWLIST = [
     "smoke_consultation.py",
     "smoke_runtime.py",
@@ -2062,8 +2071,10 @@ def workbench_counts() -> dict:
         "execution_count": 0,
         "execution_returned": 0,
         "execution_prepared_count": 0,
+        "execution_started_count": 0,
         "execution_opened_count": 0,
         "execution_copied_count": 0,
+        "execution_needs_manual_start_count": 0,
         "execution_failed_count": 0,
         "execution_stale_count": 0,
         "latest_exec_id": "",
@@ -2114,8 +2125,10 @@ def workbench_counts() -> dict:
     counts["execution_count"] = exec_view["execution_count"]
     counts["execution_returned"] = exec_view["execution_returned_count"]
     counts["execution_prepared_count"] = exec_view["execution_prepared_count"]
+    counts["execution_started_count"] = exec_view["execution_started_count"]
     counts["execution_opened_count"] = exec_view["execution_opened_count"]
     counts["execution_copied_count"] = exec_view["execution_copied_count"]
+    counts["execution_needs_manual_start_count"] = exec_view["execution_needs_manual_start_count"]
     counts["execution_failed_count"] = exec_view["execution_failed_count"]
     counts["execution_stale_count"] = exec_view["execution_stale_count"]
     counts["latest_exec_id"] = exec_view["latest_exec_id"]
@@ -2226,7 +2239,11 @@ def build_task_next_advice(task_id: str, status: str, latest_dispatch: dict | No
     dispatch_status_value = dispatch.get("status", "unknown")
     latest_exec = latest_exec_for_dispatch(dispatch_id) if dispatch_id else None
     if latest_exec and latest_exec.get("status") == "prepared":
-        return f"show semi-auto payload: /exec package {latest_exec.get('exec_id')}; then manually copy it"
+        return f"start read-only runner: /exec start {dispatch_id}; fallback payload: /exec package {latest_exec.get('exec_id')}"
+    if latest_exec and latest_exec.get("status") == "started":
+        return f"auto runner started; inspect /exec show {latest_exec.get('exec_id')}"
+    if latest_exec and latest_exec.get("status") == "needs_manual_start":
+        return f"manual start required: /exec package {latest_exec.get('exec_id')}; then /exec receive {latest_exec.get('exec_id')}"
     if latest_exec and latest_exec.get("status") in {"opened", "copied"}:
         return f"wait for executor return; when ready use /exec receive {latest_exec.get('exec_id')}"
     if latest_exec and latest_exec.get("status") == "returned" and dispatch_status_value in {"returned", "sent", "ready"}:
@@ -6345,7 +6362,7 @@ def exec_title_from_text(exec_id: str, text: str) -> str:
 
 
 def exec_is_stale_record(record: dict, now: datetime | None = None) -> bool:
-    if record.get("status") not in {"prepared", "opened", "copied"}:
+    if record.get("status") not in {"prepared", "started", "opened", "copied", "needs_manual_start"}:
         return False
     timestamp = record.get("updated_at") or record.get("created_at")
     if not timestamp:
@@ -6379,6 +6396,20 @@ def exec_records() -> list[dict]:
             "opened_at": meta.get("opened_at", ""),
             "copied_at": meta.get("copied_at", ""),
             "returned_at": meta.get("returned_at", ""),
+            "started_at": meta.get("started_at", ""),
+            "auto_run_mode": meta.get("auto_run_mode", ""),
+            "read_only_auto_run": meta.get("read_only_auto_run", ""),
+            "runner_probe": meta.get("runner_probe", ""),
+            "runner_mode": meta.get("runner_mode", ""),
+            "runner_sandbox": meta.get("runner_sandbox", ""),
+            "returncode": meta.get("returncode", ""),
+            "timed_out": meta.get("timed_out", ""),
+            "stdout_chars": meta.get("stdout_chars", ""),
+            "stderr_chars": meta.get("stderr_chars", ""),
+            "completion_state": meta.get("completion_state", ""),
+            "payload_state": meta.get("payload_state", ""),
+            "write_confirmed": meta.get("write_confirmed", ""),
+            "write_approved_at": meta.get("write_approved_at", ""),
             "dispatch_id": meta.get("dispatch_id", ""),
             "task_id": meta.get("task_id", ""),
             "project_id": meta.get("project_id", ""),
@@ -6396,9 +6427,11 @@ def latest_exec_for_dispatch(dispatch_id: str) -> dict | None:
     matches = [record for record in exec_records() if record.get("dispatch_id") == normalized_dispatch_id]
     status_rank = {
         "returned": 80,
+        "started": 75,
         "copied": 70,
         "opened": 65,
         "prepared": 60,
+        "needs_manual_start": 55,
         "failed": 20,
         "cancelled": 10,
     }
@@ -6426,9 +6459,11 @@ def exec_counts(records: list[dict] | None = None) -> dict:
     return {
         "execution_count": len(items),
         "execution_prepared_count": sum(1 for item in items if item.get("status") == "prepared"),
+        "execution_started_count": sum(1 for item in items if item.get("status") == "started"),
         "execution_opened_count": sum(1 for item in items if item.get("status") == "opened"),
         "execution_copied_count": sum(1 for item in items if item.get("status") == "copied"),
         "execution_returned_count": sum(1 for item in items if item.get("status") == "returned"),
+        "execution_needs_manual_start_count": sum(1 for item in items if item.get("status") == "needs_manual_start"),
         "execution_failed_count": sum(1 for item in items if item.get("status") == "failed"),
         "execution_cancelled_count": sum(1 for item in items if item.get("status") == "cancelled"),
         "execution_stale_count": sum(1 for item in items if item.get("stale")),
@@ -6455,15 +6490,58 @@ external_execution_enabled: false
 runtime_injection_enabled: false
 auto_execute_enabled: false
 
-This package is for manual copy only. Atlas/Bridge has not sent it, has not called {display_target}, and will not run the task.
+This package is the execution payload for {display_target}. Atlas/Bridge only permits read-only auto start after safety checks; otherwise this payload is for manual copy only.
+
+## Dispatch Summary
+- dispatch_id: {normalized_dispatch_id}
+- dispatch_status: {meta.get('status', 'unknown')}
+- task_id: {meta.get('task_id', '')}
+- project_id: {meta.get('project_id', '') or 'unassigned'}
+- target_executor: {target}
+- context_id: {meta.get('context_id', '') or 'none'}
 
 ## Manual Confirmation Required
 - Copy this payload into {display_target} manually.
 - Confirm any action inside {display_target} manually.
 - Paste the return report back with /exec receive {normalized_exec_id}.
 
+## Auto-Run Output Guidance
+- Keep the final answer concise so the runner can exit before timeout.
+- For minimal AUTORUN validation, include AUTORUN-PAYLOAD-OK and a short return report.
+- Do not stream long analysis logs; summarize commands, results, unverified items, and risks.
+
 ## Dispatch Package
 {package}
+""")
+
+
+def build_runner_payload(exec_id: str, dispatch_id: str, sandbox_mode: str) -> str:
+    payload = build_exec_payload(exec_id, dispatch_id)
+    if sandbox_mode != "workspace-write":
+        return payload
+    return sanitize_sensitive_text(f"""{payload}
+
+## Human Write Approval
+- exec_id: {normalize_exec_id(exec_id)}
+- approval_mode: workspace-write
+- user_explicit_confirmation_required: true
+- This approval allows the executor to modify workspace files only for the scoped task.
+
+## Workspace-Write Forbidden Actions
+- Do not run git add.
+- Do not run git commit.
+- Do not run git push.
+- Do not run git merge.
+- Do not deploy.
+- Do not read or print .env files.
+- Do not print tokens, cookies, Authorization headers, passwords, api keys, or secrets.
+
+## Required Return Evidence
+- Summarize modified files.
+- Summarize commands and tests run.
+- State git status and git diff --stat observations.
+- State unresolved risks and unverified items.
+- Keep output concise enough to avoid runner timeout.
 """)
 
 
@@ -6491,12 +6569,26 @@ created_at: {now}
 updated_at: {now}
 opened_at:
 copied_at:
+started_at:
 returned_at:
 mode: semi_auto
 human_confirm_required: true
 external_execution_enabled: false
 runtime_injection_enabled: false
 auto_execute_enabled: false
+read_only_auto_run: false
+auto_run_mode:
+runner_probe:
+runner_mode:
+runner_sandbox:
+returncode:
+timed_out: false
+stdout_chars: 0
+stderr_chars: 0
+completion_state: prepared
+payload_state:
+write_confirmed: false
+write_approved_at:
 manual_copy_required: true
 
 ## Dispatch Summary
@@ -6524,11 +6616,32 @@ manual_copy_required: true
 - The user must paste the payload.
 - The user must confirm any executor-side action.
 
+## Human Write Approval
+- not approved.
+
 ## Copy Payload
 {payload}
 
 ## Open Record
 - not opened.
+
+## Auto Start
+- not started.
+
+## Runner Metadata
+- not started.
+
+## Runner Stdout
+- not captured.
+
+## Runner Stderr
+- not captured.
+
+## Post-Run Snapshot
+- not captured.
+
+## Runner Test Results
+- not captured.
 
 ## Return Record
 - not returned.
@@ -6564,6 +6677,784 @@ def create_exec_session(dispatch_id: str) -> tuple[str, str]:
     return exec_id, markdown
 
 
+READ_ONLY_BOUNDARY_MARKERS = (
+    "read-only",
+    "read only",
+    "only read",
+    "no code changes",
+    "no file changes",
+    "do not modify",
+    "do not write",
+    "只读",
+    "不改代码",
+    "不修改",
+    "不创建文件",
+    "不写文件",
+    "不提交",
+)
+
+WRITE_INTENT_PATTERNS = (
+    r"\bwrite\s+code\b",
+    r"\bmodify\s+(code|files?)\b",
+    r"\bcreate\s+(files?|migration|component|route)\b",
+    r"\bedit\s+(files?|code)\b",
+    r"\bapply\s+patch\b",
+    r"\bgit\s+(add|commit|push|merge)\b",
+    r"\bdeploy\b",
+    r"写代码",
+    r"修改代码",
+    r"改代码",
+    r"创建文件",
+    r"新建文件",
+    r"修改文件",
+    r"提交",
+    r"部署",
+    r"发布",
+)
+
+WRITE_APPROVAL_FORBIDDEN_PATTERNS = (
+    r"\bgit\s+(add|commit|push|merge)\b",
+    r"\bdeploy\b",
+    r"æäº¤",
+    r"éƒ¨ç½²",
+    r"å‘å¸ƒ",
+)
+
+EXPLICIT_WRITE_TARGET_PATTERNS = (
+    r"\b(create|update|write|touch)\b.+\b(workbench|logs|runtime|tmp|templates)[\\/][^\s`'\"<>]+",
+    r"\b(create|update|write|touch)\b.+[A-Za-z0-9_.-]+[\\/][^\s`'\"<>]+\.(txt|md|json|py|yaml|yml|toml|cmd|bat|ps1|tsx?|jsx?|css|html)\b",
+    r"\b(create|update|write|touch)\b.+\b(file|path)\b.+[^\s`'\"<>]+\.(txt|md|json|py|yaml|yml|toml|cmd|bat|ps1|tsx?|jsx?|css|html)\b",
+    r"\b(create\s+or\s+update|create/update|update\s+or\s+create)\b.+[^\s`'\"<>]+[\\/][^\s`'\"<>]+",
+)
+
+NEGATIVE_BOUNDARY_MARKERS = (
+    "do not",
+    "don't",
+    "must not",
+    "no ",
+    "not ",
+    "forbidden",
+    "禁止",
+    "不要",
+    "不得",
+    "不能",
+    "不",
+)
+
+
+def context_text_for_dispatch(dispatch_text: str) -> str:
+    context_id = task_metadata(dispatch_text).get("context_id", "")
+    if not context_id:
+        return ""
+    try:
+        return read_context_pack(context_id)
+    except Exception:
+        return ""
+
+
+def exec_start_source_bundle(dispatch_id: str) -> tuple[str, str, str, str]:
+    normalized_dispatch_id = normalize_dispatch_id(dispatch_id)
+    dispatch_text = read_dispatch(normalized_dispatch_id)
+    meta = task_metadata(dispatch_text)
+    task_id = normalize_task_id(meta.get("task_id", ""))
+    task_text = read_task(task_id)
+    context_text = context_text_for_dispatch(dispatch_text)
+    package = build_dispatch_package_reply(normalized_dispatch_id)
+    return dispatch_text, task_text, context_text, package
+
+
+def line_has_explicit_write_target(line: str) -> bool:
+    return any(re.search(pattern, line, re.IGNORECASE) for pattern in EXPLICIT_WRITE_TARGET_PATTERNS)
+
+
+def line_has_write_intent(line: str) -> bool:
+    lowered = line.lower()
+    field_label = re.sub(r"^[>\-\s]*", "", lowered).strip()
+    report_field_labels = {
+        "modified files:",
+        "modified files：",
+        "files changed:",
+        "files changed：",
+        "修改文件:",
+        "修改文件：",
+        "变更文件:",
+        "变更文件：",
+    }
+    if field_label in report_field_labels:
+        return False
+    evidence_or_report_markers = (
+        "return report",
+        "report format",
+        "modified files",
+        "rollback notes",
+        "acceptance",
+        "evidence",
+        "report:",
+        "报告",
+        "回传",
+        "验收",
+        "证据",
+    )
+    if any(marker in lowered for marker in evidence_or_report_markers):
+        return False
+    safety_capability_markers = (
+        "dispatch writes only workbench/dispatches",
+        "write only workbench/context_packs",
+        "writes only workbench/executions",
+        "writes only workbench execution",
+        "bridge/atlas only writes",
+    )
+    if any(marker in lowered for marker in safety_capability_markers):
+        return False
+    if line_has_explicit_write_target(line):
+        return True
+    if any(marker in lowered for marker in NEGATIVE_BOUNDARY_MARKERS):
+        return False
+    return any(re.search(pattern, line, re.IGNORECASE) for pattern in WRITE_INTENT_PATTERNS)
+
+
+def read_only_dispatch_gate(dispatch_id: str) -> dict:
+    dispatch_text, task_text, context_text, package = exec_start_source_bundle(dispatch_id)
+    combined = "\n".join([dispatch_text, task_text, context_text, package])
+    lowered = combined.lower()
+    has_read_only_marker = any(marker in lowered for marker in READ_ONLY_BOUNDARY_MARKERS)
+    write_lines = [
+        sanitize_sensitive_text(line.strip())
+        for line in combined.splitlines()
+        if line_has_write_intent(line)
+    ][:5]
+    return {
+        "ok": bool(has_read_only_marker and not write_lines),
+        "has_read_only_marker": has_read_only_marker,
+        "write_intent_lines": write_lines,
+        "reason": (
+            "read-only boundary accepted"
+            if has_read_only_marker and not write_lines
+            else "missing read-only boundary" if not has_read_only_marker else "write intent detected"
+        ),
+    }
+
+
+def write_approval_gate(dispatch_id: str) -> dict:
+    dispatch_text, task_text, context_text, package = exec_start_source_bundle(dispatch_id)
+    combined = "\n".join([dispatch_text, task_text, context_text, package])
+    forbidden_lines = [
+        sanitize_sensitive_text(line.strip())
+        for line in combined.splitlines()
+        if not any(marker in line.lower() for marker in NEGATIVE_BOUNDARY_MARKERS)
+        and any(re.search(pattern, line, re.IGNORECASE) for pattern in WRITE_APPROVAL_FORBIDDEN_PATTERNS)
+    ][:5]
+    return {
+        "ok": not forbidden_lines,
+        "forbidden_lines": forbidden_lines,
+        "reason": "write approval accepted" if not forbidden_lines else "forbidden write/deploy action detected",
+    }
+
+
+def command_basename(command: str) -> str:
+    return Path(str(command or "")).name.lower()
+
+
+def process_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def is_allowed_external_command(argv: list[str]) -> bool:
+    if not argv:
+        return False
+    name = command_basename(argv[0])
+    codex_names = {"codex", "codex.exe", "codex.cmd", "codex.bat"}
+    if name not in codex_names:
+        return False
+    if len(argv) == 2 and argv[1] == "--help":
+        return True
+    if len(argv) == 3 and argv[1:3] == ["exec", "--help"]:
+        return True
+    if len(argv) == 5 and argv[1:3] == ["exec", "--sandbox"] and argv[3] in RUNNER_SANDBOX_MODES and argv[4] == "-":
+        return True
+    return False
+
+
+def is_allowed_post_run_command(argv: list[str]) -> bool:
+    if argv == ["git", "status", "--short"]:
+        return True
+    if argv == ["git", "diff", "--stat"]:
+        return True
+    if argv == ["git", "diff", "--cached", "--stat"]:
+        return True
+    return False
+
+
+def run_allowlisted_external_command(
+    argv: list[str],
+    *,
+    input_text: str = "",
+    timeout: int = EXEC_START_TIMEOUT_SECONDS,
+) -> dict:
+    if not is_allowed_external_command(argv):
+        raise ValueError("external command is not allowlisted")
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=ROOT,
+            input=sanitize_sensitive_text(input_text),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            shell=False,
+        )
+        return {
+            "returncode": completed.returncode,
+            "stdout": sanitize_sensitive_text(completed.stdout or ""),
+            "stderr": sanitize_sensitive_text(completed.stderr or ""),
+            "timed_out": False,
+        }
+    except FileNotFoundError as exc:
+        return {"returncode": 127, "stdout": "", "stderr": sanitize_sensitive_text(str(exc)), "timed_out": False}
+    except subprocess.TimeoutExpired as exc:
+        stdout = sanitize_sensitive_text(process_text(exc.stdout))
+        stderr = sanitize_sensitive_text(process_text(exc.stderr) or "execution timed out")
+        return {
+            "returncode": 124,
+            "stdout": stdout,
+            "stderr": stderr,
+            "timed_out": True,
+        }
+
+
+def run_allowlisted_post_run_command(argv: list[str]) -> dict:
+    if not is_allowed_post_run_command(argv):
+        raise ValueError("post-run command is not allowlisted")
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=RUNNER_SNAPSHOT_TIMEOUT_SECONDS,
+            shell=False,
+        )
+        return {
+            "returncode": completed.returncode,
+            "stdout": sanitize_sensitive_text(completed.stdout or ""),
+            "stderr": sanitize_sensitive_text(completed.stderr or ""),
+        }
+    except FileNotFoundError as exc:
+        return {"returncode": 127, "stdout": "", "stderr": sanitize_sensitive_text(str(exc))}
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "returncode": 124,
+            "stdout": sanitize_sensitive_text(process_text(exc.stdout)),
+            "stderr": sanitize_sensitive_text(process_text(exc.stderr) or "post-run snapshot timed out"),
+        }
+
+
+def probe_codex_noninteractive(sandbox_mode: str = "read-only") -> dict:
+    if sandbox_mode not in RUNNER_SANDBOX_MODES:
+        return {"supported": False, "mode": "invalid_sandbox", "reason": f"unsupported sandbox mode: {sandbox_mode}", "command": []}
+    if os.environ.get("OHB_EXEC_SIMULATE_CODEX") == "1":
+        return {"supported": True, "mode": "simulated", "reason": "OHB_EXEC_SIMULATE_CODEX enabled", "command": []}
+    codex_path = shutil.which("codex")
+    if not codex_path:
+        return {"supported": False, "mode": "missing", "reason": "codex command not found", "command": []}
+    help_result = run_allowlisted_external_command([codex_path, "--help"], timeout=10)
+    help_text = f"{help_result.get('stdout', '')}\n{help_result.get('stderr', '')}".lower()
+    if help_result.get("returncode") != 0 or "exec" not in help_text:
+        return {"supported": False, "mode": "help_probe_failed", "reason": "codex --help did not expose exec", "command": []}
+    exec_help = run_allowlisted_external_command([codex_path, "exec", "--help"], timeout=10)
+    exec_help_text = f"{exec_help.get('stdout', '')}\n{exec_help.get('stderr', '')}".lower()
+    if exec_help.get("returncode") != 0:
+        return {"supported": False, "mode": "exec_help_failed", "reason": "codex exec --help failed", "command": []}
+    has_prompt_arg = "prompt" in exec_help_text
+    has_requested_sandbox = "sandbox" in exec_help_text and sandbox_mode in exec_help_text
+    has_stdin_prompt = "stdin" in exec_help_text and ("`-`" in exec_help_text or " - " in f" {exec_help_text} ")
+    if has_prompt_arg and has_requested_sandbox and has_stdin_prompt:
+        mode_label = sandbox_mode.replace("-", "_")
+        return {
+            "supported": True,
+            "mode": f"codex_exec_{mode_label}_stdin",
+            "reason": f"codex exec help exposes prompt, stdin, and {sandbox_mode} sandbox",
+            "command": [codex_path, "exec", "--sandbox", sandbox_mode, "-"],
+        }
+    return {
+        "supported": False,
+        "mode": "unsupported_help_shape",
+        "reason": f"codex exec help did not expose a recognized {sandbox_mode} stdin non-interactive shape",
+        "command": [],
+    }
+
+
+def probe_codex_workspace_write() -> dict:
+    return probe_codex_noninteractive("workspace-write")
+
+
+def build_manual_start_hint(exec_id: str, dispatch_id: str, reason: str) -> str:
+    return sanitize_sensitive_text(f"""Manual start required for {exec_id}
+- reason: {reason}
+- show package: /exec package {exec_id}
+- approve workspace-write runner: /exec approve {exec_id} write
+- after manual return: /exec receive {exec_id}
+- dispatch fallback: /dispatch package {dispatch_id}
+- boundary: copy-only unless the user explicitly confirms executor-side actions.""")
+
+
+def runner_output_limit(text: str, limit: int) -> str:
+    clean = sanitize_sensitive_text(text)
+    if len(clean) <= limit:
+        return clean
+    return clean[: max(0, limit - 80)].rstrip() + "\n...[truncated runner output]"
+
+
+def collect_post_run_snapshot() -> str:
+    commands = [
+        ("git status --short", ["git", "status", "--short"]),
+        ("git diff --stat", ["git", "diff", "--stat"]),
+        ("git diff --cached --stat", ["git", "diff", "--cached", "--stat"]),
+    ]
+    lines = []
+    for label, argv in commands:
+        result = run_allowlisted_post_run_command(argv)
+        lines.extend(
+            [
+                f"### {label}",
+                f"- returncode: {result.get('returncode')}",
+                "stdout:",
+                "```text",
+                runner_output_limit(str(result.get("stdout", "")).strip() or "- empty", 4000),
+                "```",
+                "stderr:",
+                "```text",
+                runner_output_limit(str(result.get("stderr", "")).strip() or "- empty", 2000),
+                "```",
+            ]
+        )
+    return sanitize_sensitive_text("\n".join(lines))
+
+
+def extract_test_results_summary(stdout: str) -> str:
+    text = sanitize_sensitive_text(stdout)
+    pattern = re.compile(r"(?im)^(test results|tests?|测试结果)\s*:\s*$")
+    match = pattern.search(text)
+    if not match:
+        return safe_preview(text, 800) or "- no stdout captured"
+    next_match = re.search(
+        r"(?im)^(key logs|unverified|unresolved risks|rollback notes|modified files|commands|关键日志|未验证|未解决风险)\s*:\s*$",
+        text[match.end():],
+    )
+    end = match.end() + next_match.start() if next_match else len(text)
+    return safe_preview(text[match.end():end].strip(), 1000) or "- test section empty"
+
+
+def runner_output_has_payload(output: str, exec_id: str, dispatch_id: str, task_id: str) -> bool:
+    lowered = sanitize_sensitive_text(output).lower()
+    markers = [
+        "# semi-auto execution package",
+        f"exec_id: {exec_id}".lower(),
+        f"dispatch_id: {dispatch_id}".lower(),
+        f"task_id: {task_id}".lower(),
+        "## dispatch package",
+        "## goal",
+        "## execution boundary",
+    ]
+    return sum(1 for marker in markers if marker and marker in lowered) >= 2
+
+
+def stdout_has_valid_runner_output(stdout: str, dispatch_id: str, task_id: str) -> bool:
+    clean = sanitize_sensitive_text(stdout).strip()
+    lowered = clean.lower()
+    if not clean:
+        return False
+    if "autorun-payload-ok" in lowered:
+        return True
+    has_ids = task_id.lower() in lowered and dispatch_id.lower() in lowered
+    report_markers = (
+        "execution summary",
+        "modified files",
+        "commands",
+        "test results",
+        "unverified",
+        "unresolved risks",
+    )
+    return has_ids and sum(1 for marker in report_markers if marker in lowered) >= 3
+
+
+def classify_runner_completion(exec_id: str, dispatch_id: str, task_id: str, result: dict) -> dict:
+    stdout = sanitize_sensitive_text(result.get("stdout", ""))
+    stderr = sanitize_sensitive_text(result.get("stderr", ""))
+    output = f"{stdout}\n{stderr}"
+    returncode = int(result.get("returncode") if str(result.get("returncode", "")).strip() else 0)
+    timed_out = bool(result.get("timed_out")) or returncode == 124
+    payload_seen = runner_output_has_payload(output, exec_id, dispatch_id, task_id)
+    valid_stdout = stdout_has_valid_runner_output(stdout, dispatch_id, task_id)
+    if returncode == 0:
+        completion_state = "completed"
+    elif timed_out and valid_stdout:
+        completion_state = "timeout_with_output"
+    elif timed_out and payload_seen:
+        completion_state = "timeout_with_payload"
+    elif timed_out:
+        completion_state = "payload_missing"
+    else:
+        completion_state = "failed"
+    return {
+        "returncode": str(returncode),
+        "timed_out": "true" if timed_out else "false",
+        "stdout_chars": str(len(stdout)),
+        "stderr_chars": str(len(stderr)),
+        "completion_state": completion_state,
+        "payload_state": "payload_seen" if payload_seen else "payload_missing",
+        "has_valid_stdout": valid_stdout,
+    }
+
+
+def update_exec_fields(exec_id: str, fields: dict[str, str]) -> str:
+    normalized_exec_id = normalize_exec_id(exec_id)
+    text = read_exec(normalized_exec_id)
+    for key, value in fields.items():
+        text = replace_task_field(text, key, value)
+    write_exec(normalized_exec_id, text)
+    return text
+
+
+def persist_runner_result(exec_id: str, result: dict, probe: dict, completion: dict, post_run_snapshot: str = "") -> None:
+    stdout = sanitize_sensitive_text(result.get("stdout", ""))
+    stderr = sanitize_sensitive_text(result.get("stderr", ""))
+    fields = {
+        "runner_mode": str(probe.get("mode", "")),
+        "auto_run_mode": str(probe.get("mode", "")),
+        "runner_probe": safe_preview(str(probe.get("reason", "")), 120),
+        "returncode": completion["returncode"],
+        "timed_out": completion["timed_out"],
+        "stdout_chars": completion["stdout_chars"],
+        "stderr_chars": completion["stderr_chars"],
+        "completion_state": completion["completion_state"],
+        "payload_state": completion["payload_state"],
+    }
+    update_exec_fields(exec_id, fields)
+    now = iso_now()
+    append_exec_autostart_section(
+        exec_id,
+        "runner output",
+        "\n".join(
+            [
+                f"- returncode: {completion['returncode']}",
+                f"- timed_out: {completion['timed_out']}",
+                f"- completion_state: {completion['completion_state']}",
+                f"- payload_state: {completion['payload_state']}",
+                f"- stdout_chars: {completion['stdout_chars']}",
+                f"- stderr_chars: {completion['stderr_chars']}",
+                f"- recorded_at: {now}",
+            ]
+        ),
+    )
+    text = read_exec(exec_id)
+    text = append_to_section(
+        text,
+        "Runner Metadata",
+        "\n".join(
+            [
+                f"### Runner result at {now}",
+                f"- runner_mode: {probe.get('mode', '')}",
+                f"- runner_probe: {safe_preview(str(probe.get('reason', '')), 160)}",
+                f"- returncode: {completion['returncode']}",
+                f"- timed_out: {completion['timed_out']}",
+                f"- completion_state: {completion['completion_state']}",
+                f"- payload_state: {completion['payload_state']}",
+                f"- stdout_chars: {completion['stdout_chars']}",
+                f"- stderr_chars: {completion['stderr_chars']}",
+            ]
+        ),
+    )
+    text = append_to_section(
+        text,
+        "Runner Stdout",
+        f"### stdout at {now}\n```text\n{runner_output_limit(stdout, RUNNER_OUTPUT_RECORD_LIMIT) or '- empty'}\n```",
+    )
+    text = append_to_section(
+        text,
+        "Runner Stderr",
+        f"### stderr at {now}\n```text\n{runner_output_limit(stderr, RUNNER_ERROR_RECORD_LIMIT) or '- empty'}\n```",
+    )
+    text = append_to_section(
+        text,
+        "Post-Run Snapshot",
+        f"### snapshot at {now}\n{post_run_snapshot or '- snapshot unavailable'}",
+    )
+    text = append_to_section(
+        text,
+        "Runner Test Results",
+        f"### test summary at {now}\n{extract_test_results_summary(stdout)}",
+    )
+    write_exec(exec_id, text)
+
+
+def build_auto_runner_report(
+    exec_id: str,
+    dispatch_id: str,
+    result: dict,
+    mode: str,
+    completion: dict | None = None,
+    post_run_snapshot: str = "",
+    sandbox_mode: str = "read-only",
+) -> str:
+    stdout = sanitize_sensitive_text(result.get("stdout", ""))
+    stderr = sanitize_sensitive_text(result.get("stderr", ""))
+    completion = completion or {"completion_state": "completed", "timed_out": "false"}
+    stdout_summary = safe_preview(stdout, 1400) or "- none"
+    stderr_summary = safe_preview(stderr, 800) or "- none"
+    return sanitize_sensitive_text(f"""Task id: {task_metadata(read_exec(exec_id)).get('task_id', '')}
+Dispatch id: {dispatch_id}
+Execution id: {exec_id}
+
+Execution summary:
+- Dispatch runner completed with mode={mode}.
+- Runner sandbox: {sandbox_mode}
+- Return code: {result.get('returncode')}
+- Timed out: {completion.get('timed_out', 'false')}
+- Completion state: {completion.get('completion_state', 'completed')}
+- Bridge did not run git add, commit, push, merge, deployment, or Docker actions.
+
+Modified files:
+- See post-run git status and diff snapshot below. Bridge does not claim unverified file changes.
+
+Commands:
+- codex non-interactive {sandbox_mode} runner with payload injected through stdin, or safe simulated runner.
+
+Test results:
+- stdout summary: {stdout_summary}
+- stderr summary: {stderr_summary}
+
+Key logs or screenshots:
+- execution record: workbench/executions/{exec_id}.md
+
+Post-run snapshot:
+{safe_preview(post_run_snapshot, 1400) if post_run_snapshot else '- not captured'}
+
+Unverified:
+- Atlas review still required.
+- Any executor claim must be checked against evidence.
+
+Unresolved risks:
+- Non-interactive executor output is summarized, not a full live UI proof.
+
+Rollback notes:
+- No project file rollback expected from Bridge read-only runner.
+""")
+
+
+def build_simulated_runner_result(exec_id: str, dispatch_id: str, payload: str = "") -> dict:
+    return {
+        "returncode": 0,
+        "stdout": sanitize_sensitive_text(
+            f"safe simulated returned: exec_id={exec_id} dispatch_id={dispatch_id}; read-only runner path exercised; payload_chars={len(payload)}."
+        ),
+        "stderr": "",
+        "timed_out": False,
+    }
+
+
+def record_exec_failure_evidence(exec_id: str, dispatch_id: str, task_id: str, result: dict, completion: dict, post_run_snapshot: str) -> None:
+    try:
+        update_dispatch_status(
+            dispatch_id,
+            "failed",
+            f"execution {exec_id} failed: {completion.get('completion_state')} returncode={completion.get('returncode')}",
+        )
+    except Exception:
+        pass
+    body = sanitize_sensitive_text(
+        f"""Execution failure evidence
+exec_id: {exec_id}
+dispatch_id: {dispatch_id}
+returncode: {completion.get('returncode')}
+timed_out: {completion.get('timed_out')}
+completion_state: {completion.get('completion_state')}
+payload_state: {completion.get('payload_state')}
+stdout_chars: {completion.get('stdout_chars')}
+stderr_chars: {completion.get('stderr_chars')}
+
+stdout_summary:
+{safe_preview(result.get('stdout', ''), 1200) or '- none'}
+
+stderr_summary:
+{safe_preview(result.get('stderr', ''), 800) or '- none'}
+
+post_run_snapshot:
+{safe_preview(post_run_snapshot, 1200) if post_run_snapshot else '- not captured'}
+"""
+    )
+    try:
+        create_evidence_entry(task_id, "command", body, source="exec_runner", verified="no", sync_task=True)
+    except Exception:
+        pass
+
+
+def execute_exec_runner(
+    exec_id: str,
+    dispatch_id: str,
+    probe: dict,
+    sandbox_mode: str,
+    approval_note: str = "",
+) -> str:
+    normalized_dispatch_id = normalize_dispatch_id(dispatch_id)
+    sandbox_mode = sandbox_mode if sandbox_mode in RUNNER_SANDBOX_MODES else "read-only"
+    now = iso_now()
+    write_mode = sandbox_mode == "workspace-write"
+    extra_fields = {
+        "started_at": now,
+        "human_confirm_required": "false",
+        "auto_execute_enabled": "true",
+        "read_only_auto_run": "false" if write_mode else "true",
+        "auto_run_mode": str(probe.get("mode", "unknown")),
+        "runner_mode": str(probe.get("mode", "unknown")),
+        "runner_sandbox": sandbox_mode,
+        "runner_probe": safe_preview(probe.get("reason", ""), 120),
+        "completion_state": "started",
+    }
+    if write_mode:
+        extra_fields.update({"write_confirmed": "true", "write_approved_at": now})
+    update_exec_status(
+        exec_id,
+        "started",
+        f"{sandbox_mode} runner started via {probe.get('mode')}",
+        extra_fields,
+    )
+    if write_mode:
+        text = read_exec(exec_id)
+        text = append_to_section(
+            text,
+            "Human Write Approval",
+            f"### write approved at {now}\n- approval: write\n- runner_sandbox: workspace-write\n- note: {sanitize_sensitive_text(approval_note).strip() or 'explicit write approval'}\n- forbidden_git_write_actions: true\n- deploy_forbidden: true",
+        )
+        write_exec(exec_id, text)
+    append_exec_autostart_section(
+        exec_id,
+        "started",
+        f"- mode: {probe.get('mode')}\n- runner_sandbox: {sandbox_mode}\n- read_only_gate: {'not_required_after_write_approval' if write_mode else 'passed'}\n- command_allowlist: true\n- payload_injection: stdin\n- started_at: {now}",
+    )
+    package = build_runner_payload(exec_id, normalized_dispatch_id, sandbox_mode)
+    if probe.get("mode") == "simulated":
+        result = build_simulated_runner_result(exec_id, normalized_dispatch_id, package)
+    else:
+        command = list(probe.get("command") or [])
+        if not command:
+            reason = "probe returned no command"
+            hint = mark_exec_needs_manual_start(exec_id, normalized_dispatch_id, reason)
+            return f"""Execution needs manual start: {exec_id}
+- status: needs_manual_start
+- reason: {reason}
+- next: /exec package {exec_id}
+
+{hint}"""
+        result = run_allowlisted_external_command(command, input_text=package, timeout=EXEC_START_TIMEOUT_SECONDS)
+    task_id = task_metadata(read_exec(exec_id)).get("task_id", "")
+    completion = classify_runner_completion(exec_id, normalized_dispatch_id, task_id, result)
+    post_run_snapshot = collect_post_run_snapshot()
+    persist_runner_result(exec_id, result, probe, completion, post_run_snapshot)
+    if completion["completion_state"] in {"completed", "timeout_with_output"}:
+        report = build_auto_runner_report(
+            exec_id,
+            normalized_dispatch_id,
+            result,
+            str(probe.get("mode", "unknown")),
+            completion,
+            post_run_snapshot,
+            sandbox_mode,
+        )
+        receive_reply = build_exec_receive_reply(exec_id, report)
+        if completion["completion_state"] == "timeout_with_output":
+            update_exec_fields(
+                exec_id,
+                {
+                    "completion_state": "timeout_with_output",
+                    "timed_out": "true",
+                    "returncode": completion["returncode"],
+                    "stdout_chars": completion["stdout_chars"],
+                    "stderr_chars": completion["stderr_chars"],
+                    "runner_sandbox": sandbox_mode,
+                },
+            )
+            append_exec_autostart_section(
+                exec_id,
+                "timeout with output",
+                "- timeout_with_output: true\n- stdout was preserved and synced through return report\n- next: /dispatch qa then /task review",
+            )
+        log_event("exec_auto_returned", exec_id=exec_id, dispatch_id=normalized_dispatch_id)
+        state_label = "timed out with output" if completion["completion_state"] == "timeout_with_output" else "returned"
+        response_title = "Execution auto-run" if sandbox_mode == "read-only" else f"Execution {sandbox_mode} runner"
+        return f"""{response_title} {state_label}: {exec_id}
+- status: returned
+- dispatch_id: {normalized_dispatch_id}
+- read_only_gate: {'not_required_after_write_approval' if sandbox_mode == 'workspace-write' else 'passed'}
+- runner_sandbox: {sandbox_mode}
+- runner_mode: {probe.get('mode')}
+- returncode: {completion['returncode']}
+- timed_out: {completion['timed_out']}
+- completion_state: {completion['completion_state']}
+- stdout_chars: {completion['stdout_chars']}
+- stderr_chars: {completion['stderr_chars']}
+- stdout_summary: {safe_preview(result.get('stdout', ''), 360) or 'none'}
+- stderr_summary: {safe_preview(result.get('stderr', ''), 240) or 'none'}
+- dispatch_receive_synced: true
+- evidence_intake: generated through dispatch/task report chain
+- post_run_snapshot: recorded
+- no_git_add_commit_push: true
+- deploy_forbidden: true
+- next: /dispatch qa {normalized_dispatch_id}, then /task review {task_metadata(read_exec(exec_id)).get('task_id', '')}
+
+{safe_preview(receive_reply, 700)}"""
+    if result.get("returncode") != 0:
+        update_exec_status(
+            exec_id,
+            "failed",
+            f"{sandbox_mode} runner {completion['completion_state']} returncode={completion['returncode']}",
+            {
+                "auto_execute_enabled": "false",
+                "completion_state": completion["completion_state"],
+                "timed_out": completion["timed_out"],
+                "returncode": completion["returncode"],
+                "runner_sandbox": sandbox_mode,
+            },
+        )
+        record_exec_failure_evidence(exec_id, normalized_dispatch_id, task_id, result, completion, post_run_snapshot)
+        log_event("exec_failed", exec_id=exec_id, dispatch_id=normalized_dispatch_id)
+        response_title = "Execution auto-run" if sandbox_mode == "read-only" else f"Execution {sandbox_mode} runner"
+        return f"""{response_title} failed: {exec_id}
+- status: failed
+- dispatch_id: {normalized_dispatch_id}
+- runner_sandbox: {sandbox_mode}
+- returncode: {completion['returncode']}
+- timed_out: {completion['timed_out']}
+- completion_state: {completion['completion_state']}
+- payload_state: {completion['payload_state']}
+- stdout_chars: {completion['stdout_chars']}
+- stderr_chars: {completion['stderr_chars']}
+- stdout_summary: {safe_preview(result.get('stdout', ''), 300) or 'none'}
+- stderr_summary: {safe_preview(result.get('stderr', ''), 300) or 'none'}
+- post_run_snapshot: recorded
+- failure_evidence: recorded
+- no_git_write_actions_by_bridge: true
+- next: inspect /exec show {exec_id}; if payload_state=payload_seen rerun with shorter output or paste saved stdout via /exec receive; if payload_missing use /exec package manually"""
+    return f"""Execution {sandbox_mode} runner ended without return sync: {exec_id}
+- status: started
+- completion_state: {completion['completion_state']}
+- next: /exec show {exec_id}"""
+
+
+def append_exec_autostart_section(exec_id: str, title: str, body: str) -> None:
+    text = read_exec(exec_id)
+    text = append_to_section(text, "Auto Start", f"### {title} at {iso_now()}\n{sanitize_sensitive_text(body)}")
+    write_exec(exec_id, text)
+
+
 def update_exec_status(exec_id: str, status: str, timeline: str, extra_fields: dict[str, str] | None = None) -> str:
     if status not in EXEC_STATUSES:
         raise ValueError("invalid execution status")
@@ -6585,8 +7476,19 @@ def exec_next_action(record: dict | None) -> str:
         return "prepare execution session: /exec prepare <dispatch_id>"
     exec_id = record.get("exec_id", "")
     status = record.get("status", "unknown")
+    completion_state = record.get("completion_state", "")
+    if status == "returned" and completion_state == "timeout_with_output":
+        return f"timeout produced usable stdout and was synced; run /dispatch qa {record.get('dispatch_id', '')}, then /task review {record.get('task_id', '')}"
+    if status == "failed" and completion_state == "timeout_with_payload":
+        return f"payload reached runner but output was incomplete; inspect /exec show {exec_id}, then rerun with shorter output or manually /exec receive"
+    if status == "failed" and completion_state == "payload_missing":
+        return f"payload was not observed in runner output; use /exec package {exec_id} for manual copy or rerun after checking Codex CLI"
     if status == "prepared":
-        return f"show payload: /exec package {exec_id}; then manually copy it"
+        return f"start read-only runner with /exec start {record.get('dispatch_id', '')}, or show payload with /exec package {exec_id}"
+    if status == "started":
+        return f"wait for auto runner output; if stuck inspect /exec show {exec_id}"
+    if status == "needs_manual_start":
+        return f"manual start required; approve workspace-write with /exec approve {exec_id} write or show payload with /exec package {exec_id}; then /exec receive {exec_id}"
     if status in {"opened", "copied"}:
         return f"wait for executor return; when ready use /exec receive {exec_id}"
     if status == "returned":
@@ -6598,9 +7500,11 @@ def exec_next_action(record: dict | None) -> str:
 
 
 def build_exec_help_reply() -> str:
-    return """Atlas semi-auto execution commands
+    return """Atlas execution commands
 - /exec help
 - /exec prepare <dispatch_id>
+- /exec start <dispatch_id>
+- /exec approve <exec_id> write
 - /exec package <exec_id>
 - /exec mark <exec_id> copied <note>
 - /exec mark <exec_id> opened <note>
@@ -6614,12 +7518,17 @@ def build_exec_help_reply() -> str:
 - /exec stale
 
 Boundary:
-- semi-auto only
-- human_confirm_required: true
+- read-only auto-run only for dispatches with explicit read-only / no-code-change boundaries
+- write or modification tasks degrade to needs_manual_start
+- workspace-write runner requires explicit /exec approve <exec_id> write
+- human_confirm_required: true for write/modify/deploy tasks
 - external_execution_enabled: false
-- auto_execute_enabled: false
-- does not automatically call Codex/Kiro
-- does not run user tasks or package content
+- auto_execute_enabled: false for arbitrary tasks
+- read_only_auto_exec_enabled: true
+- probes Codex non-interactive support before any auto run
+- sends the full execution payload through stdin, not as a title-only prompt argument
+- forbids git add/commit/push/merge and deploy in workspace-write prompt and Bridge post-run commands
+- does not execute arbitrary local commands from package content
 - does not read .env or print tokens/cookies/secrets
 - writes only workbench execution/dispatch/task records"""
 
@@ -6640,6 +7549,139 @@ def build_exec_prepare_reply(dispatch_id: str) -> str:
 - auto_execute_enabled: false
 - path: workbench/executions/{exec_id}.md
 - next: /exec package {exec_id}"""
+
+
+def mark_exec_needs_manual_start(exec_id: str, dispatch_id: str, reason: str) -> str:
+    now = iso_now()
+    text = update_exec_status(
+        exec_id,
+        "needs_manual_start",
+        f"auto start refused or unavailable: {reason}",
+        {
+            "started_at": "",
+            "human_confirm_required": "true",
+            "auto_execute_enabled": "false",
+            "read_only_auto_run": "false",
+            "auto_run_mode": "manual",
+            "runner_mode": "manual",
+            "runner_probe": safe_preview(reason, 120),
+            "completion_state": "needs_manual_start",
+        },
+    )
+    hint = build_manual_start_hint(exec_id, dispatch_id, reason)
+    text = append_to_section(text, "Auto Start", f"### needs_manual_start at {now}\n{hint}")
+    write_exec(exec_id, text)
+    return hint
+
+
+def build_exec_start_reply(dispatch_id: str) -> str:
+    parts = str(dispatch_id or "").strip().split()
+    if len(parts) != 1:
+        return "Usage: /exec start <dispatch_id>"
+    normalized_dispatch_id = normalize_dispatch_id(parts[0])
+    exec_id, _text = create_exec_session(normalized_dispatch_id)
+    gate = read_only_dispatch_gate(normalized_dispatch_id)
+    if not gate["ok"]:
+        reason = f"{gate['reason']}; human_confirm_required=true"
+        if gate.get("write_intent_lines"):
+            reason += f"; write_intent={safe_preview('; '.join(gate['write_intent_lines']), 220)}"
+        hint = mark_exec_needs_manual_start(exec_id, normalized_dispatch_id, reason)
+        log_event("exec_needs_manual_start", exec_id=exec_id, dispatch_id=normalized_dispatch_id)
+        return f"""Execution start requires manual confirmation: {exec_id}
+- status: needs_manual_start
+- dispatch_id: {normalized_dispatch_id}
+- read_only_gate: failed
+- reason: {safe_preview(reason, 260)}
+- human_confirm_required: true
+- auto_execute_enabled: false
+- next: /exec approve {exec_id} write OR /exec package {exec_id}
+
+{hint}"""
+    probe = probe_codex_noninteractive()
+    if not probe.get("supported"):
+        reason = f"codex non-interactive unsupported: {probe.get('reason', 'unknown')}"
+        hint = mark_exec_needs_manual_start(exec_id, normalized_dispatch_id, reason)
+        log_event("exec_needs_manual_start", exec_id=exec_id, dispatch_id=normalized_dispatch_id)
+        return f"""Execution needs manual start: {exec_id}
+- status: needs_manual_start
+- dispatch_id: {normalized_dispatch_id}
+- read_only_gate: passed
+- runner_probe: {safe_preview(probe.get('mode', 'unknown'), 80)}
+- reason: {safe_preview(reason, 260)}
+- human_confirm_required: true
+- auto_execute_enabled: false
+- next: /exec package {exec_id}
+
+{hint}"""
+    return execute_exec_runner(exec_id, normalized_dispatch_id, probe, "read-only")
+
+
+def build_exec_approve_reply(tail: str) -> str:
+    parts = str(tail or "").strip().split(maxsplit=2)
+    if len(parts) < 2 or parts[1].lower() != "write":
+        return "Usage: /exec approve <exec_id> write"
+    exec_id = normalize_exec_id(parts[0])
+    approval_note = parts[2] if len(parts) > 2 else "explicit user write approval"
+    text = read_exec(exec_id)
+    meta = task_metadata(text)
+    status = meta.get("status", "unknown")
+    if status != "needs_manual_start":
+        return f"""Execution approval refused: {exec_id}
+- status: {status}
+- required_status: needs_manual_start
+- reason: write approval is only accepted after /exec start stops for human confirmation"""
+    dispatch_id = normalize_dispatch_id(meta.get("dispatch_id", ""))
+    target_executor = meta.get("target_executor", "").lower()
+    if target_executor != "codex":
+        return f"""Execution approval refused: {exec_id}
+- target_executor: {target_executor or 'unknown'}
+- reason: workspace-write runner is currently supported only for Codex dispatches
+- next: /exec package {exec_id}"""
+    gate = write_approval_gate(dispatch_id)
+    if not gate["ok"]:
+        reason = f"{gate['reason']}: {safe_preview('; '.join(gate.get('forbidden_lines', [])), 260)}"
+        update_exec_status(
+            exec_id,
+            "needs_manual_start",
+            f"write approval refused: {reason}",
+            {
+                "auto_execute_enabled": "false",
+                "write_confirmed": "false",
+                "runner_sandbox": "manual",
+                "completion_state": "write_approval_refused",
+            },
+        )
+        return f"""Execution write approval refused: {exec_id}
+- status: needs_manual_start
+- reason: {safe_preview(reason, 320)}
+- forbidden_git_write_actions: true
+- deploy_forbidden: true
+- next: /exec package {exec_id}"""
+    probe = probe_codex_workspace_write()
+    if not probe.get("supported"):
+        reason = f"codex workspace-write non-interactive unsupported: {probe.get('reason', 'unknown')}"
+        update_exec_status(
+            exec_id,
+            "needs_manual_start",
+            f"write approval could not start: {reason}",
+            {
+                "auto_execute_enabled": "false",
+                "write_confirmed": "true",
+                "write_approved_at": iso_now(),
+                "runner_sandbox": "workspace-write",
+                "runner_probe": safe_preview(reason, 120),
+                "completion_state": "needs_manual_start",
+            },
+        )
+        hint = build_manual_start_hint(exec_id, dispatch_id, reason)
+        return f"""Execution write approval needs manual start: {exec_id}
+- status: needs_manual_start
+- runner_sandbox: workspace-write
+- reason: {safe_preview(reason, 260)}
+- next: /exec package {exec_id}
+
+{hint}"""
+    return execute_exec_runner(exec_id, dispatch_id, probe, "workspace-write", approval_note)
 
 
 def build_exec_package_reply(exec_id: str) -> str:
@@ -6747,11 +7789,25 @@ def build_exec_show_reply(exec_id: str) -> str:
 - updated_at: {meta.get('updated_at', '')}
 - opened_at: {meta.get('opened_at', '') or 'none'}
 - copied_at: {meta.get('copied_at', '') or 'none'}
+- started_at: {meta.get('started_at', '') or 'none'}
 - returned_at: {meta.get('returned_at', '') or 'none'}
 - stale: {str(bool(record.get('stale'))).lower()}
 - human_confirm_required: {meta.get('human_confirm_required', 'true')}
 - external_execution_enabled: {meta.get('external_execution_enabled', 'false')}
 - auto_execute_enabled: {meta.get('auto_execute_enabled', 'false')}
+- read_only_auto_run: {meta.get('read_only_auto_run', 'false')}
+- auto_run_mode: {meta.get('auto_run_mode', '') or 'none'}
+- runner_mode: {meta.get('runner_mode', '') or meta.get('auto_run_mode', '') or 'none'}
+- runner_sandbox: {meta.get('runner_sandbox', '') or 'none'}
+- runner_probe: {meta.get('runner_probe', '') or 'none'}
+- returncode: {meta.get('returncode', '') or 'none'}
+- timed_out: {meta.get('timed_out', 'false')}
+- stdout_chars: {meta.get('stdout_chars', '0')}
+- stderr_chars: {meta.get('stderr_chars', '0')}
+- completion_state: {meta.get('completion_state', '') or 'unknown'}
+- payload_state: {meta.get('payload_state', '') or 'unknown'}
+- write_confirmed: {meta.get('write_confirmed', 'false')}
+- write_approved_at: {meta.get('write_approved_at', '') or 'none'}
 - return_record: {safe_preview(task_section(text, 'Return Record'), 240)}
 - next: {exec_next_action(record)}"""
 
@@ -6781,14 +7837,17 @@ def build_exec_dashboard_reply() -> str:
         "Atlas Execution Dashboard",
         f"- execution_count: {counts['execution_count']}",
         f"- prepared_count: {counts['execution_prepared_count']}",
+        f"- started_count: {counts['execution_started_count']}",
         f"- opened_count: {counts['execution_opened_count']}",
         f"- copied_count: {counts['execution_copied_count']}",
         f"- returned_count: {counts['execution_returned_count']}",
+        f"- needs_manual_start_count: {counts['execution_needs_manual_start_count']}",
         f"- failed_count: {counts['execution_failed_count']}",
         f"- stale_count: {counts['execution_stale_count']}",
         "- human_confirm_required: true",
         "- external_execution_enabled: false",
         "- auto_execute_enabled: false",
+        f"- read_only_auto_exec_enabled: {str(READ_ONLY_AUTO_EXEC_ENABLED).lower()}",
         "",
         "by_executor:",
     ]
@@ -6798,7 +7857,7 @@ def build_exec_dashboard_reply() -> str:
     lines.extend([f"- {name}: {count}" for name, count in sorted(by_project.items())] or ["- none"])
     lines.append("")
     lines.append("Recent pending:")
-    pending = [record for record in records if record.get("status") in {"prepared", "opened", "copied"}][:10]
+    pending = [record for record in records if record.get("status") in {"prepared", "started", "opened", "copied", "needs_manual_start"}][:10]
     lines.extend([f"- {record['exec_id']} | {record.get('status')} | next={exec_next_action(record)}" for record in pending] or ["- none"])
     return "\n".join(lines)
 
@@ -6828,6 +7887,10 @@ def handle_exec_command(user_text: str) -> str | None:
             return build_exec_help_reply()
         if subcommand == "prepare":
             return build_exec_prepare_reply(tail)
+        if subcommand == "start":
+            return build_exec_start_reply(tail)
+        if subcommand == "approve":
+            return build_exec_approve_reply(tail)
         if subcommand == "package":
             return build_exec_package_reply(tail)
         if subcommand == "mark":
@@ -9043,8 +10106,10 @@ def build_status_reply(context: dict) -> str:
         f"- execution_count: {counts['execution_count']}",
         f"- execution_returned: {counts['execution_returned']}",
         f"- execution_prepared_count: {counts['execution_prepared_count']}",
+        f"- execution_started_count: {counts['execution_started_count']}",
         f"- execution_opened_count: {counts['execution_opened_count']}",
         f"- execution_copied_count: {counts['execution_copied_count']}",
+        f"- execution_needs_manual_start_count: {counts['execution_needs_manual_start_count']}",
         f"- execution_failed_count: {counts['execution_failed_count']}",
         f"- execution_stale_count: {counts['execution_stale_count']}",
         f"- latest_exec_id: {counts['latest_exec_id'] or 'none'}",
@@ -9060,6 +10125,7 @@ def build_status_reply(context: dict) -> str:
         f"- runtime_injection_enabled: {str(RUNTIME_INJECTION_ENABLED).lower()}",
         f"- external_application_enabled: {str(EXTERNAL_APPLICATION_ENABLED).lower()}",
         f"- external_execution_enabled: {str(EXTERNAL_EXECUTION_ENABLED).lower()}",
+        f"- read_only_auto_exec_enabled: {str(READ_ONLY_AUTO_EXEC_ENABLED).lower()}",
         f"- human_confirm_required: {str(HUMAN_CONFIRM_REQUIRED).lower()}",
         f"- auto_execute_enabled: {str(AUTO_EXECUTE_ENABLED).lower()}",
         f"- 最近 task_id：{counts['recent_task_id'] or 'none'}",
