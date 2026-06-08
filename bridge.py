@@ -6589,6 +6589,15 @@ completion_state: prepared
 payload_state:
 write_confirmed: false
 write_approved_at:
+auto_postprocess_enabled: false
+auto_qa_done: false
+auto_evidence_verified: false
+auto_review_done: false
+auto_dispatch_review_linked: false
+auto_decision:
+auto_closed: false
+auto_retro_created: false
+auto_postprocess_reason:
 manual_copy_required: true
 
 ## Dispatch Summary
@@ -7370,6 +7379,15 @@ def execute_exec_runner(
             sandbox_mode,
         )
         receive_reply = build_exec_receive_reply(exec_id, report)
+        auto_postprocess_reply = ""
+        if sandbox_mode == "read-only":
+            auto_postprocess_reply = build_exec_auto_postprocess_reply(
+                exec_id,
+                normalized_dispatch_id,
+                completion,
+                sandbox_mode=sandbox_mode,
+                receive_synced="synced_dispatch_receive: true" in receive_reply,
+            )
         if completion["completion_state"] == "timeout_with_output":
             update_exec_fields(
                 exec_id,
@@ -7410,7 +7428,9 @@ def execute_exec_runner(
 - deploy_forbidden: true
 - next: /dispatch qa {normalized_dispatch_id}, then /task review {task_metadata(read_exec(exec_id)).get('task_id', '')}
 
-{safe_preview(receive_reply, 700)}"""
+{safe_preview(receive_reply, 700)}
+
+{auto_postprocess_reply}"""
     if result.get("returncode") != 0:
         update_exec_status(
             exec_id,
@@ -7427,6 +7447,15 @@ def execute_exec_runner(
         record_exec_failure_evidence(exec_id, normalized_dispatch_id, task_id, result, completion, post_run_snapshot)
         log_event("exec_failed", exec_id=exec_id, dispatch_id=normalized_dispatch_id)
         response_title = "Execution auto-run" if sandbox_mode == "read-only" else f"Execution {sandbox_mode} runner"
+        auto_postprocess_reply = ""
+        if sandbox_mode == "read-only":
+            auto_postprocess_reply = build_exec_auto_postprocess_reply(
+                exec_id,
+                normalized_dispatch_id,
+                completion,
+                sandbox_mode=sandbox_mode,
+                receive_synced=False,
+            )
         return f"""{response_title} failed: {exec_id}
 - status: failed
 - dispatch_id: {normalized_dispatch_id}
@@ -7442,7 +7471,9 @@ def execute_exec_runner(
 - post_run_snapshot: recorded
 - failure_evidence: recorded
 - no_git_write_actions_by_bridge: true
-- next: inspect /exec show {exec_id}; if payload_state=payload_seen rerun with shorter output or paste saved stdout via /exec receive; if payload_missing use /exec package manually"""
+- next: inspect /exec show {exec_id}; if payload_state=payload_seen rerun with shorter output or paste saved stdout via /exec receive; if payload_missing use /exec package manually
+
+{auto_postprocess_reply}"""
     return f"""Execution {sandbox_mode} runner ended without return sync: {exec_id}
 - status: started
 - completion_state: {completion['completion_state']}
@@ -7757,6 +7788,276 @@ Dispatch sync:
 {safe_preview(dispatch_reply, 520)}"""
 
 
+def auto_postprocess_commands(exec_id: str, task_id: str, dispatch_id: str, reason: str = "") -> str:
+    clean_reason = safe_preview(reason, 160) or "auto postprocess gate failed"
+    return "\n".join(
+        [
+            f"- /exec show {exec_id}",
+            f"- /dispatch qa {dispatch_id}",
+            f"- /evidence gaps {task_id}",
+            f"- /task review {task_id}",
+            f"- /dispatch link-review {dispatch_id}",
+            f"- /task decide {task_id} needs_evidence human review required: {clean_reason}",
+        ]
+    )
+
+
+def record_auto_postprocess_state(
+    exec_id: str,
+    task_id: str,
+    dispatch_id: str,
+    *,
+    enabled: bool,
+    qa_done: bool = False,
+    evidence_verified: bool = False,
+    review_done: bool = False,
+    dispatch_review_linked: bool = False,
+    decision: str = "needs_human_review",
+    closed: bool = False,
+    retro_created: bool = False,
+    reason: str = "",
+) -> None:
+    clean_reason = safe_preview(reason, 260) or decision
+    fields = {
+        "auto_postprocess_enabled": str(bool(enabled)).lower(),
+        "auto_qa_done": str(bool(qa_done)).lower(),
+        "auto_evidence_verified": str(bool(evidence_verified)).lower(),
+        "auto_review_done": str(bool(review_done)).lower(),
+        "auto_dispatch_review_linked": str(bool(dispatch_review_linked)).lower(),
+        "auto_decision": sanitize_sensitive_text(decision),
+        "auto_closed": str(bool(closed)).lower(),
+        "auto_retro_created": str(bool(retro_created)).lower(),
+        "auto_postprocess_reason": clean_reason,
+    }
+    update_exec_fields(exec_id, fields)
+    append_exec_autostart_section(
+        exec_id,
+        "auto postprocess",
+        "\n".join(f"- {key}: {value}" for key, value in fields.items()),
+    )
+    try:
+        task_text = read_task(task_id)
+        task_text = append_to_section(
+            task_text,
+            "Timeline",
+            f"- {iso_now()} auto postprocess decision={decision}; closed={str(bool(closed)).lower()}; reason={clean_reason}.",
+        )
+        write_task(task_id, task_text)
+    except Exception:
+        pass
+    log_event("exec_auto_postprocess", exec_id=exec_id, dispatch_id=dispatch_id, decision=decision)
+
+
+def generated_exec_evidence_ids(task_id: str, exec_id: str) -> list[str]:
+    ids = []
+    for record in evidence_records(task_id):
+        if record.get("verified") in {"verified", "yes"}:
+            continue
+        combined = "\n".join(
+            str(record.get(key, ""))
+            for key in ("claim", "observed", "risk", "notes")
+        )
+        if exec_id in combined and record.get("supports_acceptance") == "observed":
+            ids.append(record["evidence_id"])
+    return ids
+
+
+def auto_verify_exec_evidence(task_id: str, exec_id: str) -> list[str]:
+    verified_ids = []
+    for evidence_id in generated_exec_evidence_ids(task_id, exec_id):
+        update_evidence_mark(
+            task_id,
+            evidence_id,
+            "verified",
+            f"auto verified for read-only exec {exec_id}: returncode=0, timed_out=false, completion_state=completed, no git/deploy action by Bridge.",
+        )
+        verified_ids.append(evidence_id)
+    return verified_ids
+
+
+def build_exec_auto_postprocess_reply(
+    exec_id: str,
+    dispatch_id: str,
+    completion: dict,
+    *,
+    sandbox_mode: str,
+    receive_synced: bool,
+) -> str:
+    normalized_exec_id = normalize_exec_id(exec_id)
+    normalized_dispatch_id = normalize_dispatch_id(dispatch_id)
+    exec_meta = task_metadata(read_exec(normalized_exec_id))
+    task_id = normalize_task_id(exec_meta.get("task_id", ""))
+    hard_gates = {
+        "runner_sandbox": sandbox_mode == "read-only",
+        "read_only_gate": sandbox_mode == "read-only",
+        "returncode": str(completion.get("returncode")) == "0",
+        "timed_out": str(completion.get("timed_out")).lower() == "false",
+        "completion_state": completion.get("completion_state") == "completed",
+        "dispatch_receive_synced": bool(receive_synced),
+        "no_git_add_commit_push": True,
+        "deploy_forbidden": True,
+    }
+    failed_hard = [name for name, ok in hard_gates.items() if not ok]
+    if failed_hard:
+        reason = "gate failed: " + ", ".join(failed_hard)
+        record_auto_postprocess_state(
+            normalized_exec_id,
+            task_id,
+            normalized_dispatch_id,
+            enabled=False,
+            decision="needs_human_review",
+            reason=reason,
+        )
+        return f"""Auto postprocess: needs_human_review
+- auto_postprocess_enabled: false
+- auto_decision: needs_human_review
+- auto_closed: false
+- auto_postprocess_reason: {reason}
+Next commands:
+{auto_postprocess_commands(normalized_exec_id, task_id, normalized_dispatch_id, reason)}"""
+
+    qa_done = False
+    evidence_verified = False
+    review_done = False
+    dispatch_review_linked = False
+    try:
+        qa_reply = build_dispatch_qa_reply(normalized_dispatch_id)
+        qa_done = True
+        task_text = read_task(task_id)
+        report = task_section(task_text, "Execution Report")
+        intake = analyze_evidence_intake(report, task_section(task_text, "Acceptance Criteria"))
+        eligible_ids = generated_exec_evidence_ids(task_id, normalized_exec_id)
+        evidence_intake_generated = bool(eligible_ids)
+        sensitive_ok = not bool(intake.get("sensitive_risk"))
+        if evidence_intake_generated and sensitive_ok:
+            verified_ids = auto_verify_exec_evidence(task_id, normalized_exec_id)
+            evidence_verified = bool(verified_ids)
+        else:
+            verified_ids = []
+        review_reply = build_task_review_reply(task_id)
+        review_done = True
+        link_reply = build_dispatch_link_review_reply(normalized_dispatch_id)
+        dispatch_review_linked = True
+        analysis = evidence_analysis(task_id)
+        review_has_no_gaps = not analysis["has_gaps"] and analysis["recommendation"] == "pass"
+        gates = {
+            **hard_gates,
+            "evidence_intake": evidence_intake_generated,
+            "sensitive_risk": sensitive_ok,
+            "review_has_no_remaining_gaps": review_has_no_gaps,
+        }
+        failed = [name for name, ok in gates.items() if not ok]
+        if failed:
+            reason = "gate failed: " + ", ".join(failed)
+            record_auto_postprocess_state(
+                normalized_exec_id,
+                task_id,
+                normalized_dispatch_id,
+                enabled=True,
+                qa_done=qa_done,
+                evidence_verified=evidence_verified,
+                review_done=review_done,
+                dispatch_review_linked=dispatch_review_linked,
+                decision="needs_human_review",
+                reason=reason,
+            )
+            return f"""Auto postprocess: needs_human_review
+- auto_postprocess_enabled: true
+- auto_qa_done: {str(qa_done).lower()}
+- auto_evidence_verified: {str(evidence_verified).lower()}
+- auto_review_done: {str(review_done).lower()}
+- auto_dispatch_review_linked: {str(dispatch_review_linked).lower()}
+- auto_decision: needs_human_review
+- auto_closed: false
+- auto_postprocess_reason: {reason}
+- evidence_ids: {', '.join(verified_ids) if verified_ids else 'none'}
+Next commands:
+{auto_postprocess_commands(normalized_exec_id, task_id, normalized_dispatch_id, reason)}
+
+Review preview:
+{safe_preview(review_reply, 420)}
+
+Dispatch link preview:
+{safe_preview(link_reply, 260)}
+
+QA preview:
+{safe_preview(qa_reply, 260)}"""
+
+        decide_reply = build_task_decide_reply(
+            task_id,
+            "pass",
+            f"auto pass: read-only exec {normalized_exec_id} completed with verified generated evidence and no remaining review gaps.",
+        )
+        close_reply = build_task_close_reply(task_id)
+        retro_reply = build_retro_create_reply(task_id)
+        retro_created = retro_exists(task_id)
+        record_auto_postprocess_state(
+            normalized_exec_id,
+            task_id,
+            normalized_dispatch_id,
+            enabled=True,
+            qa_done=qa_done,
+            evidence_verified=evidence_verified,
+            review_done=review_done,
+            dispatch_review_linked=dispatch_review_linked,
+            decision="pass",
+            closed=True,
+            retro_created=retro_created,
+            reason="all gates passed",
+        )
+        return f"""Auto postprocess: pass
+- auto_postprocess_enabled: true
+- auto_qa_done: true
+- auto_evidence_verified: {str(evidence_verified).lower()}
+- auto_review_done: true
+- auto_dispatch_review_linked: true
+- auto_decision: pass
+- auto_closed: true
+- auto_retro_created: {str(retro_created).lower()}
+- auto_postprocess_reason: all gates passed
+- evidence_ids: {', '.join(verified_ids) if verified_ids else 'none'}
+- task_status: {task_status(task_id)}
+
+Close loop:
+- dispatch QA done
+- generated evidence auto-verified
+- task review done
+- dispatch review linked
+- task decided pass
+- task closed
+- retro draft created
+
+Decision preview:
+{safe_preview(decide_reply, 260)}
+
+Close preview:
+{safe_preview(close_reply, 260)}
+
+Retro preview:
+{safe_preview(retro_reply, 260)}"""
+    except Exception as exc:
+        reason = f"auto postprocess failed: {safe_preview(str(exc), 220)}"
+        record_auto_postprocess_state(
+            normalized_exec_id,
+            task_id,
+            normalized_dispatch_id,
+            enabled=True,
+            qa_done=qa_done,
+            evidence_verified=evidence_verified,
+            review_done=review_done,
+            dispatch_review_linked=dispatch_review_linked,
+            decision="needs_human_review",
+            reason=reason,
+        )
+        return f"""Auto postprocess: needs_human_review
+- auto_postprocess_enabled: true
+- auto_decision: needs_human_review
+- auto_closed: false
+- auto_postprocess_reason: {reason}
+Next commands:
+{auto_postprocess_commands(normalized_exec_id, task_id, normalized_dispatch_id, reason)}"""
+
+
 def build_exec_terminal_reply(tail: str, status: str) -> str:
     parts = str(tail or "").strip().split(maxsplit=1)
     if not parts:
@@ -7808,6 +8109,15 @@ def build_exec_show_reply(exec_id: str) -> str:
 - payload_state: {meta.get('payload_state', '') or 'unknown'}
 - write_confirmed: {meta.get('write_confirmed', 'false')}
 - write_approved_at: {meta.get('write_approved_at', '') or 'none'}
+- auto_postprocess_enabled: {meta.get('auto_postprocess_enabled', 'false')}
+- auto_qa_done: {meta.get('auto_qa_done', 'false')}
+- auto_evidence_verified: {meta.get('auto_evidence_verified', 'false')}
+- auto_review_done: {meta.get('auto_review_done', 'false')}
+- auto_dispatch_review_linked: {meta.get('auto_dispatch_review_linked', 'false')}
+- auto_decision: {meta.get('auto_decision', '') or 'none'}
+- auto_closed: {meta.get('auto_closed', 'false')}
+- auto_retro_created: {meta.get('auto_retro_created', 'false')}
+- auto_postprocess_reason: {meta.get('auto_postprocess_reason', '') or 'none'}
 - return_record: {safe_preview(task_section(text, 'Return Record'), 240)}
 - next: {exec_next_action(record)}"""
 

@@ -142,6 +142,14 @@ def main() -> int:
             assert_contains(started, "read_only_gate: passed")
             assert_contains(started, "dispatch_receive_synced: true")
             assert_contains(started, "no_git_add_commit_push: true")
+            assert_contains(started, "Auto postprocess: pass")
+            assert_contains(started, "auto_qa_done: true")
+            assert_contains(started, "auto_evidence_verified: true")
+            assert_contains(started, "auto_review_done: true")
+            assert_contains(started, "auto_dispatch_review_linked: true")
+            assert_contains(started, "auto_decision: pass")
+            assert_contains(started, "auto_closed: true")
+            assert_contains(started, "auto_retro_created: true")
             assert_no_sensitive_markers(started)
             if len(captured_runner_inputs) != 1:
                 raise AssertionError("runner input was not captured exactly once")
@@ -160,10 +168,18 @@ def main() -> int:
             assert_contains(exec_file.read_text(encoding="utf-8"), "completion_state: completed")
             assert_contains(exec_file.read_text(encoding="utf-8"), "returncode: 0")
             assert_contains(exec_file.read_text(encoding="utf-8"), "## Post-Run Snapshot")
-            assert_contains(dispatch_file.read_text(encoding="utf-8"), "status: returned")
-            assert_contains(task_file.read_text(encoding="utf-8"), "status: reported")
-            if not any(bridge.EVIDENCE_DIR.rglob("*.md")):
+            assert_contains(exec_file.read_text(encoding="utf-8"), "auto_decision: pass")
+            assert_contains(exec_file.read_text(encoding="utf-8"), "auto_closed: true")
+            assert_contains(dispatch_file.read_text(encoding="utf-8"), "status: reviewed")
+            assert_contains(task_file.read_text(encoding="utf-8"), "status: archived")
+            assert_contains(task_file.read_text(encoding="utf-8"), "auto postprocess decision=pass")
+            evidence_file = bridge.EVIDENCE_DIR / f"{task_id}.md"
+            if not evidence_file.exists():
                 raise AssertionError("expected evidence intake record")
+            assert_contains(evidence_file.read_text(encoding="utf-8"), "verified: verified")
+            retro_file = bridge.RETROS_DIR / f"{task_id}.md"
+            if not retro_file.exists():
+                raise AssertionError("expected auto retro draft")
             if external_commands != [["codex", "exec", "--sandbox", "read-only", "-"]]:
                 raise AssertionError(f"unexpected runner command shape: {external_commands}")
 
@@ -204,12 +220,17 @@ def main() -> int:
             timeout_exec_id = extract_exec_id(timeout_reply)
             assert_contains(timeout_reply, "status: returned")
             assert_contains(timeout_reply, "completion_state: timeout_with_output")
+            assert_contains(timeout_reply, "Auto postprocess: needs_human_review")
+            assert_contains(timeout_reply, "auto_decision: needs_human_review")
+            assert_contains(timeout_reply, f"/dispatch qa {timeout_dispatch_id}")
             timeout_exec_text = (bridge.EXECUTIONS_DIR / f"{timeout_exec_id}.md").read_text(encoding="utf-8")
             for needle in (
                 "status: returned",
                 "returncode: 124",
                 "timed_out: true",
                 "completion_state: timeout_with_output",
+                "auto_decision: needs_human_review",
+                "auto_closed: false",
                 "AUTORUN-PAYLOAD-OK",
                 "## Runner Stdout",
                 "## Runner Metadata",
@@ -217,6 +238,8 @@ def main() -> int:
                 assert_contains(timeout_exec_text, needle)
             assert_contains((bridge.DISPATCHES_DIR / f"{timeout_dispatch_id}.md").read_text(encoding="utf-8"), "status: returned")
             assert_contains((bridge.TASKS_DIR / f"{timeout_task_id}.md").read_text(encoding="utf-8"), "status: reported")
+            if (bridge.RETROS_DIR / f"{timeout_task_id}.md").exists():
+                raise AssertionError("timeout_with_output must not auto-create retro")
 
             def timeout_with_payload_runner(argv: list[str], *, input_text: str = "", **_: object) -> dict:
                 external_commands.append(list(argv))
@@ -235,9 +258,12 @@ def main() -> int:
             payload_exec_id = extract_exec_id(payload_reply)
             assert_contains(payload_reply, "status: failed")
             assert_contains(payload_reply, "completion_state: timeout_with_payload")
+            assert_contains(payload_reply, "Auto postprocess: needs_human_review")
             payload_exec_text = (bridge.EXECUTIONS_DIR / f"{payload_exec_id}.md").read_text(encoding="utf-8")
             assert_contains(payload_exec_text, "completion_state: timeout_with_payload")
             assert_contains(payload_exec_text, "payload_state: payload_seen")
+            assert_contains(payload_exec_text, "auto_decision: needs_human_review")
+            assert_contains(payload_exec_text, "auto_closed: false")
 
             def payload_missing_runner(argv: list[str], *, input_text: str = "", **_: object) -> dict:
                 external_commands.append(list(argv))
@@ -256,9 +282,11 @@ def main() -> int:
             missing_exec_id = extract_exec_id(missing_reply)
             assert_contains(missing_reply, "status: failed")
             assert_contains(missing_reply, "completion_state: payload_missing")
+            assert_contains(missing_reply, "Auto postprocess: needs_human_review")
             missing_exec_text = (bridge.EXECUTIONS_DIR / f"{missing_exec_id}.md").read_text(encoding="utf-8")
             assert_contains(missing_exec_text, "completion_state: payload_missing")
             assert_contains(missing_exec_text, "payload_state: payload_missing")
+            assert_contains(missing_exec_text, "auto_decision: needs_human_review")
 
             write_task_reply, route = bridge.prepare_reply(
                 "/task new Create or update only workbench/tmp/write-runner-live-smoke.txt. Do not modify source code. No git add/commit/push. --project auto_exec",
@@ -275,6 +303,7 @@ def main() -> int:
             assert_contains(manual, "status: needs_manual_start")
             assert_contains(manual, "human_confirm_required: true")
             assert_contains((bridge.EXECUTIONS_DIR / f"{manual_exec_id}.md").read_text(encoding="utf-8"), "auto_execute_enabled: false")
+            assert_not_contains((bridge.EXECUTIONS_DIR / f"{manual_exec_id}.md").read_text(encoding="utf-8"), "auto_decision: pass")
             if len(captured_runner_inputs) != 4:
                 raise AssertionError("write-task dispatch must not call runner")
 
@@ -378,6 +407,61 @@ def main() -> int:
             assert_contains((bridge.EXECUTIONS_DIR / f"{unsupported_exec_id}.md").read_text(encoding="utf-8"), "status: needs_manual_start")
             if len(captured_runner_inputs) != write_capture_start + 1:
                 raise AssertionError("unsupported Codex path must not call runner")
+
+            bridge.probe_codex_noninteractive = lambda: {
+                "supported": True,
+                "mode": "codex_exec_read_only_stdin",
+                "reason": "smoke fake non-interactive read-only stdin runner",
+                "command": ["codex", "exec", "--sandbox", "read-only", "-"],
+            }
+
+            def evidence_gap_runner(argv: list[str], *, input_text: str = "", **_: object) -> dict:
+                external_commands.append(list(argv))
+                captured_runner_inputs.append(input_text)
+                return {
+                    "returncode": 0,
+                    "stdout": "\n".join(
+                        [
+                            "Task id: evidence-gap-test",
+                            "Dispatch id: evidence-gap-test",
+                            "Execution summary:",
+                            "- fake runner completed but did not cover live UI",
+                            "Modified files:",
+                            "- none",
+                            "Commands:",
+                            "- fake codex exec read-only",
+                            "Test results:",
+                            "- local output passed",
+                            "Unverified:",
+                            "- live UI not run",
+                            "Unresolved risks:",
+                            "- live UI not verified",
+                        ]
+                    ),
+                    "stderr": "",
+                    "timed_out": False,
+                }
+
+            bridge.run_allowlisted_external_command = evidence_gap_runner
+            gap_task_id, gap_dispatch_id = create_read_only_dispatch(ctx)
+            gap_reply, route = bridge.prepare_reply(f"/exec start {gap_dispatch_id}", ctx)
+            assert route == "local_command"
+            gap_exec_id = extract_exec_id(gap_reply)
+            assert_contains(gap_reply, "status: returned")
+            assert_contains(gap_reply, "Auto postprocess: needs_human_review")
+            assert_contains(gap_reply, "review_has_no_remaining_gaps")
+            assert_contains(gap_reply, "auto_decision: needs_human_review")
+            assert_contains(gap_reply, f"/task review {gap_task_id}")
+            gap_exec_text = (bridge.EXECUTIONS_DIR / f"{gap_exec_id}.md").read_text(encoding="utf-8")
+            gap_task_text = (bridge.TASKS_DIR / f"{gap_task_id}.md").read_text(encoding="utf-8")
+            assert_contains(gap_exec_text, "auto_evidence_verified: true")
+            assert_contains(gap_exec_text, "auto_decision: needs_human_review")
+            assert_contains(gap_exec_text, "auto_closed: false")
+            assert_contains(gap_task_text, "status: reviewed")
+            assert_contains(gap_task_text, "live_skipped: true")
+            assert_not_contains(gap_task_text, "status: archived")
+            if (bridge.RETROS_DIR / f"{gap_task_id}.md").exists():
+                raise AssertionError("evidence-gap case must not auto-create retro")
 
             dashboard, route = bridge.prepare_reply("/exec dashboard", ctx)
             assert route == "local_command"
