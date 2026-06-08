@@ -7849,6 +7849,104 @@ One command task run:
 - selected_task_id: {record.get('task_id', '')}"""
 
 
+def build_run_help_reply() -> str:
+    return """Atlas one-command run
+- /run help
+- /run codex <task title> [--project <project_id>]
+
+Boundary:
+- creates a local task, creates a Codex dispatch with context, then starts the existing execution flow
+- read-only/no-change tasks may use the guarded read-only Codex runner
+- write/modify/deploy tasks stop at needs_manual_start and require explicit /exec approve <exec_id|dispatch_id> write or /exec approve-latest write
+- does not bypass read-only gate, write approval gate, command allowlist, stdin payload checks, or post-run evidence checks
+- does not run git add/commit/push/merge, deploy, package managers, shells, or arbitrary commands
+- does not read .env or print tokens/cookies/secrets
+- writes only workbench task/dispatch/context/execution/evidence records"""
+
+
+def reply_field(reply: str, field: str) -> str:
+    prefix = f"- {field}:"
+    for line in str(reply or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith(prefix):
+            return stripped[len(prefix):].strip()
+    return ""
+
+
+def create_codex_dispatch(task_id: str, with_context: bool = True) -> tuple[str, dict]:
+    normalized_task_id = normalize_task_id(task_id)
+    read_task(normalized_task_id)
+    dispatch_id = generate_dispatch_id()
+    markdown = build_dispatch_markdown(dispatch_id, normalized_task_id, "codex", with_context)
+    write_dispatch(dispatch_id, markdown)
+    meta = task_metadata(markdown)
+    log_event("dispatch_created", dispatch_id=dispatch_id, task_id=normalized_task_id, target_executor="codex")
+    return dispatch_id, meta
+
+
+def one_command_next_action(record: dict | None, dispatch_id: str) -> str:
+    if not record:
+        return f"inspect /dispatch show {dispatch_id}"
+    if record.get("status") == "needs_manual_start":
+        exec_id = record.get("exec_id", "")
+        return f"/exec approve {dispatch_id} write OR /exec approve-latest write OR /exec package {exec_id}"
+    return exec_next_action(record)
+
+
+def build_run_codex_reply(tail: str) -> str:
+    clean_title, project_id = parse_task_new_tail(tail)
+    if not clean_title:
+        return "Usage: /run codex <task title> [--project <project_id>]"
+    if project_id and not project_path(project_id).exists():
+        return f"""One command task run refused
+- reason: project not found
+- project_id: {project_id}
+- next: /project new {project_id} <project title>"""
+
+    task_id, _task_text = create_task(clean_title, project_id=project_id)
+    if project_id:
+        attach_task_to_project(project_id, task_id)
+    dispatch_id, dispatch_meta = create_codex_dispatch(task_id, with_context=True)
+    start_reply = build_exec_start_reply(dispatch_id)
+    record = latest_exec_for_dispatch(dispatch_id)
+    exec_id = record.get("exec_id", "none") if record else "none"
+    exec_status = record.get("status", "unknown") if record else "unknown"
+    exec_meta = task_metadata(read_exec(exec_id)) if record and exec_id != "none" else {}
+    read_only_gate = reply_field(start_reply, "read_only_gate") or "not_reported"
+    auto_execute_enabled = exec_meta.get("auto_execute_enabled", "false")
+    runner_sandbox = exec_meta.get("runner_sandbox", "") or "none"
+    runner_mode = exec_meta.get("runner_mode", "") or exec_meta.get("auto_run_mode", "") or "none"
+    auto_decision = exec_meta.get("auto_decision", "") or "none"
+    next_action = one_command_next_action(record, dispatch_id)
+    log_event(
+        "run_codex",
+        task_id=task_id,
+        dispatch_id=dispatch_id,
+        exec_id=exec_id,
+        exec_status=exec_status,
+    )
+    return sanitize_sensitive_text(f"""One command task run:
+- status: {exec_status}
+- target_executor: codex
+- command_chain: task -> dispatch -> exec start
+- task_id: {task_id}
+- dispatch_id: {dispatch_id}
+- exec_id: {exec_id}
+- project_id: {project_id or 'unassigned'}
+- context_id: {dispatch_meta.get('context_id') or 'none'}
+- read_only_gate: {read_only_gate}
+- auto_execute_enabled: {auto_execute_enabled}
+- runner_sandbox: {runner_sandbox}
+- runner_mode: {runner_mode}
+- auto_decision: {auto_decision}
+- no_git_add_commit_push: true
+- deploy_forbidden: true
+- next: {next_action}
+
+Execution start summary:
+{safe_preview(start_reply, 1600)}""")
+
+
 def build_exec_package_reply(exec_id: str) -> str:
     normalized_exec_id = normalize_exec_id(exec_id)
     text = read_exec(normalized_exec_id)
@@ -10660,6 +10758,7 @@ def build_help_reply() -> str:
 - /task help: local task ledger commands.
 - /dispatch help: manual dispatch queue and execution session ledger.
 - /exec help: semi-auto execution session ledger; human confirmation required.
+- /run help: one-command task -> dispatch -> exec start helper.
 - /collect help: read-only whitelist evidence collection.
 - /pilot help: real-project pilot metrics and operating notes.
 - /context help: Context Pack commands.
@@ -10685,7 +10784,7 @@ def build_help_reply() -> str:
 - Recommended: /dispatch receive <dispatch_id> then paste report.
 - Recommended: /dispatch qa <dispatch_id>, /task review <task_id>, /task decide ...
 - Recommended: /pilot start <project_id> <title>, then /pilot metrics <pilot_id>.
-- Execution requests only create work orders; Bridge does not run commands, modify project files, call Codex/Kiro, or claim completion without evidence."""
+- Ordinary execution requests only create work orders. /run uses the guarded execution ledger flow; Bridge does not modify project files, run arbitrary commands, or claim completion without evidence."""
 
 
 def build_template_help_reply() -> str:
@@ -10695,9 +10794,36 @@ def build_template_help_reply() -> str:
 - /template review：审查清单模板"""
 
 
+def handle_run_command(user_text: str) -> str | None:
+    lines = user_text.strip().splitlines()
+    first_line = lines[0] if lines else ""
+    parts = first_line.split(maxsplit=2)
+    if not parts or parts[0].lower() != "/run":
+        return None
+    subcommand = parts[1].lower() if len(parts) > 1 else "help"
+    tail = parts[2] if len(parts) > 2 else ""
+    body = "\n".join(lines[1:]).strip()
+    if body:
+        tail = f"{tail}\n{body}".strip()
+    try:
+        if subcommand == "help":
+            return build_run_help_reply()
+        if subcommand == "codex":
+            return build_run_codex_reply(tail)
+        return build_run_help_reply()
+    except FileNotFoundError as exc:
+        return f"run source not found: {safe_preview(str(exc), 180)}"
+    except ValueError as exc:
+        return f"run operation refused: {safe_preview(str(exc), 220)}"
+    except Exception as exc:
+        return f"run operation failed: {safe_preview(str(exc), 180)}"
+
+
 def handle_local_command(user_text: str, context: dict) -> str | None:
     parts = user_text.strip().split(maxsplit=1)
     command = parts[0].lower() if parts else ""
+    if command == "/run":
+        return handle_run_command(user_text)
     if command == "/apply":
         return handle_apply_command(user_text)
     if command == "/playbook":

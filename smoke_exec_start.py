@@ -183,6 +183,30 @@ def main() -> int:
             if external_commands != [["codex", "exec", "--sandbox", "read-only", "-"]]:
                 raise AssertionError(f"unexpected runner command shape: {external_commands}")
 
+            run_read_capture_start = len(captured_runner_inputs)
+            run_read, route = bridge.prepare_reply(
+                "/run codex Read-only inspect local state only, no code changes, do not modify files --project auto_exec",
+                ctx,
+            )
+            assert route == "local_command"
+            run_read_task_id = extract_task_id(run_read)
+            run_read_dispatch_id = extract_dispatch_id(run_read)
+            run_read_exec_id = extract_exec_id(run_read)
+            assert_contains(run_read, "One command task run:")
+            assert_contains(run_read, "command_chain: task -> dispatch -> exec start")
+            assert_contains(run_read, "status: returned")
+            assert_contains(run_read, "read_only_gate: passed")
+            assert_contains(run_read, "auto_execute_enabled: true")
+            assert_contains(run_read, "runner_sandbox: read-only")
+            assert_contains(run_read, "auto_decision: pass")
+            if len(captured_runner_inputs) != run_read_capture_start + 1:
+                raise AssertionError("/run codex read-only must call runner exactly once")
+            assert_complete_runner_payload(captured_runner_inputs[-1], run_read_task_id, run_read_dispatch_id)
+            assert_contains((bridge.EXECUTIONS_DIR / f"{run_read_exec_id}.md").read_text(encoding="utf-8"), "status: returned")
+            assert_contains((bridge.DISPATCHES_DIR / f"{run_read_dispatch_id}.md").read_text(encoding="utf-8"), "status: reviewed")
+            assert_contains((bridge.TASKS_DIR / f"{run_read_task_id}.md").read_text(encoding="utf-8"), "status: archived")
+
+            source_write_capture_start = len(captured_runner_inputs)
             source_write_task_reply, route = bridge.prepare_reply(
                 "/task new WRITE IMPLEMENTATION modify bridge.py update smoke_exec_start.py read-only inspection only. No git add/commit/push. --project auto_exec",
                 ctx,
@@ -204,7 +228,7 @@ def main() -> int:
             assert_contains(source_write_exec_text, "status: needs_manual_start")
             assert_contains(source_write_exec_text, "auto_execute_enabled: false")
             assert_not_contains(source_write_exec_text, "auto_decision: pass")
-            if len(captured_runner_inputs) != 1:
+            if len(captured_runner_inputs) != source_write_capture_start:
                 raise AssertionError("source-write task must not call read-only runner")
 
             def timeout_with_output_runner(argv: list[str], *, input_text: str = "", **_: object) -> dict:
@@ -321,6 +345,7 @@ def main() -> int:
             write_dispatch_reply, route = bridge.prepare_reply(f"/dispatch create {write_task_id} codex --with-context", ctx)
             assert route == "local_command"
             write_dispatch_id = extract_dispatch_id(write_dispatch_reply)
+            write_manual_capture_start = len(captured_runner_inputs)
             manual, route = bridge.prepare_reply(f"/exec start {write_dispatch_id}", ctx)
             assert route == "local_command"
             manual_exec_id = extract_exec_id(manual)
@@ -328,7 +353,7 @@ def main() -> int:
             assert_contains(manual, "human_confirm_required: true")
             assert_contains((bridge.EXECUTIONS_DIR / f"{manual_exec_id}.md").read_text(encoding="utf-8"), "auto_execute_enabled: false")
             assert_not_contains((bridge.EXECUTIONS_DIR / f"{manual_exec_id}.md").read_text(encoding="utf-8"), "auto_decision: pass")
-            if len(captured_runner_inputs) != 4:
+            if len(captured_runner_inputs) != write_manual_capture_start:
                 raise AssertionError("write-task dispatch must not call runner")
 
             write_capture_start = len(captured_runner_inputs)
@@ -347,6 +372,7 @@ def main() -> int:
                         "workbench/tmp/write-runner-live-smoke.txt",
                         "workbench/tmp/fast-write-approval-smoke.txt",
                         "workbench/tmp/latest-write-approval-smoke.txt",
+                        "workbench/tmp/run-write-approval-smoke.txt",
                     )
                 ):
                     raise AssertionError("write runner payload did not include the expected write target")
@@ -496,6 +522,50 @@ def main() -> int:
             assert_contains(latest_exec_text, "explicit user write approval via approve-latest")
             assert_contains((bridge.DISPATCHES_DIR / f"{latest_write_dispatch_id}.md").read_text(encoding="utf-8"), "status: reviewed")
             assert_contains((bridge.TASKS_DIR / f"{latest_write_task_id}.md").read_text(encoding="utf-8"), "status: archived")
+
+            run_write_capture_start = len(captured_runner_inputs)
+            run_write, route = bridge.prepare_reply(
+                "/run codex Create or update only workbench/tmp/run-write-approval-smoke.txt. Do not modify source code. No git add/commit/push. --project auto_exec",
+                ctx,
+            )
+            assert route == "local_command"
+            run_write_task_id = extract_task_id(run_write)
+            run_write_dispatch_id = extract_dispatch_id(run_write)
+            run_write_exec_id = extract_exec_id(run_write)
+            assert_contains(run_write, "One command task run:")
+            assert_contains(run_write, "command_chain: task -> dispatch -> exec start")
+            assert_contains(run_write, "status: needs_manual_start")
+            assert_contains(run_write, "read_only_gate: failed")
+            assert_contains(run_write, "auto_execute_enabled: false")
+            assert_contains(run_write, "runner_sandbox: none")
+            assert_contains(run_write, "/exec approve-latest write")
+            if len(captured_runner_inputs) != run_write_capture_start:
+                raise AssertionError("/run codex write task must stop before runner")
+            assert_contains((bridge.EXECUTIONS_DIR / f"{run_write_exec_id}.md").read_text(encoding="utf-8"), "status: needs_manual_start")
+            assert_contains((bridge.DISPATCHES_DIR / f"{run_write_dispatch_id}.md").read_text(encoding="utf-8"), "status: ready")
+
+            run_write_approve_capture_start = len(captured_runner_inputs)
+            run_write_external_start = len(external_commands)
+            run_write_approved, route = bridge.prepare_reply("/exec approve-latest write", ctx)
+            assert route == "local_command"
+            assert_contains(run_write_approved, "workspace-write runner returned")
+            assert_contains(run_write_approved, "status: returned")
+            assert_contains(run_write_approved, "runner_sandbox: workspace-write")
+            assert_contains(run_write_approved, "approval_target: approve-latest")
+            assert_contains(run_write_approved, f"resolved_exec_id: {run_write_exec_id}")
+            assert_contains(run_write_approved, f"resolved_dispatch_id: {run_write_dispatch_id}")
+            assert_contains(run_write_approved, "selected_status: needs_manual_start")
+            assert_contains(run_write_approved, "Auto postprocess: pass")
+            if len(captured_runner_inputs) != run_write_approve_capture_start + 1:
+                raise AssertionError("/run codex write approval must call runner exactly once")
+            if external_commands[run_write_external_start:] != [["codex", "exec", "--sandbox", "workspace-write", "-"]]:
+                raise AssertionError("/run codex write approval used non-workspace-write command")
+            run_write_exec_text = (bridge.EXECUTIONS_DIR / f"{run_write_exec_id}.md").read_text(encoding="utf-8")
+            assert_contains(run_write_exec_text, "write_confirmed: true")
+            assert_contains(run_write_exec_text, "runner_sandbox: workspace-write")
+            assert_contains(run_write_exec_text, "explicit user write approval via approve-latest")
+            assert_contains((bridge.DISPATCHES_DIR / f"{run_write_dispatch_id}.md").read_text(encoding="utf-8"), "status: reviewed")
+            assert_contains((bridge.TASKS_DIR / f"{run_write_task_id}.md").read_text(encoding="utf-8"), "status: archived")
 
             deploy_task_reply, route = bridge.prepare_reply(
                 "/task new Deploy app to production --project auto_exec",
