@@ -373,6 +373,7 @@ def main() -> int:
                         "workbench/tmp/fast-write-approval-smoke.txt",
                         "workbench/tmp/latest-write-approval-smoke.txt",
                         "workbench/tmp/run-write-approval-smoke.txt",
+                        "workbench/tmp/owner-fast-lane-write-smoke.txt",
                     )
                 ):
                     raise AssertionError("write runner payload did not include the expected write target")
@@ -566,6 +567,49 @@ def main() -> int:
             assert_contains(run_write_exec_text, "explicit user write approval via approve-latest")
             assert_contains((bridge.DISPATCHES_DIR / f"{run_write_dispatch_id}.md").read_text(encoding="utf-8"), "status: reviewed")
             assert_contains((bridge.TASKS_DIR / f"{run_write_task_id}.md").read_text(encoding="utf-8"), "status: archived")
+
+            owner_fast_lane_capture_start = len(captured_runner_inputs)
+            owner_fast_lane_external_start = len(external_commands)
+            owner_fast_lane, route = bridge.prepare_reply(
+                "/run codex-write Create or update only workbench/tmp/owner-fast-lane-write-smoke.txt. Do not modify source code. No git add/commit/push. --project auto_exec",
+                ctx,
+            )
+            assert route == "local_command"
+            owner_fast_lane_task_id = extract_task_id(owner_fast_lane)
+            owner_fast_lane_dispatch_id = extract_dispatch_id(owner_fast_lane)
+            owner_fast_lane_exec_id = extract_exec_id(owner_fast_lane)
+            assert_contains(owner_fast_lane, "One command owner write run:")
+            assert_contains(owner_fast_lane, "command_chain: task -> dispatch -> exec start -> exec approve write")
+            assert_contains(owner_fast_lane, "status: returned")
+            assert_contains(owner_fast_lane, "owner_fast_lane: true")
+            assert_contains(owner_fast_lane, "owner_fast_lane_status: returned")
+            assert_contains(owner_fast_lane, "runner_sandbox: workspace-write")
+            assert_contains(owner_fast_lane, "workspace-write runner returned")
+            assert_contains(owner_fast_lane, "auto_decision: pass")
+            if len(captured_runner_inputs) != owner_fast_lane_capture_start + 1:
+                raise AssertionError("owner fast lane write run must call runner exactly once")
+            if external_commands[owner_fast_lane_external_start:] != [["codex", "exec", "--sandbox", "workspace-write", "-"]]:
+                raise AssertionError("owner fast lane used non-workspace-write command")
+            owner_fast_lane_exec_text = (bridge.EXECUTIONS_DIR / f"{owner_fast_lane_exec_id}.md").read_text(encoding="utf-8")
+            assert_contains(owner_fast_lane_exec_text, "write_confirmed: true")
+            assert_contains(owner_fast_lane_exec_text, "runner_sandbox: workspace-write")
+            assert_contains(owner_fast_lane_exec_text, "explicit owner fast lane write approval")
+            assert_contains((bridge.DISPATCHES_DIR / f"{owner_fast_lane_dispatch_id}.md").read_text(encoding="utf-8"), "status: reviewed")
+            assert_contains((bridge.TASKS_DIR / f"{owner_fast_lane_task_id}.md").read_text(encoding="utf-8"), "status: archived")
+
+            owner_deploy_capture_start = len(captured_runner_inputs)
+            owner_deploy, route = bridge.prepare_reply(
+                "/run codex-write Deploy app to production --project auto_exec",
+                ctx,
+            )
+            assert route == "local_command"
+            assert_contains(owner_deploy, "One command owner write run:")
+            assert_contains(owner_deploy, "owner_fast_lane: true")
+            assert_contains(owner_deploy, "owner_fast_lane_status: refused")
+            assert_contains(owner_deploy, "write approval refused")
+            assert_contains(owner_deploy, "deploy_forbidden: true")
+            if len(captured_runner_inputs) != owner_deploy_capture_start:
+                raise AssertionError("owner fast lane deploy refusal must not call runner")
 
             deploy_task_reply, route = bridge.prepare_reply(
                 "/task new Deploy app to production --project auto_exec",

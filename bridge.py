@@ -7853,11 +7853,13 @@ def build_run_help_reply() -> str:
     return """Atlas one-command run
 - /run help
 - /run codex <task title> [--project <project_id>]
+- /run codex-write <task title> [--project <project_id>]
 
 Boundary:
 - creates a local task, creates a Codex dispatch with context, then starts the existing execution flow
 - read-only/no-change tasks may use the guarded read-only Codex runner
 - write/modify/deploy tasks stop at needs_manual_start and require explicit /exec approve <exec_id|dispatch_id> write or /exec approve-latest write
+- codex-write is the owner fast lane: it is an explicit workspace-write approval for write-intent tasks and still uses the write approval gate
 - does not bypass read-only gate, write approval gate, command allowlist, stdin payload checks, or post-run evidence checks
 - does not run git add/commit/push/merge, deploy, package managers, shells, or arbitrary commands
 - does not read .env or print tokens/cookies/secrets
@@ -7893,10 +7895,14 @@ def one_command_next_action(record: dict | None, dispatch_id: str) -> str:
     return exec_next_action(record)
 
 
-def build_run_codex_reply(tail: str) -> str:
+def build_run_codex_reply(tail: str, owner_write_fast_lane: bool = False) -> str:
     clean_title, project_id = parse_task_new_tail(tail)
     if not clean_title:
-        return "Usage: /run codex <task title> [--project <project_id>]"
+        return (
+            "Usage: /run codex-write <task title> [--project <project_id>]"
+            if owner_write_fast_lane
+            else "Usage: /run codex <task title> [--project <project_id>]"
+        )
     if project_id and not project_path(project_id).exists():
         return f"""One command task run refused
 - reason: project not found
@@ -7908,7 +7914,30 @@ def build_run_codex_reply(tail: str) -> str:
         attach_task_to_project(project_id, task_id)
     dispatch_id, dispatch_meta = create_codex_dispatch(task_id, with_context=True)
     start_reply = build_exec_start_reply(dispatch_id)
+    approval_reply = ""
+    owner_fast_lane_status = "not_requested"
+    owner_fast_lane_reason = ""
     record = latest_exec_for_dispatch(dispatch_id)
+    if owner_write_fast_lane:
+        gate = read_only_dispatch_gate(dispatch_id)
+        if record and record.get("status") == "needs_manual_start" and gate.get("reason") == "write intent detected":
+            approval_reply = build_exec_approve_reply(f"{dispatch_id} write explicit owner fast lane write approval")
+            record = latest_exec_for_dispatch(dispatch_id)
+            if approval_reply.lower().startswith("execution write approval refused"):
+                owner_fast_lane_status = "refused"
+            elif approval_reply.lower().startswith("execution write approval needs manual start"):
+                owner_fast_lane_status = "needs_manual_start"
+            else:
+                owner_fast_lane_status = record.get("status", "unknown") if record else "unknown"
+            owner_fast_lane_reason = "write intent detected; explicit owner fast lane approval applied"
+        elif record and record.get("status") == "needs_manual_start":
+            owner_fast_lane_status = "refused"
+            owner_fast_lane_reason = (
+                f"owner fast lane requires explicit write intent; read_only_gate={gate.get('reason', 'unknown')}"
+            )
+        else:
+            owner_fast_lane_status = "not_needed"
+            owner_fast_lane_reason = f"exec_status={record.get('status', 'unknown') if record else 'unknown'}"
     exec_id = record.get("exec_id", "none") if record else "none"
     exec_status = record.get("status", "unknown") if record else "unknown"
     exec_meta = task_metadata(read_exec(exec_id)) if record and exec_id != "none" else {}
@@ -7924,11 +7953,33 @@ def build_run_codex_reply(tail: str) -> str:
         dispatch_id=dispatch_id,
         exec_id=exec_id,
         exec_status=exec_status,
+        owner_fast_lane=owner_write_fast_lane,
     )
-    return sanitize_sensitive_text(f"""One command task run:
+    title = "One command owner write run:" if owner_write_fast_lane else "One command task run:"
+    command_chain = (
+        "task -> dispatch -> exec start -> exec approve write"
+        if owner_write_fast_lane and approval_reply
+        else "task -> dispatch -> exec start"
+    )
+    approval_section = (
+        f"""
+Owner write approval summary:
+{safe_preview(approval_reply, 1600)}"""
+        if owner_write_fast_lane and approval_reply
+        else ""
+    )
+    owner_lines = (
+        f"""
+- owner_fast_lane: true
+- owner_fast_lane_status: {owner_fast_lane_status}
+- owner_fast_lane_reason: {safe_preview(owner_fast_lane_reason, 180) or 'none'}"""
+        if owner_write_fast_lane
+        else ""
+    )
+    return sanitize_sensitive_text(f"""{title}
 - status: {exec_status}
 - target_executor: codex
-- command_chain: task -> dispatch -> exec start
+- command_chain: {command_chain}
 - task_id: {task_id}
 - dispatch_id: {dispatch_id}
 - exec_id: {exec_id}
@@ -7941,10 +7992,13 @@ def build_run_codex_reply(tail: str) -> str:
 - auto_decision: {auto_decision}
 - no_git_add_commit_push: true
 - deploy_forbidden: true
+- workspace_write_requires_explicit_owner_command: true
+{owner_lines}
 - next: {next_action}
 
 Execution start summary:
-{safe_preview(start_reply, 1600)}""")
+{safe_preview(start_reply, 1600)}
+{approval_section}""")
 
 
 def build_exec_package_reply(exec_id: str) -> str:
@@ -10810,6 +10864,8 @@ def handle_run_command(user_text: str) -> str | None:
             return build_run_help_reply()
         if subcommand == "codex":
             return build_run_codex_reply(tail)
+        if subcommand in {"codex-write", "codex-owner-write"}:
+            return build_run_codex_reply(tail, owner_write_fast_lane=True)
         return build_run_help_reply()
     except FileNotFoundError as exc:
         return f"run source not found: {safe_preview(str(exc), 180)}"
