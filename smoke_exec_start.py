@@ -380,6 +380,14 @@ def main() -> int:
             assert_contains(approved, "workspace-write runner returned")
             assert_contains(approved, "status: returned")
             assert_contains(approved, "runner_sandbox: workspace-write")
+            assert_contains(approved, "Auto postprocess: pass")
+            assert_contains(approved, "auto_qa_done: true")
+            assert_contains(approved, "auto_evidence_verified: true")
+            assert_contains(approved, "auto_review_done: true")
+            assert_contains(approved, "auto_dispatch_review_linked: true")
+            assert_contains(approved, "auto_decision: pass")
+            assert_contains(approved, "auto_closed: true")
+            assert_contains(approved, "auto_retro_created: true")
             if len(captured_runner_inputs) != write_capture_start + 1:
                 raise AssertionError("write approval must call runner exactly once")
             if external_commands[external_start:] != [["codex", "exec", "--sandbox", "workspace-write", "-"]]:
@@ -392,8 +400,23 @@ def main() -> int:
                 "## Human Write Approval",
                 "## Post-Run Snapshot",
                 "## Runner Test Results",
+                "auto_decision: pass",
+                "auto_closed: true",
             ):
                 assert_contains(approved_exec_text, needle)
+            write_dispatch_text = (bridge.DISPATCHES_DIR / f"{write_dispatch_id}.md").read_text(encoding="utf-8")
+            write_task_text = (bridge.TASKS_DIR / f"{write_task_id}.md").read_text(encoding="utf-8")
+            assert_contains(write_dispatch_text, "status: reviewed")
+            assert_contains(write_task_text, "status: archived")
+            assert_contains(write_task_text, "auto postprocess decision=pass")
+            write_evidence_file = bridge.EVIDENCE_DIR / f"{write_task_id}.md"
+            if not write_evidence_file.exists():
+                raise AssertionError("expected approved-write evidence intake record")
+            assert_contains(write_evidence_file.read_text(encoding="utf-8"), "verified: verified")
+            assert_contains(write_evidence_file.read_text(encoding="utf-8"), "approved workspace-write exec")
+            write_retro_file = bridge.RETROS_DIR / f"{write_task_id}.md"
+            if not write_retro_file.exists():
+                raise AssertionError("expected approved-write auto retro draft")
 
             deploy_task_reply, route = bridge.prepare_reply(
                 "/task new Deploy app to production --project auto_exec",

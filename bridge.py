@@ -1502,7 +1502,7 @@ def task_title_from_text(task_id: str, text: str) -> str:
 
 def task_metadata(text: str) -> dict:
     meta: dict[str, str] = {}
-    for line in text.splitlines()[1:20]:
+    for line in text.splitlines()[1:]:
         if line.startswith("## "):
             break
         if ":" in line:
@@ -7431,15 +7431,13 @@ def execute_exec_runner(
             sandbox_mode,
         )
         receive_reply = build_exec_receive_reply(exec_id, report)
-        auto_postprocess_reply = ""
-        if sandbox_mode == "read-only":
-            auto_postprocess_reply = build_exec_auto_postprocess_reply(
-                exec_id,
-                normalized_dispatch_id,
-                completion,
-                sandbox_mode=sandbox_mode,
-                receive_synced="synced_dispatch_receive: true" in receive_reply,
-            )
+        auto_postprocess_reply = build_exec_auto_postprocess_reply(
+            exec_id,
+            normalized_dispatch_id,
+            completion,
+            sandbox_mode=sandbox_mode,
+            receive_synced="synced_dispatch_receive: true" in receive_reply,
+        )
         if completion["completion_state"] == "timeout_with_output":
             update_exec_fields(
                 exec_id,
@@ -7499,15 +7497,13 @@ def execute_exec_runner(
         record_exec_failure_evidence(exec_id, normalized_dispatch_id, task_id, result, completion, post_run_snapshot)
         log_event("exec_failed", exec_id=exec_id, dispatch_id=normalized_dispatch_id)
         response_title = "Execution auto-run" if sandbox_mode == "read-only" else f"Execution {sandbox_mode} runner"
-        auto_postprocess_reply = ""
-        if sandbox_mode == "read-only":
-            auto_postprocess_reply = build_exec_auto_postprocess_reply(
-                exec_id,
-                normalized_dispatch_id,
-                completion,
-                sandbox_mode=sandbox_mode,
-                receive_synced=False,
-            )
+        auto_postprocess_reply = build_exec_auto_postprocess_reply(
+            exec_id,
+            normalized_dispatch_id,
+            completion,
+            sandbox_mode=sandbox_mode,
+            receive_synced=False,
+        )
         return f"""{response_title} failed: {exec_id}
 - status: failed
 - dispatch_id: {normalized_dispatch_id}
@@ -7914,14 +7910,15 @@ def generated_exec_evidence_ids(task_id: str, exec_id: str) -> list[str]:
     return ids
 
 
-def auto_verify_exec_evidence(task_id: str, exec_id: str) -> list[str]:
+def auto_verify_exec_evidence(task_id: str, exec_id: str, sandbox_mode: str = "read-only") -> list[str]:
     verified_ids = []
+    sandbox_label = "approved workspace-write" if sandbox_mode == "workspace-write" else "read-only"
     for evidence_id in generated_exec_evidence_ids(task_id, exec_id):
         update_evidence_mark(
             task_id,
             evidence_id,
             "verified",
-            f"auto verified for read-only exec {exec_id}: returncode=0, timed_out=false, completion_state=completed, no git/deploy action by Bridge.",
+            f"auto verified for {sandbox_label} exec {exec_id}: returncode=0, timed_out=false, completion_state=completed, no git/deploy action by Bridge.",
         )
         verified_ids.append(evidence_id)
     return verified_ids
@@ -7939,9 +7936,13 @@ def build_exec_auto_postprocess_reply(
     normalized_dispatch_id = normalize_dispatch_id(dispatch_id)
     exec_meta = task_metadata(read_exec(normalized_exec_id))
     task_id = normalize_task_id(exec_meta.get("task_id", ""))
+    write_confirmed = str(exec_meta.get("write_confirmed", "")).lower() == "true"
+    authorized_sandbox = sandbox_mode == "read-only" or (sandbox_mode == "workspace-write" and write_confirmed)
+    sandbox_label = "approved workspace-write" if sandbox_mode == "workspace-write" else "read-only"
     hard_gates = {
-        "runner_sandbox": sandbox_mode == "read-only",
-        "read_only_gate": sandbox_mode == "read-only",
+        "runner_sandbox": sandbox_mode in RUNNER_SANDBOX_MODES,
+        "runner_authorization": authorized_sandbox,
+        "write_confirmed": sandbox_mode != "workspace-write" or write_confirmed,
         "returncode": str(completion.get("returncode")) == "0",
         "timed_out": str(completion.get("timed_out")).lower() == "false",
         "completion_state": completion.get("completion_state") == "completed",
@@ -8011,7 +8012,7 @@ QA preview:
         evidence_intake_generated = bool(eligible_ids)
         sensitive_ok = not bool(intake.get("sensitive_risk"))
         if evidence_intake_generated and sensitive_ok:
-            verified_ids = auto_verify_exec_evidence(task_id, normalized_exec_id)
+            verified_ids = auto_verify_exec_evidence(task_id, normalized_exec_id, sandbox_mode)
             evidence_verified = bool(verified_ids)
         else:
             verified_ids = []
@@ -8067,7 +8068,7 @@ QA preview:
         decide_reply = build_task_decide_reply(
             task_id,
             "pass",
-            f"auto pass: read-only exec {normalized_exec_id} completed with verified generated evidence and no remaining review gaps.",
+            f"auto pass: {sandbox_label} exec {normalized_exec_id} completed with verified generated evidence and no remaining review gaps.",
         )
         close_reply = build_task_close_reply(task_id)
         retro_reply = build_retro_create_reply(task_id)
@@ -8104,7 +8105,7 @@ Close loop:
 - generated evidence auto-verified
 - task review done
 - dispatch review linked
-- task decided pass
+- task decided pass via {sandbox_label}
 - task closed
 - retro draft created
 
