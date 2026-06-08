@@ -834,6 +834,29 @@ def report_has_no_modification_marker(report: str) -> bool:
     )
 
 
+FALSE_PASS_REPORT_PATTERNS = (
+    ("could_not_modify_files", r"\bcould\s+not\s+modify\s+files?\b"),
+    ("cannot_modify_files", r"\bcannot\s+modify\s+files?\b"),
+    ("read_only_filesystem_permissions", r"\bread[- ]only\s+filesystem\s+permissions\b"),
+    ("implementation_blocked", r"\bimplementation\s+(?:was\s+)?blocked\b"),
+    ("session_read_only", r"\bsession\s+(?:is|was)\s+read[- ]only\b"),
+    ("no_code_change_read_only", r"\bno\s+code\s+change\s+was\s+made\s+because\s+read[- ]only\b"),
+    ("unable_to_write", r"\b(?:unable\s+to\s+write|could\s+not\s+write|cannot\s+write)\b"),
+    ("needs_evidence", r"\bneeds_evidence\b"),
+    ("decision_label_needs_evidence", r"\bdecision\s+label\s*:\s*needs_evidence\b"),
+    ("source_write_only_inspected", r"\bsource[- ]write\s+task\s+was\s+only\s+inspected\b"),
+)
+
+
+def read_only_false_pass_reasons(report: str) -> list[str]:
+    text = str(report or "")
+    reasons = []
+    for label, pattern in FALSE_PASS_REPORT_PATTERNS:
+        if re.search(pattern, text, re.IGNORECASE):
+            reasons.append(label)
+    return reasons
+
+
 def report_has_modified_files_field(report: str) -> bool:
     text = str(report or "")
     lowered = text.lower()
@@ -6704,6 +6727,7 @@ READ_ONLY_BOUNDARY_MARKERS = (
 
 WRITE_INTENT_PATTERNS = (
     r"\bwrite\s+code\b",
+    r"\bwrite\s+implementation\b",
     r"\bmodify\s+(code|files?)\b",
     r"\bcreate\s+(files?|migration|component|route)\b",
     r"\bedit\s+(files?|code)\b",
@@ -6719,6 +6743,26 @@ WRITE_INTENT_PATTERNS = (
     r"提交",
     r"部署",
     r"发布",
+)
+
+SOURCE_FILE_REF_PATTERN = r"(?:[A-Za-z0-9_.-]+[\\/])*[A-Za-z0-9_.-]+\.py|\*\.py"
+
+SOURCE_WRITE_INTENT_PATTERNS = (
+    r"\bwrite\s+implementation\b",
+    r"\bsource[-/\s]+write\s+implementation\b",
+    r"\bsource[-\s]+code\s+implementation\b",
+    r"\b(?:implement|implementation)\s+(?:in|inside|within)\s+(?:" + SOURCE_FILE_REF_PATTERN + r")\b",
+    r"\b(?:modify|update|edit|patch|change|harden)\s+(?:" + SOURCE_FILE_REF_PATTERN + r")\b",
+    r"\badd\s+regression\s+tests?\s+(?:in|to)\s+(?:" + SOURCE_FILE_REF_PATTERN + r")\b",
+    r"\b(?:modify|update|edit|patch|change|harden)\s+(?:tracked\s+)?source\s+(?:code|files?)\b",
+    r"\b(?:edit|patch|modify|change|update|harden)\s+source\b",
+)
+
+NEGATED_SOURCE_WRITE_PATTERNS = (
+    r"\b(?:do\s+not|don't|must\s+not|cannot|can't)\s+(?:modify|update|edit|patch|change|harden|implement|write)\b.*(?:source|\.py)",
+    r"\bwithout\s+(?:modifying|updating|editing|patching|changing|hardening|implementing|writing)\b.*(?:source|\.py)",
+    r"\bno\s+(?:source\s+)?code\s+changes?\b",
+    r"\bno\s+changes?\s+to\s+(?:source|.*\.py)\b",
 )
 
 WRITE_APPROVAL_FORBIDDEN_PATTERNS = (
@@ -6776,6 +6820,12 @@ def line_has_explicit_write_target(line: str) -> bool:
     return any(re.search(pattern, line, re.IGNORECASE) for pattern in EXPLICIT_WRITE_TARGET_PATTERNS)
 
 
+def line_has_source_write_intent(line: str) -> bool:
+    if any(re.search(pattern, line, re.IGNORECASE) for pattern in NEGATED_SOURCE_WRITE_PATTERNS):
+        return False
+    return any(re.search(pattern, line, re.IGNORECASE) for pattern in SOURCE_WRITE_INTENT_PATTERNS)
+
+
 def line_has_write_intent(line: str) -> bool:
     lowered = line.lower()
     field_label = re.sub(r"^[>\-\s]*", "", lowered).strip()
@@ -6791,6 +6841,8 @@ def line_has_write_intent(line: str) -> bool:
     }
     if field_label in report_field_labels:
         return False
+    if line_has_source_write_intent(line):
+        return True
     evidence_or_report_markers = (
         "return report",
         "report format",
@@ -7926,6 +7978,35 @@ Next commands:
         task_text = read_task(task_id)
         report = task_section(task_text, "Execution Report")
         intake = analyze_evidence_intake(report, task_section(task_text, "Acceptance Criteria"))
+        false_pass_reasons = read_only_false_pass_reasons(report)
+        if false_pass_reasons:
+            reason = "report indicates blocked write/source implementation: " + ", ".join(false_pass_reasons[:4])
+            record_auto_postprocess_state(
+                normalized_exec_id,
+                task_id,
+                normalized_dispatch_id,
+                enabled=True,
+                qa_done=qa_done,
+                evidence_verified=False,
+                review_done=False,
+                dispatch_review_linked=False,
+                decision="needs_human_review",
+                reason=reason,
+            )
+            return f"""Auto postprocess: needs_human_review
+- auto_postprocess_enabled: true
+- auto_qa_done: {str(qa_done).lower()}
+- auto_evidence_verified: false
+- auto_review_done: false
+- auto_dispatch_review_linked: false
+- auto_decision: needs_human_review
+- auto_closed: false
+- auto_postprocess_reason: {reason}
+Next commands:
+{auto_postprocess_commands(normalized_exec_id, task_id, normalized_dispatch_id, reason)}
+
+QA preview:
+{safe_preview(qa_reply, 260)}"""
         eligible_ids = generated_exec_evidence_ids(task_id, normalized_exec_id)
         evidence_intake_generated = bool(eligible_ids)
         sensitive_ok = not bool(intake.get("sensitive_risk"))

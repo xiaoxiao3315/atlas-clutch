@@ -183,6 +183,30 @@ def main() -> int:
             if external_commands != [["codex", "exec", "--sandbox", "read-only", "-"]]:
                 raise AssertionError(f"unexpected runner command shape: {external_commands}")
 
+            source_write_task_reply, route = bridge.prepare_reply(
+                "/task new WRITE IMPLEMENTATION modify bridge.py update smoke_exec_start.py read-only inspection only. No git add/commit/push. --project auto_exec",
+                ctx,
+            )
+            assert route == "local_command"
+            source_write_task_id = extract_task_id(source_write_task_reply)
+            source_write_dispatch_reply, route = bridge.prepare_reply(f"/dispatch create {source_write_task_id} codex --with-context", ctx)
+            assert route == "local_command"
+            source_write_dispatch_id = extract_dispatch_id(source_write_dispatch_reply)
+            source_write_manual, route = bridge.prepare_reply(f"/exec start {source_write_dispatch_id}", ctx)
+            assert route == "local_command"
+            source_write_exec_id = extract_exec_id(source_write_manual)
+            assert_contains(source_write_manual, "status: needs_manual_start")
+            assert_contains(source_write_manual, "read_only_gate: failed")
+            assert_contains(source_write_manual, "write intent detected")
+            assert_contains(source_write_manual, "modify bridge.py")
+            assert_contains(source_write_manual, "update smoke_exec_start.py")
+            source_write_exec_text = (bridge.EXECUTIONS_DIR / f"{source_write_exec_id}.md").read_text(encoding="utf-8")
+            assert_contains(source_write_exec_text, "status: needs_manual_start")
+            assert_contains(source_write_exec_text, "auto_execute_enabled: false")
+            assert_not_contains(source_write_exec_text, "auto_decision: pass")
+            if len(captured_runner_inputs) != 1:
+                raise AssertionError("source-write task must not call read-only runner")
+
             def timeout_with_output_runner(argv: list[str], *, input_text: str = "", **_: object) -> dict:
                 external_commands.append(list(argv))
                 captured_runner_inputs.append(input_text)
@@ -414,6 +438,54 @@ def main() -> int:
                 "reason": "smoke fake non-interactive read-only stdin runner",
                 "command": ["codex", "exec", "--sandbox", "read-only", "-"],
             }
+
+            def read_only_blocked_runner(argv: list[str], *, input_text: str = "", **_: object) -> dict:
+                external_commands.append(list(argv))
+                captured_runner_inputs.append(input_text)
+                return {
+                    "returncode": 0,
+                    "stdout": "\n".join(
+                        [
+                            "AUTORUN-PAYLOAD-OK",
+                            "Execution summary:",
+                            "- could not modify files because this Codex session has read-only filesystem permissions",
+                            "- source-write task was only inspected",
+                            "Modified files:",
+                            "- none",
+                            "Commands:",
+                            "- fake codex exec read-only",
+                            "Test results:",
+                            "- inspection only; implementation was blocked",
+                            "Unverified:",
+                            "- source change",
+                            "Unresolved risks:",
+                            "- unable to write",
+                            "Decision label: needs_evidence",
+                        ]
+                    ),
+                    "stderr": "",
+                    "timed_out": False,
+                }
+
+            bridge.run_allowlisted_external_command = read_only_blocked_runner
+            blocked_task_id, blocked_dispatch_id = create_read_only_dispatch(ctx)
+            blocked_reply, route = bridge.prepare_reply(f"/exec start {blocked_dispatch_id}", ctx)
+            assert route == "local_command"
+            blocked_exec_id = extract_exec_id(blocked_reply)
+            assert_contains(blocked_reply, "status: returned")
+            assert_contains(blocked_reply, "Auto postprocess: needs_human_review")
+            assert_contains(blocked_reply, "report indicates blocked write/source implementation")
+            assert_contains(blocked_reply, "auto_decision: needs_human_review")
+            assert_contains(blocked_reply, "auto_closed: false")
+            assert_not_contains(blocked_reply, "Auto postprocess: pass")
+            blocked_exec_text = (bridge.EXECUTIONS_DIR / f"{blocked_exec_id}.md").read_text(encoding="utf-8")
+            blocked_task_text = (bridge.TASKS_DIR / f"{blocked_task_id}.md").read_text(encoding="utf-8")
+            assert_contains(blocked_exec_text, "auto_decision: needs_human_review")
+            assert_contains(blocked_exec_text, "auto_evidence_verified: false")
+            assert_contains(blocked_exec_text, "auto_closed: false")
+            assert_not_contains(blocked_task_text, "status: archived")
+            if (bridge.RETROS_DIR / f"{blocked_task_id}.md").exists():
+                raise AssertionError("read-only blocked implementation must not auto-create retro")
 
             def evidence_gap_runner(argv: list[str], *, input_text: str = "", **_: object) -> dict:
                 external_commands.append(list(argv))
