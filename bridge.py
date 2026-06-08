@@ -6495,6 +6495,18 @@ def resolve_write_approval_target(target_id: str) -> tuple[str, str, bool]:
     raise ValueError("approval target must be an EXEC-* or DISPATCH-* id")
 
 
+def latest_write_approval_candidate() -> dict | None:
+    for record in exec_records():
+        if record.get("status") not in WRITE_APPROVAL_ELIGIBLE_STATUSES:
+            continue
+        if record.get("target_executor", "").lower() != "codex":
+            continue
+        if record.get("stale"):
+            continue
+        return record
+    return None
+
+
 def latest_exec_for_task(task_id: str) -> dict | None:
     normalized_task_id = normalize_task_id(task_id)
     matches = [record for record in exec_records() if record.get("task_id") == normalized_task_id]
@@ -7614,6 +7626,7 @@ def build_exec_help_reply() -> str:
 - /exec prepare <dispatch_id>
 - /exec start <dispatch_id>
 - /exec approve <exec_id|dispatch_id> write
+- /exec approve-latest write
 - /exec package <exec_id>
 - /exec mark <exec_id> copied <note>
 - /exec mark <exec_id> opened <note>
@@ -7631,6 +7644,7 @@ Boundary:
 - write or modification tasks degrade to needs_manual_start
 - workspace-write runner requires explicit /exec approve <exec_id|dispatch_id> write
 - dispatch-id approval is the fast path; it reuses a prepared/manual-start exec or creates one when no execution exists yet
+- approve-latest approves only the newest prepared/manual-start Codex execution; it does not bypass write gates
 - human_confirm_required: true for write/modify/deploy tasks
 - external_execution_enabled: false
 - auto_execute_enabled: false for arbitrary tasks
@@ -7800,6 +7814,39 @@ Write approval UX:
 - approval_target: {parts[0]}
 - resolved_exec_id: {exec_id}
 - created_exec_for_dispatch: {str(created_from_dispatch).lower()}"""
+
+
+def build_exec_approve_latest_reply(tail: str) -> str:
+    parts = str(tail or "").strip().split(maxsplit=1)
+    if not parts or parts[0].lower() != "write":
+        return "Usage: /exec approve-latest write"
+    record = latest_write_approval_candidate()
+    if not record:
+        latest = exec_records()[:1]
+        if not latest:
+            return """Execution approve-latest refused
+- reason: no execution sessions found
+- required_status: prepared OR needs_manual_start
+- next: /exec prepare <dispatch_id> OR /exec start <dispatch_id>"""
+        latest_record = latest[0]
+        latest_dispatch_id = latest_record.get("dispatch_id", "")
+        return f"""Execution approve-latest refused
+- reason: no prepared/manual-start Codex execution found
+- latest_exec_id: {latest_record.get('exec_id', '')}
+- latest_status: {latest_record.get('status', 'unknown')}
+- latest_target_executor: {latest_record.get('target_executor', '') or 'unknown'}
+- required_status: prepared OR needs_manual_start
+- next: /exec start {latest_dispatch_id} OR /exec approve {latest_dispatch_id} write"""
+    note = parts[1] if len(parts) > 1 else "explicit user write approval via approve-latest"
+    reply = build_exec_approve_reply(f"{record['exec_id']} write {note}")
+    return f"""{reply}
+
+One command task run:
+- approval_target: approve-latest
+- resolved_exec_id: {record['exec_id']}
+- resolved_dispatch_id: {record.get('dispatch_id', '')}
+- selected_status: {record.get('status', 'unknown')}
+- selected_task_id: {record.get('task_id', '')}"""
 
 
 def build_exec_package_reply(exec_id: str) -> str:
@@ -8322,6 +8369,8 @@ def handle_exec_command(user_text: str) -> str | None:
             return build_exec_start_reply(tail)
         if subcommand == "approve":
             return build_exec_approve_reply(tail)
+        if subcommand == "approve-latest":
+            return build_exec_approve_latest_reply(tail)
         if subcommand == "package":
             return build_exec_package_reply(tail)
         if subcommand == "mark":

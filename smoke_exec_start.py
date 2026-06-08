@@ -346,6 +346,7 @@ def main() -> int:
                     for path in (
                         "workbench/tmp/write-runner-live-smoke.txt",
                         "workbench/tmp/fast-write-approval-smoke.txt",
+                        "workbench/tmp/latest-write-approval-smoke.txt",
                     )
                 ):
                     raise AssertionError("write runner payload did not include the expected write target")
@@ -458,6 +459,43 @@ def main() -> int:
             assert_contains(fast_exec_text, "explicit user write approval via dispatch_id")
             assert_contains((bridge.DISPATCHES_DIR / f"{fast_write_dispatch_id}.md").read_text(encoding="utf-8"), "status: reviewed")
             assert_contains((bridge.TASKS_DIR / f"{fast_write_task_id}.md").read_text(encoding="utf-8"), "status: archived")
+
+            latest_write_task_reply, route = bridge.prepare_reply(
+                "/task new Create or update only workbench/tmp/latest-write-approval-smoke.txt. Do not modify source code. No git add/commit/push. --project auto_exec",
+                ctx,
+            )
+            assert route == "local_command"
+            latest_write_task_id = extract_task_id(latest_write_task_reply)
+            latest_write_dispatch_reply, route = bridge.prepare_reply(f"/dispatch create {latest_write_task_id} codex --with-context", ctx)
+            assert route == "local_command"
+            latest_write_dispatch_id = extract_dispatch_id(latest_write_dispatch_reply)
+            latest_start, route = bridge.prepare_reply(f"/exec start {latest_write_dispatch_id}", ctx)
+            assert route == "local_command"
+            latest_manual_exec_id = extract_exec_id(latest_start)
+            assert_contains(latest_start, "status: needs_manual_start")
+            latest_write_capture_start = len(captured_runner_inputs)
+            latest_external_start = len(external_commands)
+            latest_approved, route = bridge.prepare_reply("/exec approve-latest write", ctx)
+            assert route == "local_command"
+            assert_contains(latest_approved, "workspace-write runner returned")
+            assert_contains(latest_approved, "status: returned")
+            assert_contains(latest_approved, "runner_sandbox: workspace-write")
+            assert_contains(latest_approved, "One command task run:")
+            assert_contains(latest_approved, "approval_target: approve-latest")
+            assert_contains(latest_approved, f"resolved_exec_id: {latest_manual_exec_id}")
+            assert_contains(latest_approved, f"resolved_dispatch_id: {latest_write_dispatch_id}")
+            assert_contains(latest_approved, "selected_status: needs_manual_start")
+            assert_contains(latest_approved, "Auto postprocess: pass")
+            if len(captured_runner_inputs) != latest_write_capture_start + 1:
+                raise AssertionError("approve-latest must call runner exactly once")
+            if external_commands[latest_external_start:] != [["codex", "exec", "--sandbox", "workspace-write", "-"]]:
+                raise AssertionError("approve-latest used non-workspace-write command")
+            latest_exec_text = (bridge.EXECUTIONS_DIR / f"{latest_manual_exec_id}.md").read_text(encoding="utf-8")
+            assert_contains(latest_exec_text, "write_confirmed: true")
+            assert_contains(latest_exec_text, "runner_sandbox: workspace-write")
+            assert_contains(latest_exec_text, "explicit user write approval via approve-latest")
+            assert_contains((bridge.DISPATCHES_DIR / f"{latest_write_dispatch_id}.md").read_text(encoding="utf-8"), "status: reviewed")
+            assert_contains((bridge.TASKS_DIR / f"{latest_write_task_id}.md").read_text(encoding="utf-8"), "status: archived")
 
             deploy_task_reply, route = bridge.prepare_reply(
                 "/task new Deploy app to production --project auto_exec",
