@@ -6431,6 +6431,8 @@ def exec_records() -> list[dict]:
             "stderr_chars": meta.get("stderr_chars", ""),
             "completion_state": meta.get("completion_state", ""),
             "payload_state": meta.get("payload_state", ""),
+            "run_policy": meta.get("run_policy", ""),
+            "run_policy_reason": meta.get("run_policy_reason", ""),
             "write_confirmed": meta.get("write_confirmed", ""),
             "write_approved_at": meta.get("write_approved_at", ""),
             "dispatch_id": meta.get("dispatch_id", ""),
@@ -6467,6 +6469,45 @@ def latest_exec_for_dispatch(dispatch_id: str) -> dict | None:
 
 
 WRITE_APPROVAL_ELIGIBLE_STATUSES = {"prepared", "needs_manual_start"}
+
+
+@dataclass(frozen=True)
+class RunPolicy:
+    name: str
+    auto_execute_enabled: bool
+    human_confirm_required: bool
+    read_only_gate_label: str
+
+
+RUN_POLICY_MANUAL = RunPolicy(
+    name="manual_confirmation",
+    auto_execute_enabled=False,
+    human_confirm_required=True,
+    read_only_gate_label="not_run",
+)
+RUN_POLICY_READ_ONLY_AUTO = RunPolicy(
+    name="read_only_auto_start",
+    auto_execute_enabled=True,
+    human_confirm_required=False,
+    read_only_gate_label="passed",
+)
+RUN_POLICY_APPROVED_WRITE = RunPolicy(
+    name="approved_workspace_write",
+    auto_execute_enabled=True,
+    human_confirm_required=False,
+    read_only_gate_label="not_required_after_write_approval",
+)
+
+
+def run_policy_for_sandbox(sandbox_mode: str) -> RunPolicy:
+    return RUN_POLICY_APPROVED_WRITE if sandbox_mode == "workspace-write" else RUN_POLICY_READ_ONLY_AUTO
+
+
+def run_policy_fields(policy: RunPolicy, reason: str = "") -> dict[str, str]:
+    return {
+        "run_policy": policy.name,
+        "run_policy_reason": safe_preview(reason, 180),
+    }
 
 
 def resolve_write_approval_target(target_id: str) -> tuple[str, str, bool]:
@@ -6581,6 +6622,16 @@ This package is the execution payload for {display_target}. Atlas/Bridge only pe
 
 def build_runner_payload(exec_id: str, dispatch_id: str, sandbox_mode: str) -> str:
     payload = build_exec_payload(exec_id, dispatch_id)
+    policy = run_policy_for_sandbox(sandbox_mode)
+    payload = sanitize_sensitive_text(f"""{payload}
+
+## Run Policy
+- run_policy: {policy.name}
+- policy_auto_execute_enabled: {str(policy.auto_execute_enabled).lower()}
+- policy_human_confirm_required: {str(policy.human_confirm_required).lower()}
+- runner_sandbox: {sandbox_mode}
+- read_only_gate: {policy.read_only_gate_label}
+""")
     if sandbox_mode != "workspace-write":
         return payload
     return sanitize_sensitive_text(f"""{payload}
@@ -6636,6 +6687,8 @@ copied_at:
 started_at:
 returned_at:
 mode: semi_auto
+run_policy: {RUN_POLICY_MANUAL.name}
+run_policy_reason: prepared for manual copy unless guarded start or explicit write approval succeeds
 human_confirm_required: true
 external_execution_enabled: false
 runtime_injection_enabled: false
@@ -7411,16 +7464,18 @@ def execute_exec_runner(
     sandbox_mode = sandbox_mode if sandbox_mode in RUNNER_SANDBOX_MODES else "read-only"
     now = iso_now()
     write_mode = sandbox_mode == "workspace-write"
+    run_policy = run_policy_for_sandbox(sandbox_mode)
     extra_fields = {
         "started_at": now,
-        "human_confirm_required": "false",
-        "auto_execute_enabled": "true",
+        "human_confirm_required": str(run_policy.human_confirm_required).lower(),
+        "auto_execute_enabled": str(run_policy.auto_execute_enabled).lower(),
         "read_only_auto_run": "false" if write_mode else "true",
         "auto_run_mode": str(probe.get("mode", "unknown")),
         "runner_mode": str(probe.get("mode", "unknown")),
         "runner_sandbox": sandbox_mode,
         "runner_probe": safe_preview(probe.get("reason", ""), 120),
         "completion_state": "started",
+        **run_policy_fields(run_policy, str(probe.get("reason", ""))),
     }
     if write_mode:
         extra_fields.update({"write_confirmed": "true", "write_approved_at": now})
@@ -7441,7 +7496,7 @@ def execute_exec_runner(
     append_exec_autostart_section(
         exec_id,
         "started",
-        f"- mode: {probe.get('mode')}\n- runner_sandbox: {sandbox_mode}\n- read_only_gate: {'not_required_after_write_approval' if write_mode else 'passed'}\n- command_allowlist: true\n- payload_injection: stdin\n- started_at: {now}",
+        f"- mode: {probe.get('mode')}\n- run_policy: {run_policy.name}\n- runner_sandbox: {sandbox_mode}\n- read_only_gate: {run_policy.read_only_gate_label}\n- command_allowlist: true\n- payload_injection: stdin\n- started_at: {now}",
     )
     package = build_runner_payload(exec_id, normalized_dispatch_id, sandbox_mode)
     if probe.get("mode") == "simulated":
@@ -7503,7 +7558,8 @@ def execute_exec_runner(
         return f"""{response_title} {state_label}: {exec_id}
 - status: returned
 - dispatch_id: {normalized_dispatch_id}
-- read_only_gate: {'not_required_after_write_approval' if sandbox_mode == 'workspace-write' else 'passed'}
+- run_policy: {run_policy.name}
+- read_only_gate: {run_policy.read_only_gate_label}
 - runner_sandbox: {sandbox_mode}
 - runner_mode: {probe.get('mode')}
 - returncode: {completion['returncode']}
@@ -7534,6 +7590,7 @@ def execute_exec_runner(
                 "timed_out": completion["timed_out"],
                 "returncode": completion["returncode"],
                 "runner_sandbox": sandbox_mode,
+                **run_policy_fields(run_policy, str(probe.get("reason", ""))),
             },
         )
         record_exec_failure_evidence(exec_id, normalized_dispatch_id, task_id, result, completion, post_run_snapshot)
@@ -7549,6 +7606,7 @@ def execute_exec_runner(
         return f"""{response_title} failed: {exec_id}
 - status: failed
 - dispatch_id: {normalized_dispatch_id}
+- run_policy: {run_policy.name}
 - runner_sandbox: {sandbox_mode}
 - returncode: {completion['returncode']}
 - timed_out: {completion['timed_out']}
@@ -7643,6 +7701,7 @@ Boundary:
 - read-only auto-run only for dispatches with explicit read-only / no-code-change boundaries
 - write or modification tasks degrade to needs_manual_start
 - workspace-write runner requires explicit /exec approve <exec_id|dispatch_id> write
+- execution records expose run_policy: manual_confirmation, read_only_auto_start, or approved_workspace_write
 - dispatch-id approval is the fast path; it reuses a prepared/manual-start exec or creates one when no execution exists yet
 - approve-latest approves only the newest prepared/manual-start Codex execution; it does not bypass write gates
 - human_confirm_required: true for write/modify/deploy tasks
@@ -7668,6 +7727,7 @@ def build_exec_prepare_reply(dispatch_id: str) -> str:
 - dispatch_id: {normalize_dispatch_id(parts[0])}
 - task_id: {meta.get('task_id', '')}
 - target_executor: {meta.get('target_executor', '')}
+- run_policy: {RUN_POLICY_MANUAL.name}
 - human_confirm_required: true
 - external_execution_enabled: false
 - auto_execute_enabled: false
@@ -7690,6 +7750,7 @@ def mark_exec_needs_manual_start(exec_id: str, dispatch_id: str, reason: str) ->
             "runner_mode": "manual",
             "runner_probe": safe_preview(reason, 120),
             "completion_state": "needs_manual_start",
+            **run_policy_fields(RUN_POLICY_MANUAL, reason),
         },
     )
     hint = build_manual_start_hint(exec_id, dispatch_id, reason)
@@ -7714,6 +7775,7 @@ def build_exec_start_reply(dispatch_id: str) -> str:
         return f"""Execution start requires manual confirmation: {exec_id}
 - status: needs_manual_start
 - dispatch_id: {normalized_dispatch_id}
+- run_policy: {RUN_POLICY_MANUAL.name}
 - read_only_gate: failed
 - reason: {safe_preview(reason, 260)}
 - human_confirm_required: true
@@ -7729,6 +7791,7 @@ def build_exec_start_reply(dispatch_id: str) -> str:
         return f"""Execution needs manual start: {exec_id}
 - status: needs_manual_start
 - dispatch_id: {normalized_dispatch_id}
+- run_policy: {RUN_POLICY_MANUAL.name}
 - read_only_gate: passed
 - runner_probe: {safe_preview(probe.get('mode', 'unknown'), 80)}
 - reason: {safe_preview(reason, 260)}
@@ -7774,10 +7837,12 @@ def build_exec_approve_reply(tail: str) -> str:
                 "write_confirmed": "false",
                 "runner_sandbox": "manual",
                 "completion_state": "write_approval_refused",
+                **run_policy_fields(RUN_POLICY_MANUAL, reason),
             },
         )
         return f"""Execution write approval refused: {exec_id}
 - status: needs_manual_start
+- run_policy: {RUN_POLICY_MANUAL.name}
 - reason: {safe_preview(reason, 320)}
 - forbidden_git_write_actions: true
 - deploy_forbidden: true
@@ -7796,11 +7861,13 @@ def build_exec_approve_reply(tail: str) -> str:
                 "runner_sandbox": "workspace-write",
                 "runner_probe": safe_preview(reason, 120),
                 "completion_state": "needs_manual_start",
+                **run_policy_fields(RUN_POLICY_MANUAL, reason),
             },
         )
         hint = build_manual_start_hint(exec_id, dispatch_id, reason)
         return f"""Execution write approval needs manual start: {exec_id}
 - status: needs_manual_start
+- run_policy: {RUN_POLICY_MANUAL.name}
 - runner_sandbox: workspace-write
 - reason: {safe_preview(reason, 260)}
 - created_exec_for_dispatch: {str(created_from_dispatch).lower()}
@@ -7914,6 +7981,7 @@ def build_run_codex_reply(tail: str) -> str:
     exec_meta = task_metadata(read_exec(exec_id)) if record and exec_id != "none" else {}
     read_only_gate = reply_field(start_reply, "read_only_gate") or "not_reported"
     auto_execute_enabled = exec_meta.get("auto_execute_enabled", "false")
+    run_policy = exec_meta.get("run_policy", "") or "none"
     runner_sandbox = exec_meta.get("runner_sandbox", "") or "none"
     runner_mode = exec_meta.get("runner_mode", "") or exec_meta.get("auto_run_mode", "") or "none"
     auto_decision = exec_meta.get("auto_decision", "") or "none"
@@ -7934,6 +8002,7 @@ def build_run_codex_reply(tail: str) -> str:
 - exec_id: {exec_id}
 - project_id: {project_id or 'unassigned'}
 - context_id: {dispatch_meta.get('context_id') or 'none'}
+- run_policy: {run_policy}
 - read_only_gate: {read_only_gate}
 - auto_execute_enabled: {auto_execute_enabled}
 - runner_sandbox: {runner_sandbox}
@@ -8123,7 +8192,9 @@ def build_exec_auto_postprocess_reply(
     write_confirmed = str(exec_meta.get("write_confirmed", "")).lower() == "true"
     authorized_sandbox = sandbox_mode == "read-only" or (sandbox_mode == "workspace-write" and write_confirmed)
     sandbox_label = "approved workspace-write" if sandbox_mode == "workspace-write" else "read-only"
+    expected_policy = run_policy_for_sandbox(sandbox_mode).name
     hard_gates = {
+        "run_policy": exec_meta.get("run_policy") == expected_policy,
         "runner_sandbox": sandbox_mode in RUNNER_SANDBOX_MODES,
         "runner_authorization": authorized_sandbox,
         "write_confirmed": sandbox_mode != "workspace-write" or write_confirmed,
@@ -8147,6 +8218,7 @@ def build_exec_auto_postprocess_reply(
         )
         return f"""Auto postprocess: needs_human_review
 - auto_postprocess_enabled: false
+- run_policy: {exec_meta.get('run_policy', '') or 'none'}
 - auto_decision: needs_human_review
 - auto_closed: false
 - auto_postprocess_reason: {reason}
@@ -8180,6 +8252,7 @@ Next commands:
             )
             return f"""Auto postprocess: needs_human_review
 - auto_postprocess_enabled: true
+- run_policy: {exec_meta.get('run_policy', '') or 'none'}
 - auto_qa_done: {str(qa_done).lower()}
 - auto_evidence_verified: false
 - auto_review_done: false
@@ -8229,6 +8302,7 @@ QA preview:
             )
             return f"""Auto postprocess: needs_human_review
 - auto_postprocess_enabled: true
+- run_policy: {exec_meta.get('run_policy', '') or 'none'}
 - auto_qa_done: {str(qa_done).lower()}
 - auto_evidence_verified: {str(evidence_verified).lower()}
 - auto_review_done: {str(review_done).lower()}
@@ -8273,6 +8347,7 @@ QA preview:
         )
         return f"""Auto postprocess: pass
 - auto_postprocess_enabled: true
+- run_policy: {exec_meta.get('run_policy', '') or 'none'}
 - auto_qa_done: true
 - auto_evidence_verified: {str(evidence_verified).lower()}
 - auto_review_done: true
@@ -8359,6 +8434,8 @@ def build_exec_show_reply(exec_id: str) -> str:
 - started_at: {meta.get('started_at', '') or 'none'}
 - returned_at: {meta.get('returned_at', '') or 'none'}
 - stale: {str(bool(record.get('stale'))).lower()}
+- run_policy: {meta.get('run_policy', '') or 'none'}
+- run_policy_reason: {meta.get('run_policy_reason', '') or 'none'}
 - human_confirm_required: {meta.get('human_confirm_required', 'true')}
 - external_execution_enabled: {meta.get('external_execution_enabled', 'false')}
 - auto_execute_enabled: {meta.get('auto_execute_enabled', 'false')}

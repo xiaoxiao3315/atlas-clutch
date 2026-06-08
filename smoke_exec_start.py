@@ -139,6 +139,7 @@ def main() -> int:
             exec_id = extract_exec_id(started)
             assert_contains(started, "Execution auto-run returned")
             assert_contains(started, "status: returned")
+            assert_contains(started, "run_policy: read_only_auto_start")
             assert_contains(started, "read_only_gate: passed")
             assert_contains(started, "dispatch_receive_synced: true")
             assert_contains(started, "no_git_add_commit_push: true")
@@ -154,6 +155,8 @@ def main() -> int:
             if len(captured_runner_inputs) != 1:
                 raise AssertionError("runner input was not captured exactly once")
             assert_complete_runner_payload(captured_runner_inputs[0], task_id, dispatch_id)
+            assert_contains(captured_runner_inputs[0], "## Run Policy")
+            assert_contains(captured_runner_inputs[0], "run_policy: read_only_auto_start")
             assert_no_sensitive_markers(captured_runner_inputs[0])
 
             exec_file = bridge.EXECUTIONS_DIR / f"{exec_id}.md"
@@ -164,6 +167,7 @@ def main() -> int:
                     raise AssertionError(f"expected record missing: {path}")
                 assert_no_sensitive_markers(path.read_text(encoding="utf-8", errors="replace"))
             assert_contains(exec_file.read_text(encoding="utf-8"), "status: returned")
+            assert_contains(exec_file.read_text(encoding="utf-8"), "run_policy: read_only_auto_start")
             assert_contains(exec_file.read_text(encoding="utf-8"), "read_only_auto_run: true")
             assert_contains(exec_file.read_text(encoding="utf-8"), "completion_state: completed")
             assert_contains(exec_file.read_text(encoding="utf-8"), "returncode: 0")
@@ -195,6 +199,7 @@ def main() -> int:
             assert_contains(run_read, "One command task run:")
             assert_contains(run_read, "command_chain: task -> dispatch -> exec start")
             assert_contains(run_read, "status: returned")
+            assert_contains(run_read, "run_policy: read_only_auto_start")
             assert_contains(run_read, "read_only_gate: passed")
             assert_contains(run_read, "auto_execute_enabled: true")
             assert_contains(run_read, "runner_sandbox: read-only")
@@ -220,12 +225,14 @@ def main() -> int:
             assert route == "local_command"
             source_write_exec_id = extract_exec_id(source_write_manual)
             assert_contains(source_write_manual, "status: needs_manual_start")
+            assert_contains(source_write_manual, "run_policy: manual_confirmation")
             assert_contains(source_write_manual, "read_only_gate: failed")
             assert_contains(source_write_manual, "write intent detected")
             assert_contains(source_write_manual, "modify bridge.py")
             assert_contains(source_write_manual, "update smoke_exec_start.py")
             source_write_exec_text = (bridge.EXECUTIONS_DIR / f"{source_write_exec_id}.md").read_text(encoding="utf-8")
             assert_contains(source_write_exec_text, "status: needs_manual_start")
+            assert_contains(source_write_exec_text, "run_policy: manual_confirmation")
             assert_contains(source_write_exec_text, "auto_execute_enabled: false")
             assert_not_contains(source_write_exec_text, "auto_decision: pass")
             if len(captured_runner_inputs) != source_write_capture_start:
@@ -365,6 +372,8 @@ def main() -> int:
                 if argv != ["codex", "exec", "--sandbox", "workspace-write", "-"]:
                     raise AssertionError(f"write runner used unexpected command: {argv}")
                 assert_contains(input_text, "## Human Write Approval")
+                assert_contains(input_text, "## Run Policy")
+                assert_contains(input_text, "run_policy: approved_workspace_write")
                 assert_contains(input_text, "## Workspace-Write Forbidden Actions")
                 if not any(
                     path in input_text
@@ -413,6 +422,7 @@ def main() -> int:
             assert route == "local_command"
             assert_contains(approved, "workspace-write runner returned")
             assert_contains(approved, "status: returned")
+            assert_contains(approved, "run_policy: approved_workspace_write")
             assert_contains(approved, "runner_sandbox: workspace-write")
             assert_contains(approved, "Auto postprocess: pass")
             assert_contains(approved, "auto_qa_done: true")
@@ -431,6 +441,7 @@ def main() -> int:
             approved_exec_text = (bridge.EXECUTIONS_DIR / f"{manual_exec_id}.md").read_text(encoding="utf-8")
             for needle in (
                 "status: returned",
+                "run_policy: approved_workspace_write",
                 "write_confirmed: true",
                 "runner_sandbox: workspace-write",
                 "## Human Write Approval",
@@ -470,6 +481,7 @@ def main() -> int:
             fast_exec_id = extract_exec_id(fast_approved)
             assert_contains(fast_approved, "workspace-write runner returned")
             assert_contains(fast_approved, "status: returned")
+            assert_contains(fast_approved, "run_policy: approved_workspace_write")
             assert_contains(fast_approved, "runner_sandbox: workspace-write")
             assert_contains(fast_approved, f"approval_target: {fast_write_dispatch_id}")
             assert_contains(fast_approved, f"resolved_exec_id: {fast_exec_id}")
@@ -481,6 +493,7 @@ def main() -> int:
                 raise AssertionError("dispatch-id write approval used non-workspace-write command")
             fast_exec_text = (bridge.EXECUTIONS_DIR / f"{fast_exec_id}.md").read_text(encoding="utf-8")
             assert_contains(fast_exec_text, "write_confirmed: true")
+            assert_contains(fast_exec_text, "run_policy: approved_workspace_write")
             assert_contains(fast_exec_text, "runner_sandbox: workspace-write")
             assert_contains(fast_exec_text, "explicit user write approval via dispatch_id")
             assert_contains((bridge.DISPATCHES_DIR / f"{fast_write_dispatch_id}.md").read_text(encoding="utf-8"), "status: reviewed")
@@ -499,12 +512,14 @@ def main() -> int:
             assert route == "local_command"
             latest_manual_exec_id = extract_exec_id(latest_start)
             assert_contains(latest_start, "status: needs_manual_start")
+            assert_contains(latest_start, "run_policy: manual_confirmation")
             latest_write_capture_start = len(captured_runner_inputs)
             latest_external_start = len(external_commands)
             latest_approved, route = bridge.prepare_reply("/exec approve-latest write", ctx)
             assert route == "local_command"
             assert_contains(latest_approved, "workspace-write runner returned")
             assert_contains(latest_approved, "status: returned")
+            assert_contains(latest_approved, "run_policy: approved_workspace_write")
             assert_contains(latest_approved, "runner_sandbox: workspace-write")
             assert_contains(latest_approved, "One command task run:")
             assert_contains(latest_approved, "approval_target: approve-latest")
@@ -518,6 +533,7 @@ def main() -> int:
                 raise AssertionError("approve-latest used non-workspace-write command")
             latest_exec_text = (bridge.EXECUTIONS_DIR / f"{latest_manual_exec_id}.md").read_text(encoding="utf-8")
             assert_contains(latest_exec_text, "write_confirmed: true")
+            assert_contains(latest_exec_text, "run_policy: approved_workspace_write")
             assert_contains(latest_exec_text, "runner_sandbox: workspace-write")
             assert_contains(latest_exec_text, "explicit user write approval via approve-latest")
             assert_contains((bridge.DISPATCHES_DIR / f"{latest_write_dispatch_id}.md").read_text(encoding="utf-8"), "status: reviewed")
@@ -535,6 +551,7 @@ def main() -> int:
             assert_contains(run_write, "One command task run:")
             assert_contains(run_write, "command_chain: task -> dispatch -> exec start")
             assert_contains(run_write, "status: needs_manual_start")
+            assert_contains(run_write, "run_policy: manual_confirmation")
             assert_contains(run_write, "read_only_gate: failed")
             assert_contains(run_write, "auto_execute_enabled: false")
             assert_contains(run_write, "runner_sandbox: none")
@@ -550,6 +567,7 @@ def main() -> int:
             assert route == "local_command"
             assert_contains(run_write_approved, "workspace-write runner returned")
             assert_contains(run_write_approved, "status: returned")
+            assert_contains(run_write_approved, "run_policy: approved_workspace_write")
             assert_contains(run_write_approved, "runner_sandbox: workspace-write")
             assert_contains(run_write_approved, "approval_target: approve-latest")
             assert_contains(run_write_approved, f"resolved_exec_id: {run_write_exec_id}")
@@ -562,6 +580,7 @@ def main() -> int:
                 raise AssertionError("/run codex write approval used non-workspace-write command")
             run_write_exec_text = (bridge.EXECUTIONS_DIR / f"{run_write_exec_id}.md").read_text(encoding="utf-8")
             assert_contains(run_write_exec_text, "write_confirmed: true")
+            assert_contains(run_write_exec_text, "run_policy: approved_workspace_write")
             assert_contains(run_write_exec_text, "runner_sandbox: workspace-write")
             assert_contains(run_write_exec_text, "explicit user write approval via approve-latest")
             assert_contains((bridge.DISPATCHES_DIR / f"{run_write_dispatch_id}.md").read_text(encoding="utf-8"), "status: reviewed")
