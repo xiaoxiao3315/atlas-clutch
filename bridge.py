@@ -1902,6 +1902,33 @@ def evidence_analysis(task_id: str, text: str | None = None) -> dict:
     }
 
 
+def evidence_closure_state(analysis: dict) -> str:
+    if analysis.get("has_gaps"):
+        return "closed_with_evidence_gap_risk"
+    if analysis.get("recommendation") == "pass" and analysis.get("verified"):
+        return "verified_evidence_ready"
+    return "needs_evidence_review"
+
+
+def evidence_ready_for_auto_close(analysis: dict) -> bool:
+    return evidence_closure_state(analysis) == "verified_evidence_ready"
+
+
+def build_closure_evidence_summary(analysis: dict) -> str:
+    missing = ", ".join(str(item) for item in analysis.get("missing", [])[:5]) or "none"
+    risks = " | ".join(str(item) for item in analysis.get("risks", [])[:3]) or "none"
+    return f"""- evidence_closure_state: {evidence_closure_state(analysis)}
+- evidence_gap_risk: {str(bool(analysis.get('has_gaps'))).lower()}
+- recommendation_at_close: {analysis.get('recommendation', 'needs_evidence')}
+- verified_count: {len(analysis.get('verified', []))}
+- observed_unverified_count: {len(analysis.get('observed', []))}
+- claimed_count: {len(analysis.get('claimed', []))}
+- missing_count: {len(analysis.get('missing', []))}
+- live_skipped: {str(bool(analysis.get('live_skipped'))).lower()}
+- missing: {safe_preview(missing, 240)}
+- risks: {safe_preview(risks, 260)}"""
+
+
 def build_evidence_gaps_text(task_id: str, analysis: dict | None = None) -> str:
     data = analysis or evidence_analysis(task_id)
     claimed_lines = [f"- {item}" for item in data["claimed"]] or ["- 无。"]
@@ -1917,7 +1944,7 @@ def build_evidence_gaps_text(task_id: str, analysis: dict | None = None) -> str:
     if data["live_skipped"]:
         next_step = "补 Octo UI live 验收证据；当前只能写本地通过，live 待补。"
     elif data["observed"] and not data["verified"]:
-        next_step = "人工核对 observed 证据后执行 /evidence mark <task_id> <evidence_id> verified|partial|rejected <说明>。"
+        next_step = "人工核对 observed 证据后执行 /evidence accept <task_id> <evidence_id> <reason>，或 /evidence mark <task_id> <evidence_id> verified|partial|rejected <说明>。"
     elif not data["records"]:
         next_step = "先通过 /evidence add 或 /task report 记录证据。"
     return f"""只有 claimed：
@@ -2441,6 +2468,29 @@ def build_task_report_reply(task_id: str, report: str) -> str:
 
 
 def evidence_markers_present(text: str) -> bool:
+    value = str(text or "")
+    text = value
+    lowered = value.lower()
+    english_markers = (
+        "modified files",
+        "changed files",
+        "commands:",
+        "test results",
+        "key logs",
+        "screenshots",
+        "unverified:",
+        "unresolved risks",
+        "rollback notes",
+        "post-run snapshot",
+        "stdout summary",
+        "request_id",
+        "status: 200",
+        "py_compile",
+        "passed:",
+        "failed:",
+    )
+    if any(marker in lowered for marker in english_markers):
+        return True
     return any(marker in text for marker in ("修改文件", "执行命令", "测试结果", "通过", "日志", "截图", "路径", "输出"))
 
 
@@ -2548,13 +2598,19 @@ def build_task_decide_reply(task_id: str, decision: str, note: str) -> str:
 
 def build_task_close_reply(task_id: str) -> str:
     normalized_task_id = normalize_task_id(task_id)
+    analysis = sync_task_evidence_state(normalized_task_id)
     text = read_task(normalized_task_id)
     status = task_metadata(text).get("status", "unknown")
     if status not in {"passed", "cancelled"}:
         return f"不能关闭：{normalized_task_id} 当前 status={status}。只有 passed/cancelled 可以关闭。"
     now = iso_now()
-    text = append_to_section(text, "Timeline", f"- {now} task archived from status {status}.")
+    closure_summary = build_closure_evidence_summary(analysis)
+    closure_state = evidence_closure_state(analysis)
+    text = append_to_section(text, "Closure Evidence", f"### Close at {now}\n{closure_summary}")
+    text = append_to_section(text, "Timeline", f"- {now} task archived from status {status}; evidence_closure_state={closure_state}.")
     text = update_task_status(text, "archived")
+    text = replace_task_field(text, "evidence_gap_risk", "true" if analysis["has_gaps"] else "false")
+    text = replace_task_field(text, "live_skipped", "true" if analysis["live_skipped"] else "false")
     write_task(normalized_task_id, text)
     log_event("task_archived", task_id=normalized_task_id)
     retro_line = f"- retro：尚未生成，建议发送 /retro create {normalized_task_id}。"
@@ -2564,9 +2620,12 @@ def build_task_close_reply(task_id: str) -> str:
             retro_line = f"- retro：workbench/retros/{normalized_task_id}.md status={retro_meta.get('status', 'unknown')}"
         except Exception:
             retro_line = f"- retro：workbench/retros/{normalized_task_id}.md"
+    closure_warning = "evidence gaps remain; archived does not mean verified completion" if analysis["has_gaps"] else "none"
     return f"""任务已关闭：{normalized_task_id}
 - status：archived
 - 文件保留：workbench/tasks/{normalized_task_id}.md
+- closure_warning: {closure_warning}
+{closure_summary}
 {retro_line}"""
 
 
@@ -2865,6 +2924,7 @@ def build_evidence_help_reply() -> str:
 - /evidence list <task_id>：列出任务证据。
 - /evidence show <task_id> <evidence_id>：显示证据摘要。
 - /evidence mark <task_id> <evidence_id> <verified|partial|rejected> <说明>：人工标记证据可用性。
+- /evidence accept <task_id> <evidence_id> <reason>: accept reviewed observed evidence as verified; no task decision or close effect.
 - /evidence gaps <task_id>：按验收标准和证据链输出缺口。
 - /evidence intake <task_id>：预览自动证据摄取结果，只解析不写入。
 
@@ -2885,7 +2945,7 @@ def build_evidence_add_reply(task_id: str, evidence_type: str, body: str) -> str
 - evidence_gap_risk：{str(analysis['has_gaps']).lower()}
 - live_skipped：{str(analysis['live_skipped']).lower()}
 - 路径：workbench/evidence/{normalized_task_id}.md
-- 下一步：/evidence gaps {normalized_task_id} 或 /evidence mark {normalized_task_id} {evidence_id} verified <说明>"""
+- 下一步：/evidence gaps {normalized_task_id}、/evidence accept {normalized_task_id} {evidence_id} <reason> 或 /evidence mark {normalized_task_id} {evidence_id} verified <说明>"""
 
 
 def build_evidence_intake_reply(task_id: str, body: str) -> str:
@@ -2899,7 +2959,7 @@ def build_evidence_intake_reply(task_id: str, body: str) -> str:
 write_effect: none
 verified_effect: none
 decision_effect: none
-note: observed evidence still requires manual /evidence mark before Atlas review can treat it as verified."""
+note: observed evidence still requires manual /evidence accept or /evidence mark before Atlas review can treat it as verified."""
 
 
 def build_evidence_list_reply(task_id: str) -> str:
@@ -2945,6 +3005,24 @@ def build_evidence_mark_reply(task_id: str, evidence_id: str, status: str, note:
 - evidence_gap_risk：{str(analysis['has_gaps']).lower()}
 - recommendation：{analysis['recommendation']}
 - 下一步：/evidence gaps {normalize_task_id(task_id)} 或 /task review {normalize_task_id(task_id)}"""
+
+
+def build_evidence_accept_reply(task_id: str, evidence_id: str, note: str) -> str:
+    clean_note = sanitize_sensitive_text(note).strip()
+    if not clean_note:
+        raise ValueError("accept reason is required")
+    record = update_evidence_mark(task_id, evidence_id, "verified", f"accepted by user: {clean_note}")
+    analysis = evidence_analysis(task_id)
+    normalized_task_id = normalize_task_id(task_id)
+    return f"""evidence accepted: {record['evidence_id']}
+- task_id: {normalized_task_id}
+- verified: {record.get('verified', 'verified')}
+- evidence_gap_risk: {str(analysis['has_gaps']).lower()}
+- recommendation: {analysis['recommendation']}
+- evidence_closure_state: {evidence_closure_state(analysis)}
+- decision_effect: none
+- auto_close_effect: none
+- next: /evidence gaps {normalized_task_id} or /task review {normalized_task_id}"""
 
 
 def build_evidence_gaps_reply(task_id: str) -> str:
@@ -3000,6 +3078,14 @@ def handle_evidence_command(user_text: str) -> str | None:
                 return "用法：/evidence mark <task_id> <evidence_id> <verified|partial|rejected> <说明>"
             note = mark_parts[5] if len(mark_parts) > 5 else ""
             return build_evidence_mark_reply(mark_parts[2], mark_parts[3], mark_parts[4], note)
+        if subcommand == "accept":
+            accept_parts = first_line.split(maxsplit=4)
+            if len(accept_parts) < 4:
+                return "Usage: /evidence accept <task_id> <evidence_id> <reason>"
+            note = accept_parts[4] if len(accept_parts) > 4 else "\n".join(lines[1:]).strip()
+            if not note.strip():
+                return "Usage: /evidence accept <task_id> <evidence_id> <reason>"
+            return build_evidence_accept_reply(accept_parts[2], accept_parts[3], note)
         if subcommand == "gaps":
             if len(parts) < 3:
                 return "用法：/evidence gaps <task_id>"
@@ -6205,7 +6291,7 @@ Recommended decision: needs_evidence"""
         qa_text = build_task_qa_reply(task_id)
         conclusion = dispatch_qa_conclusion(qa_text)
         status = "qa_ready" if conclusion == "pass" else "needs_evidence"
-        qa_text = f"dispatch_id: {normalized_dispatch_id}\n{qa_text}\n\nDispatch QA note:\n- observed evidence is not verified automatically.\n- Recommended: /evidence mark <task_id> <evidence_id> verified, then /task review {task_id}."
+        qa_text = f"dispatch_id: {normalized_dispatch_id}\n{qa_text}\n\nDispatch QA note:\n- observed evidence is not verified automatically.\n- Recommended: /evidence accept <task_id> <evidence_id> <reason> or /evidence mark <task_id> <evidence_id> verified, then /task review {task_id}."
     now = iso_now()
     text = read_dispatch(normalized_dispatch_id)
     text = replace_task_field(text, "status", status)
@@ -6259,8 +6345,13 @@ def build_dispatch_close_reply(dispatch_id: str) -> str:
     task_id = meta.get("task_id", "")
     dispatch_status_value = meta.get("status", "unknown")
     task_status_value = "unknown"
+    closure_summary = "- evidence_closure_state: not_applicable\n- evidence_gap_risk: false"
     if task_id:
         task_status_value = task_status(task_id)
+        try:
+            closure_summary = build_closure_evidence_summary(sync_task_evidence_state(task_id))
+        except Exception:
+            closure_summary = "- evidence_closure_state: unavailable\n- evidence_gap_risk: unknown"
     if dispatch_status_value not in {"cancelled", "failed", "closed"} and task_status_value not in {"passed", "cancelled", "archived"}:
         return (
             f"Cannot close dispatch {normalized_dispatch_id}: dispatch_status={dispatch_status_value}, "
@@ -6271,7 +6362,8 @@ def build_dispatch_close_reply(dispatch_id: str) -> str:
     return f"""Dispatch closed: {normalized_dispatch_id}
 - status: closed
 - task_id: {task_id or 'none'}
-- task_status: {task_status_value}"""
+- task_status: {task_status_value}
+{closure_summary}"""
 
 
 def build_dispatch_terminal_reply(tail: str, status: str) -> str:
@@ -8671,11 +8763,13 @@ QA preview:
         dispatch_review_linked = True
         analysis = evidence_analysis(task_id)
         review_has_no_gaps = not analysis["has_gaps"] and analysis["recommendation"] == "pass"
+        closure_evidence_ready = evidence_ready_for_auto_close(analysis)
         gates = {
             **hard_gates,
             "evidence_intake": evidence_intake_generated,
             "sensitive_risk": sensitive_ok,
             "review_has_no_remaining_gaps": review_has_no_gaps,
+            "closure_evidence_ready": closure_evidence_ready,
         }
         failed = [name for name, ok in gates.items() if not ok]
         if failed:
@@ -8720,9 +8814,42 @@ QA preview:
             "pass",
             f"auto pass: {sandbox_label} exec {normalized_exec_id} completed with verified generated evidence and no remaining review gaps.",
         )
+        post_decision_analysis = sync_task_evidence_state(task_id)
+        if not evidence_ready_for_auto_close(post_decision_analysis):
+            reason = f"post-decision evidence closure gate failed: {evidence_closure_state(post_decision_analysis)}"
+            record_auto_postprocess_state(
+                normalized_exec_id,
+                task_id,
+                normalized_dispatch_id,
+                enabled=True,
+                qa_done=qa_done,
+                evidence_verified=evidence_verified,
+                review_done=review_done,
+                dispatch_review_linked=dispatch_review_linked,
+                decision="needs_human_review",
+                reason=reason,
+            )
+            return f"""Auto postprocess: needs_human_review
+- auto_postprocess_enabled: true
+- run_policy: {exec_meta.get('run_policy', '') or 'none'}
+- auto_qa_done: {str(qa_done).lower()}
+- auto_evidence_verified: {str(evidence_verified).lower()}
+- auto_review_done: {str(review_done).lower()}
+- auto_dispatch_review_linked: {str(dispatch_review_linked).lower()}
+- auto_decision: needs_human_review
+- auto_closed: false
+- auto_postprocess_reason: {reason}
+- evidence_ids: {', '.join(verified_ids) if verified_ids else 'none'}
+{build_closure_evidence_summary(post_decision_analysis)}
+Next commands:
+{auto_postprocess_commands(normalized_exec_id, task_id, normalized_dispatch_id, reason)}
+
+Decision preview:
+{safe_preview(decide_reply, 260)}"""
         close_reply = build_task_close_reply(task_id)
         retro_reply = build_retro_create_reply(task_id)
         retro_created = retro_exists(task_id)
+        final_analysis = evidence_analysis(task_id)
         record_auto_postprocess_state(
             normalized_exec_id,
             task_id,
@@ -8750,6 +8877,7 @@ QA preview:
 - auto_postprocess_reason: all gates passed
 - evidence_ids: {', '.join(verified_ids) if verified_ids else 'none'}
 - task_status: {task_status(task_id)}
+{build_closure_evidence_summary(final_analysis)}
 
 Close loop:
 - dispatch QA done

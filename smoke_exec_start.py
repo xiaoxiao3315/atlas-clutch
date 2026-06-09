@@ -151,6 +151,8 @@ def main() -> int:
             assert_contains(started, "auto_decision: pass")
             assert_contains(started, "auto_closed: true")
             assert_contains(started, "auto_retro_created: true")
+            assert_contains(started, "evidence_closure_state: verified_evidence_ready")
+            assert_contains(started, "evidence_gap_risk: false")
             assert_no_sensitive_markers(started)
             if len(captured_runner_inputs) != 1:
                 raise AssertionError("runner input was not captured exactly once")
@@ -176,6 +178,8 @@ def main() -> int:
             assert_contains(exec_file.read_text(encoding="utf-8"), "auto_closed: true")
             assert_contains(dispatch_file.read_text(encoding="utf-8"), "status: reviewed")
             assert_contains(task_file.read_text(encoding="utf-8"), "status: archived")
+            assert_contains(task_file.read_text(encoding="utf-8"), "## Closure Evidence")
+            assert_contains(task_file.read_text(encoding="utf-8"), "evidence_closure_state: verified_evidence_ready")
             assert_contains(task_file.read_text(encoding="utf-8"), "auto postprocess decision=pass")
             evidence_file = bridge.EVIDENCE_DIR / f"{task_id}.md"
             if not evidence_file.exists():
@@ -1001,6 +1005,7 @@ def main() -> int:
             assert_contains(gap_reply, "status: returned")
             assert_contains(gap_reply, "Auto postprocess: needs_human_review")
             assert_contains(gap_reply, "review_has_no_remaining_gaps")
+            assert_contains(gap_reply, "closure_evidence_ready")
             assert_contains(gap_reply, "auto_decision: needs_human_review")
             assert_contains(gap_reply, f"/task review {gap_task_id}")
             gap_exec_text = (bridge.EXECUTIONS_DIR / f"{gap_exec_id}.md").read_text(encoding="utf-8")

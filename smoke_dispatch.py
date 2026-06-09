@@ -278,6 +278,9 @@ def main() -> int:
             closed_dispatch, route = bridge.prepare_reply(f"/dispatch close {context_dispatch}", ctx)
             assert route == "local_command"
             assert_contains(closed_dispatch, "status: closed")
+            assert_contains(closed_dispatch, "evidence_closure_state: closed_with_evidence_gap_risk")
+            assert_contains(closed_dispatch, "evidence_gap_risk: true")
+            assert_contains(closed_dispatch, "live_skipped: true")
             bridge.prepare_reply(f"/task close {task_id}", ctx)
 
             cancelled, route = bridge.prepare_reply(f"/dispatch cancel {codex_dispatch} duplicate {secret}", ctx)

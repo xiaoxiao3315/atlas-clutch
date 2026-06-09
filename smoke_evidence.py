@@ -113,7 +113,7 @@ def main() -> int:
 
             help_text, route = bridge.prepare_reply("/evidence help", ctx)
             assert route == "local_command"
-            for needle in ("/evidence add", "/evidence list", "/evidence gaps", "report 不是 verified"):
+            for needle in ("/evidence add", "/evidence list", "/evidence accept", "/evidence gaps", "report 不是 verified"):
                 assert_contains(help_text, needle)
 
             project, route = bridge.prepare_reply("/project new kiro-proxy Kiro 反代项目", ctx)
@@ -158,13 +158,19 @@ Authorization: Bearer {secret}
             assert_contains(gaps, "missing")
             assert_contains(gaps, "observed 但未 verified")
 
-            marked, route = bridge.prepare_reply(
-                f"/evidence mark {task_id} {evidence_id} verified 本地 smoke 输出可复核",
+            accepted, route = bridge.prepare_reply(
+                f"/evidence accept {task_id} {evidence_id} local smoke output reviewed by owner",
                 ctx,
             )
             assert route == "local_command"
-            assert_contains(marked, "verified：verified")
+            assert_contains(accepted, "evidence accepted")
+            assert_contains(accepted, "verified: verified")
+            assert_contains(accepted, "decision_effect: none")
+            assert_contains(accepted, "auto_close_effect: none")
             assert_contains(evidence_file.read_text(encoding="utf-8"), "verified: verified")
+            assert_contains(evidence_file.read_text(encoding="utf-8"), "accepted by user")
+            if bridge.task_status(task_id) != "open":
+                raise AssertionError("/evidence accept must not decide the task")
 
             report_body = f"""执行摘要：
 - 本地 smoke 已通过，但 live Octo UI 回归未运行，待补。
@@ -229,6 +235,17 @@ secret: {secret}
             assert route == "local_command"
             assert_contains(dashboard, "evidence_gap_count")
             assert_contains(dashboard, "live_skipped_count")
+
+            closed, route = bridge.prepare_reply(f"/task close {task_id}", ctx)
+            assert route == "local_command"
+            assert_contains(closed, "closure_warning: evidence gaps remain")
+            assert_contains(closed, "evidence_closure_state: closed_with_evidence_gap_risk")
+            assert_contains(closed, "evidence_gap_risk: true")
+            assert_contains(closed, "live_skipped: true")
+            closed_task_text = task_file.read_text(encoding="utf-8")
+            assert_contains(closed_task_text, "## Closure Evidence")
+            assert_contains(closed_task_text, "evidence_closure_state=closed_with_evidence_gap_risk")
+            assert_contains(closed_task_text, "evidence_gap_risk: true")
 
             original_call_hermes = bridge.call_hermes
 
