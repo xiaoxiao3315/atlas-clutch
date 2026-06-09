@@ -6706,6 +6706,11 @@ completion_state: prepared
 payload_state:
 write_confirmed: false
 write_approved_at:
+owner_write_policy: false
+owner_write_policy_status:
+owner_write_policy_reason:
+write_target_fidelity:
+write_target_lines:
 auto_postprocess_enabled: false
 auto_qa_done: false
 auto_evidence_verified: false
@@ -6867,11 +6872,36 @@ WRITE_APPROVAL_FORBIDDEN_PATTERNS = (
     r"å‘å¸ƒ",
 )
 
+WRITE_APPROVAL_SECRET_FORBIDDEN_PATTERNS = (
+    r"\b(?:read|cat|open|print|show|dump|echo|log|paste|return|exfiltrate|leak)\b.{0,100}\b(?:\.env|tokens?|cookies?|authorization\s+headers?|passwords?|api[_\s-]?keys?|secrets?)\b",
+    r"\b(?:\.env|tokens?|cookies?|authorization\s+headers?|passwords?|api[_\s-]?keys?|secrets?)\b.{0,100}\b(?:read|cat|open|print|show|dump|echo|log|paste|return|exfiltrate|leak)\b",
+)
+
+OWNER_WRITE_HARD_DENY_PATTERNS = (
+    r"\blive\s+validation\s+hard[-\s]?deny\b",
+    r"\bhard[-\s]?deny\s+explicit\s+target\b",
+)
+
+OWNER_WRITE_NOOP_PATTERNS = (
+    r"\bno[-\s]?op\b",
+    r"\bnoop\b",
+    r"\bno\s+operation\b",
+)
+
+OWNER_WRITE_REAL_ACTION_PATTERNS = (
+    r"\b(?:create|update|touch|append|add|modify|edit|patch|implement)\b",
+    r"\bwrite\s+(?:implementation|code|files?|changes?|to|into)\b",
+    r"\bsource[-/\s]+write\b",
+)
+
 EXPLICIT_WRITE_TARGET_PATTERNS = (
     r"\b(create|update|write|touch)\b.+\b(workbench|logs|runtime|tmp|templates)[\\/][^\s`'\"<>]+",
     r"\b(create|update|write|touch)\b.+[A-Za-z0-9_.-]+[\\/][^\s`'\"<>]+\.(txt|md|json|py|yaml|yml|toml|cmd|bat|ps1|tsx?|jsx?|css|html)\b",
     r"\b(create|update|write|touch)\b.+\b(file|path)\b.+[^\s`'\"<>]+\.(txt|md|json|py|yaml|yml|toml|cmd|bat|ps1|tsx?|jsx?|css|html)\b",
     r"\b(create\s+or\s+update|create/update|update\s+or\s+create)\b.+[^\s`'\"<>]+[\\/][^\s`'\"<>]+",
+    r"\b(?:target\s+files?|target\s+paths?|write\s+targets?|allowed\s+write\s+paths?)\s*:\s*[^\n]+?\.(txt|md|json|py|yaml|yml|toml|cmd|bat|ps1|tsx?|jsx?|css|html)\b",
+    r"\b(?:append|add)\b.+\bto\s+[^\s`'\"<>]+\.(txt|md|json|py|yaml|yml|toml|cmd|bat|ps1|tsx?|jsx?|css|html)\b",
+    r"\breadme(?:\.md)?\s+only\b",
 )
 
 NEGATIVE_BOUNDARY_MARKERS = (
@@ -6990,19 +7020,127 @@ def read_only_dispatch_gate(dispatch_id: str) -> dict:
     }
 
 
+def line_has_forbidden_write_approval_action(line: str) -> bool:
+    lowered = line.lower()
+    if any(marker in lowered for marker in NEGATIVE_BOUNDARY_MARKERS):
+        return False
+    patterns = WRITE_APPROVAL_FORBIDDEN_PATTERNS + WRITE_APPROVAL_SECRET_FORBIDDEN_PATTERNS
+    return any(re.search(pattern, line, re.IGNORECASE) for pattern in patterns)
+
+
 def write_approval_gate(dispatch_id: str) -> dict:
     dispatch_text, task_text, context_text, package = exec_start_source_bundle(dispatch_id)
     combined = "\n".join([dispatch_text, task_text, context_text, package])
     forbidden_lines = [
         sanitize_sensitive_text(line.strip())
         for line in combined.splitlines()
-        if not any(marker in line.lower() for marker in NEGATIVE_BOUNDARY_MARKERS)
-        and any(re.search(pattern, line, re.IGNORECASE) for pattern in WRITE_APPROVAL_FORBIDDEN_PATTERNS)
+        if line_has_forbidden_write_approval_action(line)
     ][:5]
     return {
         "ok": not forbidden_lines,
         "forbidden_lines": forbidden_lines,
         "reason": "write approval accepted" if not forbidden_lines else "forbidden write/deploy action detected",
+    }
+
+
+def owner_write_target_gate(dispatch_id: str) -> dict:
+    dispatch_text, task_text, _context_text, _package = exec_start_source_bundle(dispatch_id)
+    task_id = task_metadata(dispatch_text).get("task_id", "")
+    combined = "\n".join(
+        [
+            dispatch_title_from_text(normalize_dispatch_id(dispatch_id), dispatch_text),
+            task_title_from_text(task_id, task_text) if task_id else "",
+            task_section(task_text, "Goal"),
+        ]
+    )
+    target_lines = [
+        sanitize_sensitive_text(line.strip())
+        for line in combined.splitlines()
+        if line.strip() and (line_has_source_write_intent(line) or line_has_explicit_write_target(line))
+    ][:5]
+    return {
+        "ok": bool(target_lines),
+        "target_lines": target_lines,
+        "reason": "explicit write target accepted" if target_lines else "missing explicit write target",
+    }
+
+
+def owner_write_scope_lines(dispatch_id: str) -> list[str]:
+    dispatch_text, task_text, _context_text, _package = exec_start_source_bundle(dispatch_id)
+    task_id = task_metadata(dispatch_text).get("task_id", "")
+    return [
+        dispatch_title_from_text(normalize_dispatch_id(dispatch_id), dispatch_text),
+        task_title_from_text(task_id, task_text) if task_id else "",
+        task_section(task_text, "Goal"),
+    ]
+
+
+def line_has_owner_write_hard_deny(line: str) -> bool:
+    lowered = line.lower()
+    if any(marker in lowered for marker in NEGATIVE_BOUNDARY_MARKERS):
+        return False
+    if any(re.search(pattern, line, re.IGNORECASE) for pattern in OWNER_WRITE_HARD_DENY_PATTERNS):
+        return True
+    return any(re.search(pattern, line, re.IGNORECASE) for pattern in WRITE_APPROVAL_SECRET_FORBIDDEN_PATTERNS)
+
+
+def line_has_owner_write_noop(line: str) -> bool:
+    if not any(re.search(pattern, line, re.IGNORECASE) for pattern in OWNER_WRITE_NOOP_PATTERNS):
+        return False
+    if line_has_source_write_intent(line):
+        return False
+    return not any(re.search(pattern, line, re.IGNORECASE) for pattern in OWNER_WRITE_REAL_ACTION_PATTERNS)
+
+
+def owner_write_hard_deny_gate(dispatch_id: str) -> dict:
+    deny_lines = [
+        sanitize_sensitive_text(line.strip())
+        for line in owner_write_scope_lines(dispatch_id)
+        if line.strip() and line_has_owner_write_hard_deny(line)
+    ][:5]
+    return {
+        "ok": not deny_lines,
+        "deny_lines": deny_lines,
+        "reason": "owner write hard-deny accepted" if not deny_lines else "owner write hard-deny request detected",
+    }
+
+
+def owner_write_noop_gate(dispatch_id: str) -> dict:
+    noop_lines = [
+        sanitize_sensitive_text(line.strip())
+        for line in owner_write_scope_lines(dispatch_id)
+        if line.strip() and line_has_owner_write_noop(line)
+    ][:5]
+    return {
+        "ok": not noop_lines,
+        "noop_lines": noop_lines,
+        "reason": "owner write no-op accepted" if not noop_lines else "owner write no-op request detected",
+    }
+
+
+def owner_write_preflight_gate(dispatch_id: str) -> dict:
+    hard_deny_gate = owner_write_hard_deny_gate(dispatch_id)
+    approval_gate = write_approval_gate(dispatch_id)
+    noop_gate = owner_write_noop_gate(dispatch_id)
+    target_gate = owner_write_target_gate(dispatch_id)
+    ok = hard_deny_gate["ok"] and approval_gate["ok"] and noop_gate["ok"] and target_gate["ok"]
+    if not hard_deny_gate["ok"]:
+        reason = hard_deny_gate["reason"]
+    elif not approval_gate["ok"]:
+        reason = approval_gate["reason"]
+    elif not noop_gate["ok"]:
+        reason = noop_gate["reason"]
+    elif not target_gate["ok"]:
+        reason = target_gate["reason"]
+    else:
+        reason = "owner write preflight accepted"
+    return {
+        "ok": ok,
+        "reason": reason,
+        "hard_deny_gate": hard_deny_gate,
+        "approval_gate": approval_gate,
+        "noop_gate": noop_gate,
+        "target_gate": target_gate,
     }
 
 
@@ -7807,6 +7945,41 @@ def build_exec_approve_reply(tail: str) -> str:
     parts = str(tail or "").strip().split(maxsplit=2)
     if len(parts) < 2 or parts[1].lower() != "write":
         return "Usage: /exec approve <exec_id|dispatch_id> write"
+    if re.fullmatch(r"DISPATCH-\d{8}-\d{6}(?:-\d{2})?", parts[0]):
+        dispatch_id = normalize_dispatch_id(parts[0])
+        gate = write_approval_gate(dispatch_id)
+        if not gate["ok"]:
+            reason = f"{gate['reason']}: {safe_preview('; '.join(gate.get('forbidden_lines', [])), 260)}"
+            record = latest_exec_for_dispatch(dispatch_id)
+            exec_id = "none"
+            status = "refused"
+            next_action = f"no execution created; revise the request or use /dispatch package {dispatch_id} for manual handling"
+            if record and record.get("status") in WRITE_APPROVAL_ELIGIBLE_STATUSES:
+                exec_id = normalize_exec_id(record.get("exec_id", ""))
+                status = "needs_manual_start"
+                update_exec_status(
+                    exec_id,
+                    "needs_manual_start",
+                    f"write approval refused before execution: {reason}",
+                    {
+                        "auto_execute_enabled": "false",
+                        "write_confirmed": "false",
+                        "runner_sandbox": "manual",
+                        "completion_state": "write_approval_refused",
+                        **run_policy_fields(RUN_POLICY_MANUAL, reason),
+                    },
+                )
+                next_action = f"/exec package {exec_id}"
+            return f"""Execution write approval refused before execution
+- status: {status}
+- dispatch_id: {dispatch_id}
+- exec_id: {exec_id}
+- run_policy: {RUN_POLICY_MANUAL.name}
+- reason: {safe_preview(reason, 320)}
+- approval_preflight_noop: true
+- forbidden_git_write_actions: true
+- deploy_forbidden: true
+- next: {next_action}"""
     exec_id, dispatch_id, created_from_dispatch = resolve_write_approval_target(parts[0])
     approval_note = parts[2] if len(parts) > 2 else (
         "explicit user write approval via dispatch_id" if parts[0].startswith("DISPATCH-") else "explicit user write approval"
@@ -7920,12 +8093,15 @@ def build_run_help_reply() -> str:
     return """Atlas one-command run
 - /run help
 - /run codex <task title> [--project <project_id>]
+- /run codex-write <task title> [--project <project_id>]
 
 Boundary:
 - creates a local task, creates a Codex dispatch with context, then starts the existing execution flow
 - read-only/no-change tasks may use the guarded read-only Codex runner
 - write/modify/deploy tasks stop at needs_manual_start and require explicit /exec approve <exec_id|dispatch_id> write or /exec approve-latest write
-- does not bypass read-only gate, write approval gate, command allowlist, stdin payload checks, or post-run evidence checks
+- codex-write is the owner write policy path: it is an explicit owner workspace-write approval for targeted write tasks
+- codex-write bypasses read-only start only after owner preflight accepts an explicit safe write target; hard-deny, forbidden, or targetless requests refuse before execution creation
+- accepted codex-write requests still use the write approval gate, command allowlist, stdin payload checks, and post-run evidence checks
 - does not run git add/commit/push/merge, deploy, package managers, shells, or arbitrary commands
 - does not read .env or print tokens/cookies/secrets
 - writes only workbench task/dispatch/context/execution/evidence records"""
@@ -7960,10 +8136,14 @@ def one_command_next_action(record: dict | None, dispatch_id: str) -> str:
     return exec_next_action(record)
 
 
-def build_run_codex_reply(tail: str) -> str:
+def build_run_codex_reply(tail: str, owner_write_policy: bool = False) -> str:
     clean_title, project_id = parse_task_new_tail(tail)
     if not clean_title:
-        return "Usage: /run codex <task title> [--project <project_id>]"
+        return (
+            "Usage: /run codex-write <task title> [--project <project_id>]"
+            if owner_write_policy
+            else "Usage: /run codex <task title> [--project <project_id>]"
+        )
     if project_id and not project_path(project_id).exists():
         return f"""One command task run refused
 - reason: project not found
@@ -7974,29 +8154,124 @@ def build_run_codex_reply(tail: str) -> str:
     if project_id:
         attach_task_to_project(project_id, task_id)
     dispatch_id, dispatch_meta = create_codex_dispatch(task_id, with_context=True)
-    start_reply = build_exec_start_reply(dispatch_id)
+    start_reply = ""
+    approval_reply = ""
+    owner_write_policy_status = "not_requested"
+    owner_write_policy_reason = ""
+    write_target_fidelity = "not_run"
+    write_target_lines = "none"
+    if owner_write_policy:
+        preflight_gate = owner_write_preflight_gate(dispatch_id)
+        approval_gate = preflight_gate["approval_gate"]
+        target_gate = preflight_gate["target_gate"]
+        hard_deny_gate = preflight_gate["hard_deny_gate"]
+        noop_gate = preflight_gate["noop_gate"]
+        write_target_fidelity = "passed" if target_gate["ok"] else "missing"
+        write_target_lines = safe_preview("; ".join(target_gate.get("target_lines", [])), 240) or "none"
+        if not preflight_gate["ok"]:
+            owner_write_policy_status = "no_op" if not noop_gate["ok"] else "refused"
+            reason = f"{preflight_gate['reason']}; owner_write_policy=true; preflight_noop=true; human_confirm_required=true"
+            detail_lines = hard_deny_gate.get("deny_lines") or approval_gate.get("forbidden_lines") or noop_gate.get("noop_lines") or []
+            owner_write_policy_reason = reason
+            stopped_label = "no-op" if owner_write_policy_status == "no_op" else "refused"
+            read_only_gate_label = "owner_write_preflight_noop" if owner_write_policy_status == "no_op" else "owner_write_preflight_refused"
+            next_label = (
+                "no execution created; add a concrete write action or use the manual dispatch package"
+                if owner_write_policy_status == "no_op"
+                else "no execution created; revise the request with a safe explicit target or use the manual dispatch package"
+            )
+            start_reply = f"""Owner write policy {stopped_label} before execution
+- status: {owner_write_policy_status}
+- dispatch_id: {dispatch_id}
+- run_policy: {RUN_POLICY_MANUAL.name}
+- read_only_gate: {read_only_gate_label}
+- owner_write_preflight_noop: true
+- owner_write_hard_deny: {str(not hard_deny_gate['ok']).lower()}
+- owner_write_noop: {str(not noop_gate['ok']).lower()}
+- write_target_fidelity: {write_target_fidelity}
+- write_target_lines: {write_target_lines}
+- reason: {safe_preview(reason, 260)}
+- hard_deny_or_forbidden_lines: {safe_preview('; '.join(detail_lines), 260) or 'none'}
+- human_confirm_required: true
+- auto_execute_enabled: false
+- next: {next_label}"""
+        else:
+            approval_reply = build_exec_approve_reply(f"{dispatch_id} write explicit owner write policy approval")
+            record = latest_exec_for_dispatch(dispatch_id)
+            owner_write_policy_status = record.get("status", "unknown") if record else "unknown"
+            owner_write_policy_reason = "explicit owner write policy approval applied"
+    else:
+        start_reply = build_exec_start_reply(dispatch_id)
     record = latest_exec_for_dispatch(dispatch_id)
     exec_id = record.get("exec_id", "none") if record else "none"
     exec_status = record.get("status", "unknown") if record else "unknown"
+    owner_preflight_stopped = owner_write_policy and owner_write_policy_status in {"refused", "no_op"} and exec_id == "none"
+    if owner_preflight_stopped:
+        exec_status = owner_write_policy_status
+    if owner_write_policy and exec_id != "none":
+        update_exec_fields(
+            exec_id,
+            {
+                "owner_write_policy": "true",
+                "owner_write_policy_status": owner_write_policy_status,
+                "owner_write_policy_reason": owner_write_policy_reason,
+                "write_target_fidelity": write_target_fidelity,
+                "write_target_lines": write_target_lines,
+            },
+        )
     exec_meta = task_metadata(read_exec(exec_id)) if record and exec_id != "none" else {}
-    read_only_gate = reply_field(start_reply, "read_only_gate") or "not_reported"
+    read_only_gate = reply_field(start_reply, "read_only_gate") or ("bypassed_owner_write_policy" if owner_write_policy else "not_reported")
     auto_execute_enabled = exec_meta.get("auto_execute_enabled", "false")
-    run_policy = exec_meta.get("run_policy", "") or "none"
+    run_policy = exec_meta.get("run_policy", "") or (RUN_POLICY_MANUAL.name if owner_preflight_stopped else "none")
+    human_confirm_required = exec_meta.get("human_confirm_required", "true" if owner_preflight_stopped else "false")
     runner_sandbox = exec_meta.get("runner_sandbox", "") or "none"
     runner_mode = exec_meta.get("runner_mode", "") or exec_meta.get("auto_run_mode", "") or "none"
     auto_decision = exec_meta.get("auto_decision", "") or "none"
-    next_action = one_command_next_action(record, dispatch_id)
+    next_action = (
+        "no execution created; revise the request with a safe explicit target or inspect /dispatch show " + dispatch_id
+        if owner_write_policy and owner_write_policy_status == "refused" and exec_id == "none"
+        else "no execution created; add a concrete write action or inspect /dispatch show " + dispatch_id
+        if owner_write_policy and owner_write_policy_status == "no_op" and exec_id == "none"
+        else one_command_next_action(record, dispatch_id)
+    )
     log_event(
         "run_codex",
         task_id=task_id,
         dispatch_id=dispatch_id,
         exec_id=exec_id,
         exec_status=exec_status,
+        owner_write_policy=owner_write_policy,
     )
-    return sanitize_sensitive_text(f"""One command task run:
+    title = "One command owner write run:" if owner_write_policy else "One command task run:"
+    command_chain = (
+        "task -> dispatch -> owner write preflight"
+        if owner_preflight_stopped
+        else "task -> dispatch -> exec approve write" if owner_write_policy else "task -> dispatch -> exec start"
+    )
+    owner_policy_lines = (
+        f"""
+- owner_write_policy: true
+- owner_write_policy_status: {owner_write_policy_status}
+- owner_write_policy_reason: {safe_preview(owner_write_policy_reason, 180) or 'none'}
+- owner_write_preflight_noop: {str(owner_preflight_stopped).lower()}
+- write_target_fidelity: {write_target_fidelity}
+- write_target_lines: {write_target_lines}
+- workspace_write_requires_explicit_owner_command: true"""
+        if owner_write_policy
+        else ""
+    )
+    approval_section = (
+        f"""
+
+Owner write approval summary:
+{safe_preview(approval_reply, 1600)}"""
+        if owner_write_policy and approval_reply
+        else ""
+    )
+    return sanitize_sensitive_text(f"""{title}
 - status: {exec_status}
 - target_executor: codex
-- command_chain: task -> dispatch -> exec start
+- command_chain: {command_chain}
 - task_id: {task_id}
 - dispatch_id: {dispatch_id}
 - exec_id: {exec_id}
@@ -8005,15 +8280,18 @@ def build_run_codex_reply(tail: str) -> str:
 - run_policy: {run_policy}
 - read_only_gate: {read_only_gate}
 - auto_execute_enabled: {auto_execute_enabled}
+- human_confirm_required: {human_confirm_required}
 - runner_sandbox: {runner_sandbox}
 - runner_mode: {runner_mode}
 - auto_decision: {auto_decision}
 - no_git_add_commit_push: true
 - deploy_forbidden: true
+{owner_policy_lines}
 - next: {next_action}
 
 Execution start summary:
-{safe_preview(start_reply, 1600)}""")
+{safe_preview(start_reply, 1600) if start_reply else 'Owner write policy bypassed read-only start and used direct dispatch workspace-write approval.'}
+{approval_section}""")
 
 
 def build_exec_package_reply(exec_id: str) -> str:
@@ -8452,6 +8730,11 @@ def build_exec_show_reply(exec_id: str) -> str:
 - payload_state: {meta.get('payload_state', '') or 'unknown'}
 - write_confirmed: {meta.get('write_confirmed', 'false')}
 - write_approved_at: {meta.get('write_approved_at', '') or 'none'}
+- owner_write_policy: {meta.get('owner_write_policy', 'false')}
+- owner_write_policy_status: {meta.get('owner_write_policy_status', '') or 'none'}
+- owner_write_policy_reason: {meta.get('owner_write_policy_reason', '') or 'none'}
+- write_target_fidelity: {meta.get('write_target_fidelity', '') or 'none'}
+- write_target_lines: {meta.get('write_target_lines', '') or 'none'}
 - auto_postprocess_enabled: {meta.get('auto_postprocess_enabled', 'false')}
 - auto_qa_done: {meta.get('auto_qa_done', 'false')}
 - auto_evidence_verified: {meta.get('auto_evidence_verified', 'false')}
@@ -10887,6 +11170,8 @@ def handle_run_command(user_text: str) -> str | None:
             return build_run_help_reply()
         if subcommand == "codex":
             return build_run_codex_reply(tail)
+        if subcommand in {"codex-write", "codex-owner-write"}:
+            return build_run_codex_reply(tail, owner_write_policy=True)
         return build_run_help_reply()
     except FileNotFoundError as exc:
         return f"run source not found: {safe_preview(str(exc), 180)}"

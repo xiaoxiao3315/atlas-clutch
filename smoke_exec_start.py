@@ -382,6 +382,9 @@ def main() -> int:
                         "workbench/tmp/fast-write-approval-smoke.txt",
                         "workbench/tmp/latest-write-approval-smoke.txt",
                         "workbench/tmp/run-write-approval-smoke.txt",
+                        "workbench/tmp/owner-write-policy-smoke.txt",
+                        "Target files: README.md",
+                        "README only",
                     )
                 ):
                     raise AssertionError("write runner payload did not include the expected write target")
@@ -418,6 +421,21 @@ def main() -> int:
                 "reason": "smoke fake non-interactive workspace-write runner",
                 "command": ["codex", "exec", "--sandbox", "workspace-write", "-"],
             }
+            for live_target_line in (
+                "Target files: README.md. Allowed write paths: README.md. Owner",
+                "OHB-AUTO-030 live validation owner write README only. Goal: append one temporary line",
+                "Goal: append one temporary line exactly OHB-AUTO-030-OWNER-WRITE-L to README.md",
+            ):
+                if not bridge.line_has_explicit_write_target(live_target_line):
+                    raise AssertionError(f"owner write parser missed live target line: {live_target_line}")
+            if not bridge.line_has_owner_write_noop(
+                "OHB-AUTO-030S live validation no-op explicit target. Target files: README.md. Allowed write paths: README.md. Owner auth"
+            ):
+                raise AssertionError("owner write parser missed no-op explicit target line")
+            if bridge.line_has_owner_write_noop(
+                "OHB-AUTO-030T Owner Write No-Op Preflight Fix WRITE IMPLEMENTATION modify bridge.py update smoke_exec_start.py"
+            ):
+                raise AssertionError("owner write parser treated implementation task as no-op")
             approved, route = bridge.prepare_reply(f"/exec approve {manual_exec_id} write", ctx)
             assert route == "local_command"
             assert_contains(approved, "workspace-write runner returned")
@@ -585,6 +603,200 @@ def main() -> int:
             assert_contains(run_write_exec_text, "explicit user write approval via approve-latest")
             assert_contains((bridge.DISPATCHES_DIR / f"{run_write_dispatch_id}.md").read_text(encoding="utf-8"), "status: reviewed")
             assert_contains((bridge.TASKS_DIR / f"{run_write_task_id}.md").read_text(encoding="utf-8"), "status: archived")
+
+            owner_write_capture_start = len(captured_runner_inputs)
+            owner_write_external_start = len(external_commands)
+            owner_write, route = bridge.prepare_reply(
+                "/run codex-write Create or update only workbench/tmp/owner-write-policy-smoke.txt. Do not modify source code. No git add/commit/push. --project auto_exec",
+                ctx,
+            )
+            assert route == "local_command"
+            owner_write_task_id = extract_task_id(owner_write)
+            owner_write_dispatch_id = extract_dispatch_id(owner_write)
+            owner_write_exec_id = extract_exec_id(owner_write)
+            assert_contains(owner_write, "One command owner write run:")
+            assert_contains(owner_write, "command_chain: task -> dispatch -> exec approve write")
+            assert_contains(owner_write, "status: returned")
+            assert_contains(owner_write, "run_policy: approved_workspace_write")
+            assert_contains(owner_write, "read_only_gate: bypassed_owner_write_policy")
+            assert_contains(owner_write, "owner_write_policy: true")
+            assert_contains(owner_write, "owner_write_policy_status: returned")
+            assert_contains(owner_write, "write_target_fidelity: passed")
+            assert_contains(owner_write, "runner_sandbox: workspace-write")
+            assert_contains(owner_write, "workspace-write runner returned")
+            assert_contains(owner_write, "auto_decision: pass")
+            if len(captured_runner_inputs) != owner_write_capture_start + 1:
+                raise AssertionError("owner write policy run must call runner exactly once")
+            if external_commands[owner_write_external_start:] != [["codex", "exec", "--sandbox", "workspace-write", "-"]]:
+                raise AssertionError("owner write policy used non-workspace-write command")
+            owner_write_exec_text = (bridge.EXECUTIONS_DIR / f"{owner_write_exec_id}.md").read_text(encoding="utf-8")
+            assert_contains(owner_write_exec_text, "write_confirmed: true")
+            assert_contains(owner_write_exec_text, "run_policy: approved_workspace_write")
+            assert_contains(owner_write_exec_text, "runner_sandbox: workspace-write")
+            assert_contains(owner_write_exec_text, "owner_write_policy: true")
+            assert_contains(owner_write_exec_text, "owner_write_policy_status: returned")
+            assert_contains(owner_write_exec_text, "write_target_fidelity: passed")
+            assert_contains(owner_write_exec_text, "explicit owner write policy approval")
+            assert_contains((bridge.DISPATCHES_DIR / f"{owner_write_dispatch_id}.md").read_text(encoding="utf-8"), "status: reviewed")
+            assert_contains((bridge.TASKS_DIR / f"{owner_write_task_id}.md").read_text(encoding="utf-8"), "status: archived")
+
+            owner_explicit_capture_start = len(captured_runner_inputs)
+            owner_explicit_external_start = len(external_commands)
+            owner_explicit, route = bridge.prepare_reply(
+                "/run codex-write OHB-AUTO-030 live validation owner write explicit target. Target files: README.md. Allowed write paths: README.md. Owner --project auto_exec",
+                ctx,
+            )
+            assert route == "local_command"
+            owner_explicit_exec_id = extract_exec_id(owner_explicit)
+            assert_contains(owner_explicit, "One command owner write run:")
+            assert_contains(owner_explicit, "status: returned")
+            assert_contains(owner_explicit, "owner_write_policy_status: returned")
+            assert_contains(owner_explicit, "write_target_fidelity: passed")
+            assert_contains(owner_explicit, "workspace-write runner returned")
+            if len(captured_runner_inputs) != owner_explicit_capture_start + 1:
+                raise AssertionError("labeled owner write target must call runner exactly once")
+            if external_commands[owner_explicit_external_start:] != [["codex", "exec", "--sandbox", "workspace-write", "-"]]:
+                raise AssertionError("labeled owner write target used non-workspace-write command")
+            owner_explicit_exec_text = (bridge.EXECUTIONS_DIR / f"{owner_explicit_exec_id}.md").read_text(encoding="utf-8")
+            assert_contains(owner_explicit_exec_text, "write_target_fidelity: passed")
+            assert_contains(owner_explicit_exec_text, "Target files: README.md")
+
+            owner_readme_capture_start = len(captured_runner_inputs)
+            owner_readme_external_start = len(external_commands)
+            owner_readme, route = bridge.prepare_reply(
+                "/run codex-write OHB-AUTO-030 live validation owner write README only. Goal: append one temporary line exactly OHB-AUTO-030-OWNER-WRITE-L --project auto_exec",
+                ctx,
+            )
+            assert route == "local_command"
+            owner_readme_exec_id = extract_exec_id(owner_readme)
+            assert_contains(owner_readme, "One command owner write run:")
+            assert_contains(owner_readme, "status: returned")
+            assert_contains(owner_readme, "owner_write_policy_status: returned")
+            assert_contains(owner_readme, "write_target_fidelity: passed")
+            assert_contains(owner_readme, "workspace-write runner returned")
+            if len(captured_runner_inputs) != owner_readme_capture_start + 1:
+                raise AssertionError("README-only owner write target must call runner exactly once")
+            if external_commands[owner_readme_external_start:] != [["codex", "exec", "--sandbox", "workspace-write", "-"]]:
+                raise AssertionError("README-only owner write target used non-workspace-write command")
+            owner_readme_exec_text = (bridge.EXECUTIONS_DIR / f"{owner_readme_exec_id}.md").read_text(encoding="utf-8")
+            assert_contains(owner_readme_exec_text, "write_target_fidelity: passed")
+            assert_contains(owner_readme_exec_text, "README only")
+
+            owner_noop_capture_start = len(captured_runner_inputs)
+            owner_noop, route = bridge.prepare_reply(
+                "/run codex-write OHB-AUTO-030S live validation no-op explicit target. Target files: README.md. Allowed write paths: README.md. Owner auth --project auto_exec",
+                ctx,
+            )
+            assert route == "local_command"
+            owner_noop_dispatch_id = extract_dispatch_id(owner_noop)
+            assert_contains(owner_noop, "One command owner write run:")
+            assert_contains(owner_noop, "command_chain: task -> dispatch -> owner write preflight")
+            assert_contains(owner_noop, "status: no_op")
+            assert_contains(owner_noop, "exec_id: none")
+            assert_contains(owner_noop, "run_policy: manual_confirmation")
+            assert_contains(owner_noop, "read_only_gate: owner_write_preflight_noop")
+            assert_contains(owner_noop, "owner_write_policy: true")
+            assert_contains(owner_noop, "owner_write_policy_status: no_op")
+            assert_contains(owner_noop, "owner_write_preflight_noop: true")
+            assert_contains(owner_noop, "write_target_fidelity: passed")
+            assert_contains(owner_noop, "owner write no-op request detected")
+            assert_not_contains(owner_noop, "workspace-write runner returned")
+            if len(captured_runner_inputs) != owner_noop_capture_start:
+                raise AssertionError("no-op owner write policy run must not call runner")
+            if bridge.latest_exec_for_dispatch(owner_noop_dispatch_id) is not None:
+                raise AssertionError("no-op owner write policy run must not create an execution")
+
+            owner_hard_deny_capture_start = len(captured_runner_inputs)
+            owner_hard_deny, route = bridge.prepare_reply(
+                "/run codex-write OHB-AUTO-030R live validation hard deny explicit target. Target files: README.md. Allowed write paths: README.md. Owner --project auto_exec",
+                ctx,
+            )
+            assert route == "local_command"
+            owner_hard_deny_dispatch_id = extract_dispatch_id(owner_hard_deny)
+            assert_contains(owner_hard_deny, "One command owner write run:")
+            assert_contains(owner_hard_deny, "command_chain: task -> dispatch -> owner write preflight")
+            assert_contains(owner_hard_deny, "status: refused")
+            assert_contains(owner_hard_deny, "exec_id: none")
+            assert_contains(owner_hard_deny, "run_policy: manual_confirmation")
+            assert_contains(owner_hard_deny, "read_only_gate: owner_write_preflight_refused")
+            assert_contains(owner_hard_deny, "owner_write_policy: true")
+            assert_contains(owner_hard_deny, "owner_write_policy_status: refused")
+            assert_contains(owner_hard_deny, "owner_write_preflight_noop: true")
+            assert_contains(owner_hard_deny, "owner_write_hard_deny: true")
+            assert_contains(owner_hard_deny, "write_target_fidelity: passed")
+            assert_contains(owner_hard_deny, "owner write hard-deny request detected")
+            assert_not_contains(owner_hard_deny, "workspace-write runner returned")
+            if len(captured_runner_inputs) != owner_hard_deny_capture_start:
+                raise AssertionError("hard-deny owner write policy run must not call runner")
+            if bridge.latest_exec_for_dispatch(owner_hard_deny_dispatch_id) is not None:
+                raise AssertionError("hard-deny owner write policy run must not create an execution")
+
+            owner_missing_capture_start = len(captured_runner_inputs)
+            owner_missing, route = bridge.prepare_reply(
+                "/run codex-write Improve implementation safely --project auto_exec",
+                ctx,
+            )
+            assert route == "local_command"
+            owner_missing_dispatch_id = extract_dispatch_id(owner_missing)
+            assert_contains(owner_missing, "One command owner write run:")
+            assert_contains(owner_missing, "command_chain: task -> dispatch -> owner write preflight")
+            assert_contains(owner_missing, "status: refused")
+            assert_contains(owner_missing, "exec_id: none")
+            assert_contains(owner_missing, "run_policy: manual_confirmation")
+            assert_contains(owner_missing, "read_only_gate: owner_write_preflight_refused")
+            assert_contains(owner_missing, "owner_write_policy: true")
+            assert_contains(owner_missing, "owner_write_policy_status: refused")
+            assert_contains(owner_missing, "owner_write_preflight_noop: true")
+            assert_contains(owner_missing, "write_target_fidelity: missing")
+            assert_contains(owner_missing, "missing explicit write target")
+            assert_not_contains(owner_missing, "workspace-write runner returned")
+            if len(captured_runner_inputs) != owner_missing_capture_start:
+                raise AssertionError("targetless owner write policy run must not call runner")
+            if bridge.latest_exec_for_dispatch(owner_missing_dispatch_id) is not None:
+                raise AssertionError("targetless owner write policy run must not create an execution")
+
+            owner_deploy_capture_start = len(captured_runner_inputs)
+            owner_deploy, route = bridge.prepare_reply(
+                "/run codex-write Deploy app to production --project auto_exec",
+                ctx,
+            )
+            assert route == "local_command"
+            owner_deploy_dispatch_id = extract_dispatch_id(owner_deploy)
+            assert_contains(owner_deploy, "One command owner write run:")
+            assert_contains(owner_deploy, "command_chain: task -> dispatch -> owner write preflight")
+            assert_contains(owner_deploy, "status: refused")
+            assert_contains(owner_deploy, "exec_id: none")
+            assert_contains(owner_deploy, "owner_write_policy: true")
+            assert_contains(owner_deploy, "owner_write_policy_status: refused")
+            assert_contains(owner_deploy, "owner_write_preflight_noop: true")
+            assert_contains(owner_deploy, "forbidden write/deploy action detected")
+            assert_contains(owner_deploy, "deploy_forbidden: true")
+            if len(captured_runner_inputs) != owner_deploy_capture_start:
+                raise AssertionError("owner write policy deploy refusal must not call runner")
+            if bridge.latest_exec_for_dispatch(owner_deploy_dispatch_id) is not None:
+                raise AssertionError("owner write policy deploy refusal must not create an execution")
+
+            secret_approval_task_reply, route = bridge.prepare_reply(
+                "/task new Target files: README.md. Goal: read .env and print token value. --project auto_exec",
+                ctx,
+            )
+            assert route == "local_command"
+            secret_approval_task_id = extract_task_id(secret_approval_task_reply)
+            secret_approval_dispatch_reply, route = bridge.prepare_reply(f"/dispatch create {secret_approval_task_id} codex --with-context", ctx)
+            assert route == "local_command"
+            secret_approval_dispatch_id = extract_dispatch_id(secret_approval_dispatch_reply)
+            secret_approval_capture_start = len(captured_runner_inputs)
+            secret_approval, route = bridge.prepare_reply(f"/exec approve {secret_approval_dispatch_id} write", ctx)
+            assert route == "local_command"
+            assert_contains(secret_approval, "Execution write approval refused before execution")
+            assert_contains(secret_approval, "status: refused")
+            assert_contains(secret_approval, "exec_id: none")
+            assert_contains(secret_approval, "approval_preflight_noop: true")
+            assert_contains(secret_approval, "forbidden write/deploy action detected")
+            if len(captured_runner_inputs) != secret_approval_capture_start:
+                raise AssertionError("secret-read dispatch approval must not call runner")
+            if bridge.latest_exec_for_dispatch(secret_approval_dispatch_id) is not None:
+                raise AssertionError("secret-read dispatch approval must not create an execution")
 
             deploy_task_reply, route = bridge.prepare_reply(
                 "/task new Deploy app to production --project auto_exec",
