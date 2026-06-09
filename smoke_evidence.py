@@ -115,6 +115,7 @@ def main() -> int:
             assert route == "local_command"
             for needle in ("/evidence add", "/evidence list", "/evidence accept", "/evidence gaps", "report 不是 verified"):
                 assert_contains(help_text, needle)
+            assert_contains(help_text, "/task accept-evidence")
 
             project, route = bridge.prepare_reply("/project new kiro-proxy Kiro 反代项目", ctx)
             assert route == "local_command"
@@ -205,6 +206,55 @@ secret: {secret}
             auto_evidence_id = extract_evidence_id(reported)
             assert_contains(evidence_file.read_text(encoding="utf-8"), auto_evidence_id)
             assert_not_contains(evidence_file.read_text(encoding="utf-8"), "bf_")
+
+            extra_added, route = bridge.prepare_reply(
+                f"/evidence add {task_id} log\nrequest_id=batch-accept status=ok\ncommand: python smoke_evidence.py",
+                ctx,
+            )
+            assert route == "local_command"
+            extra_evidence_id = extract_evidence_id(extra_added)
+            extra_added_2, route = bridge.prepare_reply(
+                f"/evidence add {task_id} command\nCommands:\n- python -m py_compile bridge.py\nTest results:\n- passed: py_compile",
+                ctx,
+            )
+            assert route == "local_command"
+            extra_evidence_id_2 = extract_evidence_id(extra_added_2)
+            claimed_added, route = bridge.prepare_reply(f"/evidence add {task_id} report\nDone", ctx)
+            assert route == "local_command"
+            claimed_evidence_id = extract_evidence_id(claimed_added)
+            before_batch_status = bridge.task_status(task_id)
+            if before_batch_status != "reported":
+                raise AssertionError("/task report should leave task status reported before batch accept")
+            batch_accepted, route = bridge.prepare_reply(
+                f"/task accept-evidence {task_id} owner reviewed all observable records",
+                ctx,
+            )
+            assert route == "local_command"
+            for needle in (
+                "task evidence accepted",
+                "accepted_count: 2",
+                "skipped_count: 3",
+                auto_evidence_id,
+                extra_evidence_id,
+                extra_evidence_id_2,
+                "already_verified",
+                "sensitive_risk",
+                "supports_acceptance=claimed",
+                "decision_effect: none",
+                "auto_close_effect: none",
+                "status_before: reported",
+                "status_after: reported",
+            ):
+                assert_contains(batch_accepted, needle)
+            if bridge.task_status(task_id) != before_batch_status:
+                raise AssertionError("/task accept-evidence must not decide the task")
+            evidence_text_after_batch = evidence_file.read_text(encoding="utf-8")
+            assert_contains(evidence_text_after_batch, "batch accepted by user")
+            assert_contains(evidence_text_after_batch, claimed_evidence_id)
+            claimed_shown, route = bridge.prepare_reply(f"/evidence show {task_id} {claimed_evidence_id}", ctx)
+            assert route == "local_command"
+            assert_contains(claimed_shown, "supports_acceptance")
+            assert_contains(claimed_shown, "claimed")
 
             qa, route = bridge.prepare_reply(f"/task qa {task_id}", ctx)
             assert route == "local_command"

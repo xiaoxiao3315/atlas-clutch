@@ -2269,6 +2269,7 @@ def build_task_help_reply() -> str:
 - /task qa <task_id>: check minimum report evidence; does not replace Atlas review.
 - /task review <task_id>: generate Atlas review.
 - /task next <task_id>: recommend the next manual step.
+- /task accept-evidence <task_id> <reason>: batch accept all unverified observed evidence; no decision or close effect.
 - /task decide <task_id> <pass|needs_evidence|blocked|cancelled> <note>: record user decision.
 - /task close <task_id>: close only after passed/cancelled.
 - /evidence add/list/show/mark/gaps: maintain evidence chain.
@@ -2594,6 +2595,82 @@ def build_task_decide_reply(task_id: str, decision: str, note: str) -> str:
 - status：{status}
 {warning}
 - 下一步：{('/task close ' + normalized_task_id) if status in {'passed', 'cancelled'} else '按决策补证据、处理阻塞或暂停'}"""
+
+
+def evidence_record_has_sensitive_risk(record: dict) -> bool:
+    text = "\n".join(
+        str(record.get(key, ""))
+        for key in ("claim", "observed", "risk", "notes")
+    )
+    lowered = text.lower()
+    if "sensitive_risk: true" in lowered or "sensitive_riskï¼štrue" in lowered:
+        return True
+    return bool(analyze_evidence_intake(text).get("sensitive_risk"))
+
+
+def batch_accept_skip_reason(record: dict) -> str:
+    support = str(record.get("supports_acceptance", "")).strip().lower()
+    verified = str(record.get("verified", "no")).strip().lower()
+    if support != "observed":
+        return f"supports_acceptance={support or 'missing'}"
+    if verified in {"verified", "yes"}:
+        return "already_verified"
+    if verified in {"partial", "rejected"}:
+        return f"marked_{verified}"
+    if verified not in {"", "no", "false"}:
+        return f"verified={verified}"
+    if evidence_record_has_sensitive_risk(record):
+        return "sensitive_risk"
+    return ""
+
+
+def build_task_accept_evidence_reply(task_id: str, note: str) -> str:
+    normalized_task_id = normalize_task_id(task_id)
+    clean_note = sanitize_sensitive_text(note).strip()
+    if not clean_note:
+        raise ValueError("accept reason is required")
+    read_task(normalized_task_id)
+    before_status = task_status(normalized_task_id)
+    records = evidence_records(normalized_task_id)
+    accepted_ids = []
+    skipped = []
+    for record in records:
+        reason = batch_accept_skip_reason(record)
+        if reason:
+            skipped.append((record.get("evidence_id", "unknown"), reason))
+            continue
+        updated = update_evidence_mark(
+            normalized_task_id,
+            record["evidence_id"],
+            "verified",
+            f"batch accepted by user: {clean_note}",
+        )
+        accepted_ids.append(updated["evidence_id"])
+    analysis = evidence_analysis(normalized_task_id)
+    after_status = task_status(normalized_task_id)
+    accepted_lines = [f"- {evidence_id}" for evidence_id in accepted_ids] or ["- none"]
+    skipped_lines = [f"- {evidence_id}: {reason}" for evidence_id, reason in skipped[:20]] or ["- none"]
+    log_event(
+        "task_evidence_batch_accepted",
+        task_id=normalized_task_id,
+        accepted_count=len(accepted_ids),
+        skipped_count=len(skipped),
+    )
+    return f"""task evidence accepted: {normalized_task_id}
+- accepted_count: {len(accepted_ids)}
+- skipped_count: {len(skipped)}
+- accepted_ids:
+{chr(10).join(accepted_lines)}
+- skipped:
+{chr(10).join(skipped_lines)}
+- evidence_gap_risk: {str(analysis['has_gaps']).lower()}
+- recommendation: {analysis['recommendation']}
+- evidence_closure_state: {evidence_closure_state(analysis)}
+- status_before: {before_status}
+- status_after: {after_status}
+- decision_effect: none
+- auto_close_effect: none
+- next: /evidence gaps {normalized_task_id} or /task review {normalized_task_id}"""
 
 
 def build_task_close_reply(task_id: str) -> str:
@@ -2925,6 +3002,7 @@ def build_evidence_help_reply() -> str:
 - /evidence show <task_id> <evidence_id>：显示证据摘要。
 - /evidence mark <task_id> <evidence_id> <verified|partial|rejected> <说明>：人工标记证据可用性。
 - /evidence accept <task_id> <evidence_id> <reason>: accept reviewed observed evidence as verified; no task decision or close effect.
+- /task accept-evidence <task_id> <reason>: batch accept all unverified observed evidence; skips claimed/partial/rejected/sensitive-risk evidence.
 - /evidence gaps <task_id>：按验收标准和证据链输出缺口。
 - /evidence intake <task_id>：预览自动证据摄取结果，只解析不写入。
 
@@ -6291,7 +6369,7 @@ Recommended decision: needs_evidence"""
         qa_text = build_task_qa_reply(task_id)
         conclusion = dispatch_qa_conclusion(qa_text)
         status = "qa_ready" if conclusion == "pass" else "needs_evidence"
-        qa_text = f"dispatch_id: {normalized_dispatch_id}\n{qa_text}\n\nDispatch QA note:\n- observed evidence is not verified automatically.\n- Recommended: /evidence accept <task_id> <evidence_id> <reason> or /evidence mark <task_id> <evidence_id> verified, then /task review {task_id}."
+        qa_text = f"dispatch_id: {normalized_dispatch_id}\n{qa_text}\n\nDispatch QA note:\n- observed evidence is not verified automatically.\n- Recommended: /task accept-evidence <task_id> <reason>, /evidence accept <task_id> <evidence_id> <reason>, or /evidence mark <task_id> <evidence_id> verified, then /task review {task_id}."
     now = iso_now()
     text = read_dispatch(normalized_dispatch_id)
     text = replace_task_field(text, "status", status)
@@ -11010,6 +11088,14 @@ def handle_task_command(user_text: str) -> str | None:
             return build_task_review_reply(tail)
         if subcommand == "next":
             return build_task_next_reply(tail)
+        if subcommand == "accept-evidence":
+            accept_parts = tail.split(maxsplit=1)
+            if not accept_parts:
+                return "Usage: /task accept-evidence <task_id> <reason>"
+            note = accept_parts[1] if len(accept_parts) > 1 else "\n".join(lines[1:]).strip()
+            if not note.strip():
+                return "Usage: /task accept-evidence <task_id> <reason>"
+            return build_task_accept_evidence_reply(accept_parts[0], note)
         if subcommand == "decide":
             decision_parts = tail.split(maxsplit=2)
             if len(decision_parts) < 2:
