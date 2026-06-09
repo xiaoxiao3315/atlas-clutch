@@ -62,6 +62,7 @@ STARTED_AT = time.time()
 STARTED_AT_TEXT = datetime.now().astimezone().isoformat(timespec="seconds")
 OPEN_TASK_STATUSES = {"draft", "open", "reported", "reviewed", "needs_evidence"}
 DECISION_STATUSES = {"pass", "needs_evidence", "blocked", "cancelled"}
+TERMINAL_TASK_STATUSES = {"archived", "passed", "cancelled", "closed"}
 EVIDENCE_TYPES = {
     "file",
     "command",
@@ -2543,6 +2544,15 @@ def build_atlas_review_for_task(task_id: str, text: str) -> str:
 
 def build_task_review_reply(task_id: str) -> str:
     normalized_task_id = normalize_task_id(task_id)
+    text = read_task(normalized_task_id)
+    status = task_metadata(text).get("status", "unknown")
+    if status in TERMINAL_TASK_STATUSES:
+        return f"""Atlas review no-op: {normalized_task_id}
+- status: {status}
+- already_terminal: true
+- ledger_write: none
+- reason: terminal task status; not reopening review
+- review_preview: {safe_preview(task_section(text, 'Atlas Review'), 420) or 'none'}"""
     sync_task_evidence_state(normalized_task_id)
     text = read_task(normalized_task_id)
     review = build_atlas_review_for_task(normalized_task_id, text)
@@ -3461,6 +3471,13 @@ def build_retro_approve_reply(task_id: str, note: str) -> str:
     normalized_task_id = normalize_task_id(task_id)
     text = read_retro(normalized_task_id)
     meta = task_metadata(text)
+    if meta.get("status") == "approved":
+        return f"""复盘已确认：{normalized_task_id}
+- status：approved
+- already_approved: true
+- ledger_write: none
+- project_lessons：no-op，已 approved，不重复追加。
+- 边界：未写 Memory，未写 SkillRepo，未修改 Hermes。"""
     text = append_to_section(text, "Timeline", f"- {iso_now()} retro approved. note={sanitize_sensitive_text(note).strip() or '未填写说明。'}")
     text = replace_retro_status(text, "approved")
     write_retro(normalized_task_id, text)
@@ -11489,6 +11506,150 @@ def build_template_help_reply() -> str:
 - /template review：审查清单模板"""
 
 
+
+def build_auto_pipeline_closure_reply(run_reply: str, source_command: str = "/auto") -> str:
+    """Best-effort auto closure for /auto runs. Does not execute shell commands."""
+    reply_text = sanitize_sensitive_text(str(run_reply or ""))
+    task_id = reply_field(reply_text, "task_id")
+    dispatch_id = reply_field(reply_text, "dispatch_id")
+    exec_id = reply_field(reply_text, "exec_id")
+
+    def _block(
+        status: str,
+        reason: str,
+        final_task_status: str = "unknown",
+        retro_status: str = "not_run",
+        sync_task: bool = True,
+    ) -> str:
+        try:
+            analysis = (sync_task_evidence_state(task_id) if sync_task else evidence_analysis(task_id)) if task_id else {}
+            gap_risk = str(bool(analysis.get("has_gaps"))).lower() if analysis else "unknown"
+            closure_state = evidence_closure_state(analysis) if analysis else "unknown"
+        except Exception:
+            gap_risk = "unknown"
+            closure_state = "unknown"
+        no_op_lines = "\n- ledger_write: none\n- duplicate_closure_skipped: true" if status == "already_closed" else ""
+        return sanitize_sensitive_text(f"""{reply_text}
+
+Auto Pipeline Closure:
+- auto_pipeline_enabled: true
+- auto_pipeline_status: {status}
+- task_id: {task_id or 'none'}
+- dispatch_id: {dispatch_id or 'none'}
+- exec_id: {exec_id or 'none'}
+- final_task_status: {final_task_status}
+- retro_status: {retro_status}
+- evidence_gap_risk: {gap_risk}
+- evidence_closure_state: {closure_state}
+- stop_reason: {safe_preview(reason, 240)}
+{no_op_lines}
+""")
+
+    def _retro_status_for_task() -> str:
+        if not task_id or not retro_exists(task_id):
+            return "not_run"
+        try:
+            return task_metadata(read_retro(task_id)).get("status", "exists")
+        except Exception:
+            return "exists"
+
+    if not task_id or not dispatch_id or not exec_id or exec_id == "none":
+        return _block("needs_human_review", "missing task/dispatch/exec id; cannot auto-close")
+
+    try:
+        exec_meta = task_metadata(read_exec(exec_id))
+    except Exception as exc:
+        return _block("needs_human_review", f"cannot read exec metadata: {exc}")
+
+    try:
+        task_text = read_task(task_id)
+        current_task_status = task_metadata(task_text).get("status", "unknown")
+    except Exception as exc:
+        return _block("needs_human_review", f"cannot read task metadata: {exc}")
+
+    exec_auto_closed = str(exec_meta.get("auto_closed", "")).lower() == "true"
+    task_has_closure = bool(task_section(task_text, "Closure Evidence").strip())
+    task_has_decision = task_has_user_decision(task_text)
+    if current_task_status in TERMINAL_TASK_STATUSES and (exec_auto_closed or task_has_closure or task_has_decision):
+        indicators = []
+        if exec_auto_closed:
+            indicators.append("exec_auto_closed")
+        if task_has_closure:
+            indicators.append("closure_evidence")
+        if task_has_decision:
+            indicators.append("user_decision")
+        return _block(
+            "already_closed",
+            f"terminal task already has closure marker ({', '.join(indicators)}); no duplicate review/decide/close/retro ledger writes",
+            final_task_status=current_task_status,
+            retro_status=_retro_status_for_task(),
+            sync_task=False,
+        )
+
+    owner_write = str(exec_meta.get("owner_write_policy", "")).lower() == "true"
+    owner_status = str(exec_meta.get("owner_write_policy_status", "")).lower()
+
+    gates = [
+        ("exec_status", exec_meta.get("status") == "returned"),
+        ("returncode", str(exec_meta.get("returncode", "")) == "0"),
+        ("timed_out", str(exec_meta.get("timed_out", "")).lower() == "false"),
+        ("completion_state", exec_meta.get("completion_state") == "completed"),
+        ("payload_state", exec_meta.get("payload_state", "payload_seen") in {"payload_seen", ""}),
+    ]
+    if owner_write:
+        gates.extend([
+            ("owner_write_policy_status", owner_status == "returned"),
+            ("write_target_fidelity", exec_meta.get("write_target_fidelity") == "passed"),
+        ])
+
+    failed = [name for name, ok in gates if not ok]
+    if failed:
+        return _block("needs_human_review", "gate failed: " + ", ".join(failed))
+
+    try:
+        accept_reply = build_task_accept_evidence_reply(
+            task_id,
+            f"auto pipeline accepted eligible observed evidence after {source_command}",
+        )
+        review_reply = build_task_review_reply(task_id)
+        link_reply = build_dispatch_link_review_reply(dispatch_id)
+        review_reply = build_task_review_reply(task_id)
+
+        review_ready = (
+            "remaining_gaps: none" in review_reply
+            and ("?????pass" in review_reply or "recommendation: ready_for_review" in review_reply or "recommendation: pass" in review_reply)
+        )
+        if not review_ready:
+            return _block("needs_human_review", "review still has remaining gaps after evidence acceptance")
+
+        task_status = task_metadata(read_task(task_id)).get("status", "")
+        if task_status not in {"passed", "archived"}:
+            build_task_decide_reply(task_id, "pass", f"auto pipeline pass after {source_command}")
+            task_status = task_metadata(read_task(task_id)).get("status", "")
+
+        if task_status != "archived":
+            build_task_close_reply(task_id)
+            task_status = task_metadata(read_task(task_id)).get("status", "")
+
+        retro_status = "not_run"
+        try:
+            build_retro_create_reply(task_id)
+            retro_reply = build_retro_approve_reply(task_id, f"auto pipeline retro approved after {source_command}")
+            retro_status = "approved" if "approved" in retro_reply.lower() or "?????" in retro_reply else "created"
+        except Exception as exc:
+            retro_status = "needs_human_review"
+            return _block("needs_human_review", f"retro closure failed: {exc}", final_task_status=task_status, retro_status=retro_status)
+
+        return _block("pass", "all gates passed", final_task_status=task_status, retro_status=retro_status)
+    except Exception as exc:
+        try:
+            task_status = task_metadata(read_task(task_id)).get("status", "unknown")
+        except Exception:
+            task_status = "unknown"
+        return _block("needs_human_review", f"auto closure failed: {exc}", final_task_status=task_status)
+
+
+
 def handle_run_command(user_text: str) -> str | None:
     lines = user_text.strip().splitlines()
     first_line = lines[0] if lines else ""
@@ -11577,13 +11738,15 @@ def prepare_reply(user_text: str, context: dict) -> tuple[str, str]:
     if auto_codex_write_tail is not None:
         if not auto_codex_write_tail:
             return "Usage: /auto codex-write <task title> [--project project_id]", "auto_help"
-        return prepare_reply(f"/run codex-write {auto_codex_write_tail}", context)
+        run_reply, run_route = prepare_reply(f"/run codex-write {auto_codex_write_tail}", context)
+        return build_auto_pipeline_closure_reply(run_reply, "/auto codex-write"), run_route
 
     auto_codex_tail = _auto_tail("/auto codex")
     if auto_codex_tail is not None:
         if not auto_codex_tail:
             return "Usage: /auto codex <task title> [--project project_id]", "auto_help"
-        return prepare_reply(f"/run codex {auto_codex_tail}", context)
+        run_reply, run_route = prepare_reply(f"/run codex {auto_codex_tail}", context)
+        return build_auto_pipeline_closure_reply(run_reply, "/auto codex"), run_route
 
     if auto_lower == "/auto" or auto_lower.startswith("/auto "):
         return (
