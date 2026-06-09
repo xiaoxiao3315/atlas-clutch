@@ -7409,6 +7409,15 @@ def is_allowed_post_run_command(argv: list[str]) -> bool:
     return False
 
 
+def windows_subprocess_argv(argv: list[str]) -> list[str]:
+    """Return an argv that works for Windows .cmd/.bat shims with shell=False."""
+    if os.name == "nt" and argv:
+        name = command_basename(argv[0]).lower()
+        if name.endswith((".cmd", ".bat")):
+            return ["cmd.exe", "/d", "/c", subprocess.list2cmdline(argv)]
+    return argv
+
+
 def run_allowlisted_external_command(
     argv: list[str],
     *,
@@ -7419,7 +7428,7 @@ def run_allowlisted_external_command(
         raise ValueError("external command is not allowlisted")
     try:
         completed = subprocess.run(
-            argv,
+            windows_subprocess_argv(argv),
             cwd=ROOT,
             input=sanitize_sensitive_text(input_text),
             capture_output=True,
@@ -7485,10 +7494,8 @@ def probe_codex_noninteractive(sandbox_mode: str = "read-only") -> dict:
     codex_path = shutil.which("codex")
     if not codex_path:
         return {"supported": False, "mode": "missing", "reason": "codex command not found", "command": []}
-    help_result = run_allowlisted_external_command([codex_path, "--help"], timeout=10)
-    help_text = f"{help_result.get('stdout', '')}\n{help_result.get('stderr', '')}".lower()
-    if help_result.get("returncode") != 0 or "exec" not in help_text:
-        return {"supported": False, "mode": "help_probe_failed", "reason": "codex --help did not expose exec", "command": []}
+    # Probe the actual non-interactive command directly. Some Windows shims or
+    # top-level help output do not reliably expose subcommands.
     exec_help = run_allowlisted_external_command([codex_path, "exec", "--help"], timeout=10)
     exec_help_text = f"{exec_help.get('stdout', '')}\n{exec_help.get('stderr', '')}".lower()
     if exec_help.get("returncode") != 0:
@@ -11554,6 +11561,39 @@ def handle_local_command(user_text: str, context: dict) -> str | None:
 
 
 def prepare_reply(user_text: str, context: dict) -> tuple[str, str]:
+    # OHB-AUTO-033A minimal /auto alias.
+    # Keep this intentionally thin: /auto delegates to the already sealed /run paths.
+    auto_text = user_text.strip()
+    auto_lower = auto_text.lower()
+
+    def _auto_tail(prefix: str):
+        if auto_lower == prefix:
+            return ""
+        if auto_lower.startswith(prefix + " "):
+            return auto_text[len(prefix):].strip()
+        return None
+
+    auto_codex_write_tail = _auto_tail("/auto codex-write")
+    if auto_codex_write_tail is not None:
+        if not auto_codex_write_tail:
+            return "Usage: /auto codex-write <task title> [--project project_id]", "auto_help"
+        return prepare_reply(f"/run codex-write {auto_codex_write_tail}", context)
+
+    auto_codex_tail = _auto_tail("/auto codex")
+    if auto_codex_tail is not None:
+        if not auto_codex_tail:
+            return "Usage: /auto codex <task title> [--project project_id]", "auto_help"
+        return prepare_reply(f"/run codex {auto_codex_tail}", context)
+
+    if auto_lower == "/auto" or auto_lower.startswith("/auto "):
+        return (
+            "Auto command help\n"
+            "- /auto codex <task title> [--project project_id]\n"
+            "- /auto codex-write <task title> [--project project_id]\n"
+            "Current behavior: /auto delegates to the sealed /run pipeline.",
+            "auto_help",
+        )
+
     local_reply = handle_local_command(user_text, context)
     if local_reply is not None:
         return local_reply, "local_command"
