@@ -1607,6 +1607,46 @@ def detect_live_skipped(text: str) -> bool:
     return any(marker in str(text or "") for marker in ("live 验收跳过", "live 回归未运行", "live 待补", "Octo UI live 回归未运行"))
 
 
+def generated_owner_write_exec_is_verified(task_id: str, exec_id: str) -> bool:
+    try:
+        exec_meta = task_metadata(read_exec(normalize_exec_id(exec_id)))
+    except Exception:
+        return False
+    owner_write_ok = {
+        "owner_write_policy": str(exec_meta.get("owner_write_policy", "")).lower() == "true",
+        "owner_write_policy_status": exec_meta.get("owner_write_policy_status") == "returned",
+        "write_target_fidelity": exec_meta.get("write_target_fidelity") == "passed",
+        "runner_sandbox": exec_meta.get("runner_sandbox") == "workspace-write",
+        "write_confirmed": str(exec_meta.get("write_confirmed", "")).lower() == "true",
+        "returncode": str(exec_meta.get("returncode")) == "0",
+        "timed_out": str(exec_meta.get("timed_out", "")).lower() == "false",
+        "completion_state": exec_meta.get("completion_state") == "completed",
+    }
+    if not all(owner_write_ok.values()):
+        return False
+    for record in evidence_records(task_id):
+        if record.get("verified") not in {"verified", "yes"}:
+            continue
+        if record.get("supports_acceptance") != "observed":
+            continue
+        combined = "\n".join(str(record.get(key, "")) for key in ("claim", "observed", "notes", "mark_note"))
+        if exec_id in combined:
+            return True
+    return False
+
+
+def live_skip_is_owner_write_auto_postprocess_caveat(task_id: str, text: str) -> bool:
+    value = str(text or "")
+    lowered = value.lower()
+    if not re.search(
+        r"live\s+octo/atlas[^\n]*(/exec receive|/dispatch qa|/task review|final user decision)[^\n]*(not run|not verified)",
+        lowered,
+    ):
+        return False
+    exec_ids = sorted(set(re.findall(r"\bEXEC-\d{8}-\d{6}\b", value)))
+    return any(generated_owner_write_exec_is_verified(task_id, exec_id) for exec_id in exec_ids)
+
+
 def report_has_claim(text: str) -> bool:
     value = str(text or "").lower()
     return any(marker in str(text or "") for marker in ("完成", "通过", "已修复", "验收通过", "OK")) or any(
@@ -1808,6 +1848,8 @@ def evidence_analysis(task_id: str, text: str | None = None) -> dict:
     partial_records = [record for record in records if record.get("verified") == "partial"]
     rejected_records = [record for record in records if record.get("verified") == "rejected"]
     live_skipped = detect_live_skipped(combined)
+    if live_skipped and live_skip_is_owner_write_auto_postprocess_caveat(normalized_task_id, combined):
+        live_skipped = False
     missing = required_evidence_missing(combined, has_report or has_evidence)
     if observed_records and not verified_records:
         missing.append("observed 证据尚未标记 verified")
@@ -6435,6 +6477,11 @@ def exec_records() -> list[dict]:
             "run_policy_reason": meta.get("run_policy_reason", ""),
             "write_confirmed": meta.get("write_confirmed", ""),
             "write_approved_at": meta.get("write_approved_at", ""),
+            "owner_write_policy": meta.get("owner_write_policy", ""),
+            "owner_write_policy_status": meta.get("owner_write_policy_status", ""),
+            "owner_write_policy_reason": meta.get("owner_write_policy_reason", ""),
+            "write_target_fidelity": meta.get("write_target_fidelity", ""),
+            "write_target_lines": meta.get("write_target_lines", ""),
             "dispatch_id": meta.get("dispatch_id", ""),
             "task_id": meta.get("task_id", ""),
             "project_id": meta.get("project_id", ""),
@@ -6497,10 +6544,18 @@ RUN_POLICY_APPROVED_WRITE = RunPolicy(
     human_confirm_required=False,
     read_only_gate_label="not_required_after_write_approval",
 )
+RUN_POLICY_OWNER_APPROVED_WRITE = RunPolicy(
+    name="owner_approved_workspace_write",
+    auto_execute_enabled=True,
+    human_confirm_required=False,
+    read_only_gate_label="not_required_after_owner_write_preflight",
+)
 
 
-def run_policy_for_sandbox(sandbox_mode: str) -> RunPolicy:
-    return RUN_POLICY_APPROVED_WRITE if sandbox_mode == "workspace-write" else RUN_POLICY_READ_ONLY_AUTO
+def run_policy_for_sandbox(sandbox_mode: str, owner_write_policy: bool = False) -> RunPolicy:
+    if sandbox_mode == "workspace-write":
+        return RUN_POLICY_OWNER_APPROVED_WRITE if owner_write_policy else RUN_POLICY_APPROVED_WRITE
+    return RUN_POLICY_READ_ONLY_AUTO
 
 
 def run_policy_fields(policy: RunPolicy, reason: str = "") -> dict[str, str]:
@@ -6620,9 +6675,9 @@ This package is the execution payload for {display_target}. Atlas/Bridge only pe
 """)
 
 
-def build_runner_payload(exec_id: str, dispatch_id: str, sandbox_mode: str) -> str:
+def build_runner_payload(exec_id: str, dispatch_id: str, sandbox_mode: str, owner_write_policy: bool = False) -> str:
     payload = build_exec_payload(exec_id, dispatch_id)
-    policy = run_policy_for_sandbox(sandbox_mode)
+    policy = run_policy_for_sandbox(sandbox_mode, owner_write_policy=owner_write_policy)
     payload = sanitize_sensitive_text(f"""{payload}
 
 ## Run Policy
@@ -6631,6 +6686,7 @@ def build_runner_payload(exec_id: str, dispatch_id: str, sandbox_mode: str) -> s
 - policy_human_confirm_required: {str(policy.human_confirm_required).lower()}
 - runner_sandbox: {sandbox_mode}
 - read_only_gate: {policy.read_only_gate_label}
+- owner_write_policy: {str(bool(owner_write_policy)).lower()}
 """)
     if sandbox_mode != "workspace-write":
         return payload
@@ -6639,6 +6695,7 @@ def build_runner_payload(exec_id: str, dispatch_id: str, sandbox_mode: str) -> s
 ## Human Write Approval
 - exec_id: {normalize_exec_id(exec_id)}
 - approval_mode: workspace-write
+- owner_write_policy: {str(bool(owner_write_policy)).lower()}
 - user_explicit_confirmation_required: true
 - This approval allows the executor to modify workspace files only for the scoped task.
 
@@ -7597,12 +7654,18 @@ def execute_exec_runner(
     probe: dict,
     sandbox_mode: str,
     approval_note: str = "",
+    owner_write_metadata: dict[str, str] | None = None,
 ) -> str:
     normalized_dispatch_id = normalize_dispatch_id(dispatch_id)
     sandbox_mode = sandbox_mode if sandbox_mode in RUNNER_SANDBOX_MODES else "read-only"
     now = iso_now()
     write_mode = sandbox_mode == "workspace-write"
-    run_policy = run_policy_for_sandbox(sandbox_mode)
+    owner_write_fields = {
+        str(key): sanitize_sensitive_text(value)
+        for key, value in (owner_write_metadata or {}).items()
+    }
+    owner_write_policy = str(owner_write_fields.get("owner_write_policy", "")).lower() == "true"
+    run_policy = run_policy_for_sandbox(sandbox_mode, owner_write_policy=owner_write_policy)
     extra_fields = {
         "started_at": now,
         "human_confirm_required": str(run_policy.human_confirm_required).lower(),
@@ -7615,6 +7678,9 @@ def execute_exec_runner(
         "completion_state": "started",
         **run_policy_fields(run_policy, str(probe.get("reason", ""))),
     }
+    if owner_write_fields:
+        extra_fields.update(owner_write_fields)
+        extra_fields["owner_write_policy_status"] = owner_write_fields.get("owner_write_policy_status", "started") or "started"
     if write_mode:
         extra_fields.update({"write_confirmed": "true", "write_approved_at": now})
     update_exec_status(
@@ -7625,10 +7691,17 @@ def execute_exec_runner(
     )
     if write_mode:
         text = read_exec(exec_id)
+        owner_lines = ""
+        if owner_write_fields:
+            owner_lines = (
+                f"\n- owner_write_policy: {owner_write_fields.get('owner_write_policy', 'false')}"
+                f"\n- owner_write_policy_status: {owner_write_fields.get('owner_write_policy_status', 'started')}"
+                f"\n- write_target_fidelity: {owner_write_fields.get('write_target_fidelity', '') or 'none'}"
+            )
         text = append_to_section(
             text,
             "Human Write Approval",
-            f"### write approved at {now}\n- approval: write\n- runner_sandbox: workspace-write\n- note: {sanitize_sensitive_text(approval_note).strip() or 'explicit write approval'}\n- forbidden_git_write_actions: true\n- deploy_forbidden: true",
+            f"### write approved at {now}\n- approval: write\n- runner_sandbox: workspace-write\n- run_policy: {run_policy.name}\n- note: {sanitize_sensitive_text(approval_note).strip() or 'explicit write approval'}{owner_lines}\n- forbidden_git_write_actions: true\n- deploy_forbidden: true",
         )
         write_exec(exec_id, text)
     append_exec_autostart_section(
@@ -7636,7 +7709,12 @@ def execute_exec_runner(
         "started",
         f"- mode: {probe.get('mode')}\n- run_policy: {run_policy.name}\n- runner_sandbox: {sandbox_mode}\n- read_only_gate: {run_policy.read_only_gate_label}\n- command_allowlist: true\n- payload_injection: stdin\n- started_at: {now}",
     )
-    package = build_runner_payload(exec_id, normalized_dispatch_id, sandbox_mode)
+    package = build_runner_payload(
+        exec_id,
+        normalized_dispatch_id,
+        sandbox_mode,
+        owner_write_policy=owner_write_policy,
+    )
     if probe.get("mode") == "simulated":
         result = build_simulated_runner_result(exec_id, normalized_dispatch_id, package)
     else:
@@ -7655,6 +7733,15 @@ def execute_exec_runner(
     completion = classify_runner_completion(exec_id, normalized_dispatch_id, task_id, result)
     post_run_snapshot = collect_post_run_snapshot()
     persist_runner_result(exec_id, result, probe, completion, post_run_snapshot)
+    if owner_write_policy:
+        owner_status = (
+            "returned"
+            if completion["completion_state"] in {"completed", "timeout_with_output"}
+            else "failed"
+            if int(completion["returncode"]) != 0
+            else completion["completion_state"]
+        )
+        update_exec_fields(exec_id, {"owner_write_policy_status": owner_status})
     if completion["completion_state"] in {"completed", "timeout_with_output"}:
         report = build_auto_runner_report(
             exec_id,
@@ -7839,10 +7926,10 @@ Boundary:
 - read-only auto-run only for dispatches with explicit read-only / no-code-change boundaries
 - write or modification tasks degrade to needs_manual_start
 - workspace-write runner requires explicit /exec approve <exec_id|dispatch_id> write
-- execution records expose run_policy: manual_confirmation, read_only_auto_start, or approved_workspace_write
+- execution records expose run_policy: manual_confirmation, read_only_auto_start, approved_workspace_write, or owner_approved_workspace_write
 - dispatch-id approval is the fast path; it reuses a prepared/manual-start exec or creates one when no execution exists yet
 - approve-latest approves only the newest prepared/manual-start Codex execution; it does not bypass write gates
-- human_confirm_required: true for write/modify/deploy tasks
+- human_confirm_required: true for ordinary write/modify/deploy tasks; accepted codex-write owner runs record owner_approved_workspace_write
 - external_execution_enabled: false
 - auto_execute_enabled: false for arbitrary tasks
 - read_only_auto_exec_enabled: true
@@ -7941,7 +8028,7 @@ def build_exec_start_reply(dispatch_id: str) -> str:
     return execute_exec_runner(exec_id, normalized_dispatch_id, probe, "read-only")
 
 
-def build_exec_approve_reply(tail: str) -> str:
+def build_exec_approve_reply(tail: str, owner_write_metadata: dict[str, str] | None = None) -> str:
     parts = str(tail or "").strip().split(maxsplit=2)
     if len(parts) < 2 or parts[1].lower() != "write":
         return "Usage: /exec approve <exec_id|dispatch_id> write"
@@ -8020,22 +8107,32 @@ def build_exec_approve_reply(tail: str) -> str:
 - forbidden_git_write_actions: true
 - deploy_forbidden: true
 - next: /exec package {exec_id}"""
+    owner_write_fields = {
+        str(key): sanitize_sensitive_text(value)
+        for key, value in (owner_write_metadata or {}).items()
+    }
+    if owner_write_fields:
+        update_exec_fields(exec_id, owner_write_fields)
     probe = probe_codex_workspace_write()
     if not probe.get("supported"):
         reason = f"codex workspace-write non-interactive unsupported: {probe.get('reason', 'unknown')}"
+        extra_fields = {
+            "auto_execute_enabled": "false",
+            "write_confirmed": "true",
+            "write_approved_at": iso_now(),
+            "runner_sandbox": "workspace-write",
+            "runner_probe": safe_preview(reason, 120),
+            "completion_state": "needs_manual_start",
+            **run_policy_fields(RUN_POLICY_MANUAL, reason),
+        }
+        if owner_write_fields:
+            extra_fields.update(owner_write_fields)
+            extra_fields["owner_write_policy_status"] = "needs_manual_start"
         update_exec_status(
             exec_id,
             "needs_manual_start",
             f"write approval could not start: {reason}",
-            {
-                "auto_execute_enabled": "false",
-                "write_confirmed": "true",
-                "write_approved_at": iso_now(),
-                "runner_sandbox": "workspace-write",
-                "runner_probe": safe_preview(reason, 120),
-                "completion_state": "needs_manual_start",
-                **run_policy_fields(RUN_POLICY_MANUAL, reason),
-            },
+            extra_fields,
         )
         hint = build_manual_start_hint(exec_id, dispatch_id, reason)
         return f"""Execution write approval needs manual start: {exec_id}
@@ -8047,7 +8144,14 @@ def build_exec_approve_reply(tail: str) -> str:
 - next: /exec package {exec_id}
 
 {hint}"""
-    runner_reply = execute_exec_runner(exec_id, dispatch_id, probe, "workspace-write", approval_note)
+    runner_reply = execute_exec_runner(
+        exec_id,
+        dispatch_id,
+        probe,
+        "workspace-write",
+        approval_note,
+        owner_write_fields,
+    )
     return f"""{runner_reply}
 
 Write approval UX:
@@ -8099,7 +8203,7 @@ Boundary:
 - creates a local task, creates a Codex dispatch with context, then starts the existing execution flow
 - read-only/no-change tasks may use the guarded read-only Codex runner
 - write/modify/deploy tasks stop at needs_manual_start and require explicit /exec approve <exec_id|dispatch_id> write or /exec approve-latest write
-- codex-write is the owner write policy path: it is an explicit owner workspace-write approval for targeted write tasks
+- codex-write is the owner write policy path: it is an explicit owner workspace-write approval for targeted write tasks with run_policy=owner_approved_workspace_write
 - codex-write bypasses read-only start only after owner preflight accepts an explicit safe write target; hard-deny, forbidden, or targetless requests refuse before execution creation
 - accepted codex-write requests still use the write approval gate, command allowlist, stdin payload checks, and post-run evidence checks
 - does not run git add/commit/push/merge, deploy, package managers, shells, or arbitrary commands
@@ -8196,7 +8300,16 @@ def build_run_codex_reply(tail: str, owner_write_policy: bool = False) -> str:
 - auto_execute_enabled: false
 - next: {next_label}"""
         else:
-            approval_reply = build_exec_approve_reply(f"{dispatch_id} write explicit owner write policy approval")
+            approval_reply = build_exec_approve_reply(
+                f"{dispatch_id} write explicit owner write policy approval",
+                {
+                    "owner_write_policy": "true",
+                    "owner_write_policy_status": "approved",
+                    "owner_write_policy_reason": "explicit owner write policy approval applied",
+                    "write_target_fidelity": write_target_fidelity,
+                    "write_target_lines": write_target_lines,
+                },
+            )
             record = latest_exec_for_dispatch(dispatch_id)
             owner_write_policy_status = record.get("status", "unknown") if record else "unknown"
             owner_write_policy_reason = "explicit owner write policy approval applied"
@@ -8468,9 +8581,10 @@ def build_exec_auto_postprocess_reply(
     exec_meta = task_metadata(read_exec(normalized_exec_id))
     task_id = normalize_task_id(exec_meta.get("task_id", ""))
     write_confirmed = str(exec_meta.get("write_confirmed", "")).lower() == "true"
+    owner_write_policy = str(exec_meta.get("owner_write_policy", "")).lower() == "true"
     authorized_sandbox = sandbox_mode == "read-only" or (sandbox_mode == "workspace-write" and write_confirmed)
     sandbox_label = "approved workspace-write" if sandbox_mode == "workspace-write" else "read-only"
-    expected_policy = run_policy_for_sandbox(sandbox_mode).name
+    expected_policy = run_policy_for_sandbox(sandbox_mode, owner_write_policy=owner_write_policy).name
     hard_gates = {
         "run_policy": exec_meta.get("run_policy") == expected_policy,
         "runner_sandbox": sandbox_mode in RUNNER_SANDBOX_MODES,

@@ -373,7 +373,12 @@ def main() -> int:
                     raise AssertionError(f"write runner used unexpected command: {argv}")
                 assert_contains(input_text, "## Human Write Approval")
                 assert_contains(input_text, "## Run Policy")
-                assert_contains(input_text, "run_policy: approved_workspace_write")
+                if "owner_write_policy: true" in input_text:
+                    assert_contains(input_text, "run_policy: owner_approved_workspace_write")
+                    assert_contains(input_text, "read_only_gate: not_required_after_owner_write_preflight")
+                else:
+                    assert_contains(input_text, "run_policy: approved_workspace_write")
+                    assert_contains(input_text, "read_only_gate: not_required_after_write_approval")
                 assert_contains(input_text, "## Workspace-Write Forbidden Actions")
                 if not any(
                     path in input_text
@@ -617,7 +622,7 @@ def main() -> int:
             assert_contains(owner_write, "One command owner write run:")
             assert_contains(owner_write, "command_chain: task -> dispatch -> exec approve write")
             assert_contains(owner_write, "status: returned")
-            assert_contains(owner_write, "run_policy: approved_workspace_write")
+            assert_contains(owner_write, "run_policy: owner_approved_workspace_write")
             assert_contains(owner_write, "read_only_gate: bypassed_owner_write_policy")
             assert_contains(owner_write, "owner_write_policy: true")
             assert_contains(owner_write, "owner_write_policy_status: returned")
@@ -631,12 +636,17 @@ def main() -> int:
                 raise AssertionError("owner write policy used non-workspace-write command")
             owner_write_exec_text = (bridge.EXECUTIONS_DIR / f"{owner_write_exec_id}.md").read_text(encoding="utf-8")
             assert_contains(owner_write_exec_text, "write_confirmed: true")
-            assert_contains(owner_write_exec_text, "run_policy: approved_workspace_write")
+            assert_contains(owner_write_exec_text, "run_policy: owner_approved_workspace_write")
             assert_contains(owner_write_exec_text, "runner_sandbox: workspace-write")
             assert_contains(owner_write_exec_text, "owner_write_policy: true")
             assert_contains(owner_write_exec_text, "owner_write_policy_status: returned")
             assert_contains(owner_write_exec_text, "write_target_fidelity: passed")
             assert_contains(owner_write_exec_text, "explicit owner write policy approval")
+            owner_write_show, route = bridge.prepare_reply(f"/exec show {owner_write_exec_id}", ctx)
+            assert route == "local_command"
+            assert_contains(owner_write_show, "run_policy: owner_approved_workspace_write")
+            assert_contains(owner_write_show, "owner_write_policy: true")
+            assert_contains(owner_write_show, "owner_write_policy_status: returned")
             assert_contains((bridge.DISPATCHES_DIR / f"{owner_write_dispatch_id}.md").read_text(encoding="utf-8"), "status: reviewed")
             assert_contains((bridge.TASKS_DIR / f"{owner_write_task_id}.md").read_text(encoding="utf-8"), "status: archived")
 
@@ -650,6 +660,7 @@ def main() -> int:
             owner_explicit_exec_id = extract_exec_id(owner_explicit)
             assert_contains(owner_explicit, "One command owner write run:")
             assert_contains(owner_explicit, "status: returned")
+            assert_contains(owner_explicit, "run_policy: owner_approved_workspace_write")
             assert_contains(owner_explicit, "owner_write_policy_status: returned")
             assert_contains(owner_explicit, "write_target_fidelity: passed")
             assert_contains(owner_explicit, "workspace-write runner returned")
@@ -658,6 +669,7 @@ def main() -> int:
             if external_commands[owner_explicit_external_start:] != [["codex", "exec", "--sandbox", "workspace-write", "-"]]:
                 raise AssertionError("labeled owner write target used non-workspace-write command")
             owner_explicit_exec_text = (bridge.EXECUTIONS_DIR / f"{owner_explicit_exec_id}.md").read_text(encoding="utf-8")
+            assert_contains(owner_explicit_exec_text, "run_policy: owner_approved_workspace_write")
             assert_contains(owner_explicit_exec_text, "write_target_fidelity: passed")
             assert_contains(owner_explicit_exec_text, "Target files: README.md")
 
@@ -671,6 +683,7 @@ def main() -> int:
             owner_readme_exec_id = extract_exec_id(owner_readme)
             assert_contains(owner_readme, "One command owner write run:")
             assert_contains(owner_readme, "status: returned")
+            assert_contains(owner_readme, "run_policy: owner_approved_workspace_write")
             assert_contains(owner_readme, "owner_write_policy_status: returned")
             assert_contains(owner_readme, "write_target_fidelity: passed")
             assert_contains(owner_readme, "workspace-write runner returned")
@@ -679,8 +692,70 @@ def main() -> int:
             if external_commands[owner_readme_external_start:] != [["codex", "exec", "--sandbox", "workspace-write", "-"]]:
                 raise AssertionError("README-only owner write target used non-workspace-write command")
             owner_readme_exec_text = (bridge.EXECUTIONS_DIR / f"{owner_readme_exec_id}.md").read_text(encoding="utf-8")
+            assert_contains(owner_readme_exec_text, "run_policy: owner_approved_workspace_write")
             assert_contains(owner_readme_exec_text, "write_target_fidelity: passed")
             assert_contains(owner_readme_exec_text, "README only")
+
+            def owner_caveat_runner(argv: list[str], *, input_text: str = "", **_: object) -> dict:
+                external_commands.append(list(argv))
+                captured_runner_inputs.append(input_text)
+                if argv != ["codex", "exec", "--sandbox", "workspace-write", "-"]:
+                    raise AssertionError(f"owner caveat runner used unexpected command: {argv}")
+                assert_contains(input_text, "owner_write_policy: true")
+                assert_contains(input_text, "Target files: README.md")
+                return {
+                    "returncode": 0,
+                    "stdout": "\n".join(
+                        [
+                            "AUTORUN-PAYLOAD-OK",
+                            "Execution summary:",
+                            "- Added one scoped owner-approved workspace-write validation note to `README.md`.",
+                            "Modified files:",
+                            "- `README.md`",
+                            "Commands:",
+                            "- git status --short",
+                            "- git diff --check -- README.md",
+                            "Test results:",
+                            "- `git diff --check -- README.md`: passed",
+                            "Key logs or screenshots:",
+                            "- README diff shows exactly one owner-write line.",
+                            "Unverified:",
+                            "- Live Octo/Atlas `/exec receive`, `/dispatch qa`, `/task review`, and final user decision were not run here.",
+                            "Unresolved risks:",
+                            "- Auto-close behavior is not independently verified from this Codex session.",
+                        ]
+                    ),
+                    "stderr": "",
+                    "timed_out": False,
+                }
+
+            bridge.run_allowlisted_external_command = owner_caveat_runner
+            owner_caveat_capture_start = len(captured_runner_inputs)
+            owner_caveat_external_start = len(external_commands)
+            owner_caveat, route = bridge.prepare_reply(
+                "/run codex-write OHB-AUTO-031S live validation owner write auto close. Target files: README.md. Allowed write paths: README.md. Owner authorization --project auto_exec",
+                ctx,
+            )
+            assert route == "local_command"
+            owner_caveat_task_id = extract_task_id(owner_caveat)
+            owner_caveat_exec_id = extract_exec_id(owner_caveat)
+            assert_contains(owner_caveat, "One command owner write run:")
+            assert_contains(owner_caveat, "status: returned")
+            assert_contains(owner_caveat, "run_policy: owner_approved_workspace_write")
+            assert_contains(owner_caveat, "owner_write_policy_status: returned")
+            assert_contains(owner_caveat, "auto_decision: pass")
+            if len(captured_runner_inputs) != owner_caveat_capture_start + 1:
+                raise AssertionError("owner caveat policy run must call runner exactly once")
+            if external_commands[owner_caveat_external_start:] != [["codex", "exec", "--sandbox", "workspace-write", "-"]]:
+                raise AssertionError("owner caveat policy run used non-workspace-write command")
+            owner_caveat_exec_text = (bridge.EXECUTIONS_DIR / f"{owner_caveat_exec_id}.md").read_text(encoding="utf-8")
+            owner_caveat_task_text = (bridge.TASKS_DIR / f"{owner_caveat_task_id}.md").read_text(encoding="utf-8")
+            assert_contains(owner_caveat_exec_text, "auto_decision: pass")
+            assert_contains(owner_caveat_exec_text, "auto_closed: true")
+            assert_contains(owner_caveat_task_text, "status: archived")
+            assert_contains(owner_caveat_task_text, "live_skipped: false")
+            assert_contains(owner_caveat_task_text, "auto postprocess decision=pass")
+            bridge.run_allowlisted_external_command = fake_write_runner
 
             owner_noop_capture_start = len(captured_runner_inputs)
             owner_noop, route = bridge.prepare_reply(
