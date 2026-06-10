@@ -8122,23 +8122,30 @@ def path_matches_owner_write_target(path: str, target: str) -> bool:
 ACCEPTANCE_EXACT_ONE_LINE_PATTERN = re.compile(
     r"\bwrite\s+exactly\s+one\s+line\s*[:：]\s*([^\n.。]+)", re.IGNORECASE
 )
+# Narrow CJK equivalents of the exact-one-line form. Exactly two phrases,
+# full-width or ASCII colon: "写入一行：<content>" and "只写一行：<content>".
+ACCEPTANCE_EXACT_ONE_LINE_CN_PATTERN = re.compile(
+    r"(?:写入一行|只写一行)\s*[:：]\s*([^\n.。]+)"
+)
 
 
 def extract_concrete_acceptance_checks(*texts: str) -> list[dict]:
     """Narrow parser for concrete acceptance criteria.
 
-    Currently supports the explicit form "Write exactly one line: <content>".
-    The expected content is taken verbatim up to the sentence boundary.
+    Supports the explicit English form "Write exactly one line: <content>"
+    and its two narrow CJK equivalents (写入一行/只写一行). The expected
+    content is taken verbatim up to the sentence boundary.
     """
     checks: list[dict] = []
     seen: set[str] = set()
     for text in texts:
         for line in str(text or "").splitlines():
-            for match in ACCEPTANCE_EXACT_ONE_LINE_PATTERN.finditer(line):
-                expected = match.group(1).strip()
-                if expected and expected not in seen:
-                    seen.add(expected)
-                    checks.append({"kind": "exact_one_line", "expected": expected})
+            for pattern in (ACCEPTANCE_EXACT_ONE_LINE_PATTERN, ACCEPTANCE_EXACT_ONE_LINE_CN_PATTERN):
+                for match in pattern.finditer(line):
+                    expected = match.group(1).strip()
+                    if expected and expected not in seen:
+                        seen.add(expected)
+                        checks.append({"kind": "exact_one_line", "expected": expected})
     return checks
 
 
