@@ -7941,6 +7941,14 @@ def extract_declared_owner_write_targets(exec_id: str, dispatch_id: str) -> list
         r"(?:txt|md|json|py|yaml|yml|toml|cmd|bat|ps1|tsx?|jsx?|css|html))\b",
         re.IGNORECASE,
     )
+    # Narrow Chinese owner declarations, same single-line/same-phrase rule as
+    # the English explicit form. Exactly two phrases are recognized:
+    # "只允许修改 <path>" and "只允许创建或更新 <path>".
+    explicit_cn_only_pattern = re.compile(
+        r"只允许(?:修改|创建或更新)\s*[`'\"]?([A-Za-z0-9_.-]+(?:[\\/][A-Za-z0-9_.-]+)*\."
+        r"(?:txt|md|json|py|yaml|yml|toml|cmd|bat|ps1|tsx?|jsx?|css|html))\b",
+        re.IGNORECASE,
+    )
     for block in source_lines:
         for line in block.splitlines():
             lowered = line.lower()
@@ -7957,6 +7965,14 @@ def extract_declared_owner_write_targets(exec_id: str, dispatch_id: str) -> list
             for match in explicit_only_pattern.finditer(line):
                 target = normalize_fidelity_path(match.group(1).rstrip(".,;:)]"))
                 if target and target not in targets:
+                    targets.append(target)
+            # Chinese declarations refuse absolute and traversal paths at
+            # parse time; only safe workspace-relative targets resolve.
+            for match in explicit_cn_only_pattern.finditer(line):
+                target = normalize_fidelity_path(match.group(1).rstrip(".,;:)]"))
+                if not target or re.match(r"^([A-Za-z]:|/)", target) or ".." in target.split("/"):
+                    continue
+                if target not in targets:
                     targets.append(target)
     return targets
 
