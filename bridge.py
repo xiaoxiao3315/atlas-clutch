@@ -675,14 +675,20 @@ def sanitize_sensitive_text(text: str) -> str:
         if is_sensitive_zero_hit_line(line):
             line = re.sub(r"(?i)Authorization\s*:", "AUTH_HEADER_CHECK:", line)
             line = re.sub(r"(?i)Cookie\s*:", "COOKIE_CHECK:", line)
-            line = re.sub(r"(?i)bf_", "TOKEN_PREFIX_CHECK", line)
-            line = re.sub(r"(?i)sk-", "KEY_PREFIX_CHECK", line)
+            # Require a non-alphanumeric boundary before the prefix so
+            # ordinary words/paths (e.g. "cn-auto-task-smoke.txt" containing
+            # "ta|sk-") are not mangled; standalone prefixes stay flagged.
+            line = re.sub(r"(?i)(?<![A-Za-z0-9])bf_", "TOKEN_PREFIX_CHECK", line)
+            line = re.sub(r"(?i)(?<![A-Za-z0-9])sk-", "KEY_PREFIX_CHECK", line)
         lines.append(line)
     sanitized = "".join(lines)
-    sanitized = re.sub(r"(?i)bf_[A-Za-z0-9._-]+", "[REDACTED_TOKEN]", sanitized)
-    sanitized = re.sub(r"(?i)sk-[A-Za-z0-9._-]+", "[REDACTED_KEY]", sanitized)
-    sanitized = re.sub(r"(?i)bf_", "[REDACTED_TOKEN_PREFIX]", sanitized)
-    sanitized = re.sub(r"(?i)sk-", "[REDACTED_KEY_PREFIX]", sanitized)
+    # Standalone token shapes only: a real key prefix never directly follows
+    # an alphanumeric character. Mid-word substrings like "task-smoke" must
+    # not be redacted, or machine-readable paths break target parsing.
+    sanitized = re.sub(r"(?i)(?<![A-Za-z0-9])bf_[A-Za-z0-9._-]+", "[REDACTED_TOKEN]", sanitized)
+    sanitized = re.sub(r"(?i)(?<![A-Za-z0-9])sk-[A-Za-z0-9._-]+", "[REDACTED_KEY]", sanitized)
+    sanitized = re.sub(r"(?i)(?<![A-Za-z0-9])bf_", "[REDACTED_TOKEN_PREFIX]", sanitized)
+    sanitized = re.sub(r"(?i)(?<![A-Za-z0-9])sk-", "[REDACTED_KEY_PREFIX]", sanitized)
     sanitized = re.sub(r"(?im)^\s*Authorization\s*:.*$", "[REDACTED_HEADER]", sanitized)
     sanitized = re.sub(r"(?im)^\s*Cookie\s*:.*$", "[REDACTED_COOKIE]", sanitized)
     sanitized = re.sub(r"(?im)^\s*password\s*[:=].*$", "[REDACTED_SECRET]", sanitized)
@@ -757,9 +763,9 @@ def detect_sensitive_findings(text: str) -> list[dict]:
     for line_no, line in enumerate(str(text or "").splitlines(), 1):
         if not line.strip() or is_sensitive_zero_hit_line(line):
             continue
-        if re.search(r"(?i)bf_[A-Za-z0-9._-]{4,}", line):
+        if re.search(r"(?i)(?<![A-Za-z0-9])bf_[A-Za-z0-9._-]{4,}", line):
             add(line_no, "token_like_value", "high", f"line {line_no}: token-like value", line)
-        if re.search(r"(?i)sk-[A-Za-z0-9][A-Za-z0-9._-]{7,}", line):
+        if re.search(r"(?i)(?<![A-Za-z0-9])sk-[A-Za-z0-9][A-Za-z0-9._-]{7,}", line):
             add(line_no, "key_like_value", "high", f"line {line_no}: key-like value", line)
         auth_match = re.search(r"(?i)^\s*Authorization\s*:\s*(.*)$", line)
         if auth_match and not is_empty_sensitive_value(auth_match.group(1)):
@@ -7543,6 +7549,10 @@ def owner_write_target_gate(dispatch_id: str) -> dict:
             dispatch_title_from_text(normalize_dispatch_id(dispatch_id), dispatch_text),
             task_title_from_text(task_id, task_text) if task_id else "",
             task_section(task_text, "Goal"),
+            # Titles/Goal are 120-char truncations; the untruncated Original
+            # Request must also be visible so explicit targets in long
+            # commands are not silently cut off before exec creation.
+            task_section(task_text, "Original Request"),
         ]
     )
     target_lines = [
@@ -7569,6 +7579,8 @@ def owner_write_scope_lines(dispatch_id: str) -> list[str]:
         dispatch_title_from_text(normalize_dispatch_id(dispatch_id), dispatch_text),
         task_title_from_text(task_id, task_text) if task_id else "",
         task_section(task_text, "Goal"),
+        # Untruncated source of the user's request (see owner_write_target_gate).
+        task_section(task_text, "Original Request"),
     ]
 
 
@@ -7893,7 +7905,13 @@ def route_auto_executor(text: str, owner_write: bool = False) -> tuple[str, str]
         return "codex", "auto routing: read-only review of claude-written work goes to codex"
     if owner_write:
         return "claude", "auto routing: owner-write code task prefers claude writer with codex review gate"
-    if any(line_has_source_write_intent(line) or line_has_explicit_write_target(line) for line in lines):
+    if any(
+        line_has_source_write_intent(line)
+        or line_has_explicit_write_target(line)
+        or extract_explicit_owner_targets_from_line(line)
+        or line_has_cjk_write_one_line_intent(line)
+        for line in lines
+    ):
         return "claude", "auto routing: code-writing signal prefers claude writer with codex review gate"
     return "codex", "auto routing: no clear code-writing signal; codex stays the safe default"
 
@@ -7976,6 +7994,15 @@ EXPLICIT_OWNER_TARGET_EN_PATTERN = re.compile(
 EXPLICIT_OWNER_TARGET_CN_PATTERN = re.compile(
     r"只允许(?:修改|创建或更新)\s*" + OWNER_WRITE_TARGET_PATH_GROUP, re.IGNORECASE
 )
+
+
+# Narrow CJK write-intent phrases for routing only (no target parsing):
+# "写入一行：<content>" and "只写一行：<content>".
+CJK_WRITE_ONE_LINE_INTENT_PATTERN = re.compile(r"(?:写入一行|只写一行)\s*[:：]")
+
+
+def line_has_cjk_write_one_line_intent(line: str) -> bool:
+    return bool(CJK_WRITE_ONE_LINE_INTENT_PATTERN.search(str(line or "")))
 
 
 def extract_explicit_owner_targets_from_line(line: str) -> list[str]:
@@ -12540,7 +12567,13 @@ def classify_auto_task_request(text: str) -> tuple[str, str]:
         for line in lines
     ):
         return "review_codex", "review of claude-written work runs read-only on codex"
-    if any(line_has_source_write_intent(line) or line_has_explicit_write_target(line) for line in lines):
+    if any(
+        line_has_source_write_intent(line)
+        or line_has_explicit_write_target(line)
+        or extract_explicit_owner_targets_from_line(line)
+        or line_has_cjk_write_one_line_intent(line)
+        for line in lines
+    ):
         return "owner_write", "code-writing signal; claude writes under owner-write gates with codex review"
     return "read_only", "no clear code-writing signal; safe read-only codex run (no workspace-write)"
 
