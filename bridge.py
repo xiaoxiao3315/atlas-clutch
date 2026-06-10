@@ -7634,7 +7634,10 @@ def extract_declared_owner_write_targets(exec_id: str, dispatch_id: str) -> list
     labels = (
         "allowed_write_targets",
         "allowed write targets",
+        "allowed write paths",
         "write target",
+        "target files",
+        "target paths",
     )
     source_lines = [str(exec_meta.get("write_target_lines", ""))]
     try:
@@ -7647,13 +7650,26 @@ def extract_declared_owner_write_targets(exec_id: str, dispatch_id: str) -> list
         r"(?:txt|md|json|py|yaml|yml|toml|cmd|bat|ps1|tsx?|jsx?|css|html))\b",
         re.IGNORECASE,
     )
+    explicit_only_pattern = re.compile(
+        r"\bcreate or update only\s+[`'\"]?([A-Za-z0-9_.-]+(?:[\\/][A-Za-z0-9_.-]+)*\."
+        r"(?:txt|md|json|py|yaml|yml|toml|cmd|bat|ps1|tsx?|jsx?|css|html))\b",
+        re.IGNORECASE,
+    )
     for block in source_lines:
         for line in block.splitlines():
             lowered = line.lower()
-            if not any(label in lowered for label in labels):
+            if any(label in lowered for label in labels):
+                for match in path_pattern.finditer(line):
+                    target = normalize_fidelity_path(match.group(1))
+                    if target and target not in targets:
+                        targets.append(target)
                 continue
-            for match in path_pattern.finditer(line):
-                target = normalize_fidelity_path(match.group(1))
+            # Bridge's own explicit single-target declaration: accept only the
+            # path immediately following the phrase, on the same physical line.
+            # Strip trailing sentence punctuation from the captured target only.
+            # No arbitrary unlabeled path harvesting.
+            for match in explicit_only_pattern.finditer(line):
+                target = normalize_fidelity_path(match.group(1).rstrip(".,;:)]"))
                 if target and target not in targets:
                     targets.append(target)
     return targets
@@ -7710,11 +7726,14 @@ def path_matches_owner_write_target(path: str, target: str) -> bool:
     )
 
 
-def owner_write_post_run_target_fidelity(exec_id: str, dispatch_id: str, post_run_snapshot: str) -> dict:
+def owner_write_post_run_target_fidelity(
+    exec_id: str, dispatch_id: str, post_run_snapshot: str, pre_run_snapshot: str = ""
+) -> dict:
     targets = extract_declared_owner_write_targets(exec_id, dispatch_id)
     status_section = post_run_snapshot_command_section(post_run_snapshot, "git status --short")
     status_returncode = post_run_snapshot_returncode(post_run_snapshot, "git status --short")
     changed_paths = parse_git_status_short_paths(post_run_snapshot)
+    baseline_paths = parse_git_status_short_paths(pre_run_snapshot) if pre_run_snapshot else []
     if "...[truncated runner output]" in status_section:
         return {
             "status": "failed",
@@ -7740,6 +7759,33 @@ def owner_write_post_run_target_fidelity(exec_id: str, dispatch_id: str, post_ru
             "changed_paths": changed_paths,
             "unauthorized_paths": [],
             "reason": "git_status_returncode_missing_or_failed",
+            "git_status_returncode": status_returncode,
+        }
+    if pre_run_snapshot:
+        # Baseline-aware mode: judge only paths that became dirty during the
+        # run. Pre-existing working-tree dirt (developer edits, bridge
+        # bookkeeping) is not evidence about this run; any NEW path outside
+        # the declared targets still fails closed.
+        new_paths = [path for path in changed_paths if path not in baseline_paths]
+        unauthorized = [
+            path for path in new_paths
+            if not any(path_matches_owner_write_target(path, target) for target in targets)
+        ]
+        if unauthorized:
+            status = "failed"
+            reason = "post-run new changed paths outside declared targets"
+        elif new_paths:
+            status = "passed"
+            reason = "post-run new changed paths stayed inside declared targets"
+        else:
+            status = "passed"
+            reason = "no new changed paths beyond pre-run baseline"
+        return {
+            "status": status,
+            "targets": targets,
+            "changed_paths": changed_paths,
+            "unauthorized_paths": unauthorized,
+            "reason": reason,
             "git_status_returncode": status_returncode,
         }
     if not changed_paths:
@@ -8110,6 +8156,7 @@ def execute_exec_runner(
         sandbox_mode,
         owner_write_policy=owner_write_policy,
     )
+    pre_run_snapshot = collect_post_run_snapshot() if owner_write_policy else ""
     if probe.get("mode") == "simulated":
         result = build_simulated_runner_result(exec_id, normalized_dispatch_id, package)
     else:
@@ -8129,11 +8176,15 @@ def execute_exec_runner(
     post_run_snapshot = collect_post_run_snapshot()
     owner_fidelity_result = None
     if owner_write_policy:
-        owner_fidelity_result = owner_write_post_run_target_fidelity(exec_id, normalized_dispatch_id, post_run_snapshot)
+        owner_fidelity_result = owner_write_post_run_target_fidelity(
+            exec_id, normalized_dispatch_id, post_run_snapshot, pre_run_snapshot
+        )
         update_exec_fields(
             exec_id,
             {
-                "write_target_fidelity": owner_fidelity_result["status"],
+                # write_target_fidelity stays the preflight gate verdict;
+                # the post-run verdict is gated via post_run_target_fidelity
+                # in every owner-write hard gate.
                 "post_run_target_fidelity": owner_fidelity_result["status"],
                 "write_target_lines": safe_preview(
                     "; ".join(owner_fidelity_result.get("targets", []))
