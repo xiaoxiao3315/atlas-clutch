@@ -6894,7 +6894,149 @@ This package is the execution payload for {display_target}. Atlas/Bridge only pe
 """)
 
 
+CJK_CHAR_PATTERN = re.compile(r"[㐀-䶿一-鿿豈-﫿]")
+
+
+def detect_source_language(text: str) -> str:
+    sample = str(text or "")
+    has_cjk = bool(CJK_CHAR_PATTERN.search(sample))
+    has_latin = bool(re.search(r"[A-Za-z]", sample))
+    if has_cjk and has_latin:
+        return "mixed"
+    if has_cjk:
+        return "zh"
+    return "en"
+
+
+def claude_source_request_text(dispatch_id: str) -> str:
+    dispatch_text = read_dispatch(dispatch_id)
+    meta = task_metadata(dispatch_text)
+    task_id = meta.get("task_id", "")
+    parts = [dispatch_title_from_text(normalize_dispatch_id(dispatch_id), dispatch_text)]
+    if task_id:
+        try:
+            task_text = read_task(task_id)
+            parts = [task_title_from_text(task_id, task_text), task_section(task_text, "Goal")]
+        except Exception:
+            pass
+    return "\n".join(part for part in parts if part and part.strip())
+
+
+def render_claude_english_runner_payload(exec_id: str, dispatch_id: str, sandbox_mode: str, owner_write_policy: bool) -> str:
+    normalized_exec_id = normalize_exec_id(exec_id)
+    normalized_dispatch_id = normalize_dispatch_id(dispatch_id)
+    meta = task_metadata(read_dispatch(normalized_dispatch_id))
+    source_text = claude_source_request_text(normalized_dispatch_id)
+    source_language = detect_source_language(source_text)
+    policy = run_policy_for_sandbox(sandbox_mode, owner_write_policy=owner_write_policy)
+    targets = extract_declared_owner_write_targets(normalized_exec_id, normalized_dispatch_id)
+    if sandbox_mode == "workspace-write":
+        target_lines = "\n".join(f"- {target}" for target in targets) or "- none declared; do not write anything"
+        write_rules = """## Allowed Write Targets
+{targets}
+- Write only inside the allowed targets above. Any other change fails the run.
+
+## Human Write Approval
+- exec_id: {exec_id}
+- approval_mode: workspace-write
+- owner_write_policy: {owner}
+- user_explicit_confirmation_required: true
+- This approval allows modifying workspace files only for the scoped task.""".format(
+            targets=target_lines, exec_id=normalized_exec_id, owner=str(bool(owner_write_policy)).lower()
+        )
+    else:
+        write_rules = """## Allowed Write Targets
+- none (this is a read-only run; do not create, modify, or delete any file)"""
+    return sanitize_sensitive_text(f"""# Claude Execution Package (rendered in English)
+
+exec_id: {normalized_exec_id}
+dispatch_id: {normalized_dispatch_id}
+task_id: {meta.get('task_id', '')}
+project_id: {meta.get('project_id', '') or 'unassigned'}
+target_executor: claude
+source_language: {source_language}
+executor_prompt_language: en
+executor_prompt_rendered_for: claude
+
+## Goal
+- Fulfill the Original User Request section below exactly as written.
+- Treat that section as the authoritative task intent even if it is not in English.
+- Use all file paths, command names, code identifiers, task/dispatch/exec IDs exactly as written there; never translate or alter them.
+
+## Original User Request (preserved verbatim, source language: {source_language})
+{source_text or '- empty'}
+
+## Scope
+- Only the work described in the Original User Request, within the allowed write targets below.
+- Do not expand scope, refactor unrelated code, or touch unrelated files.
+
+{write_rules}
+
+## Constraints
+- Work only inside the authorized project workspace.
+- Keep changes minimal and reviewable.
+- runner_sandbox: {sandbox_mode}
+
+## Acceptance Criteria
+- The Original User Request is satisfied exactly.
+- No files outside the allowed write targets are created, modified, or deleted.
+- The return report below is complete and concise.
+
+## Safety Boundaries
+- Atlas/Bridge stays in control; you are an executor only.
+- Do not claim completion without verifiable evidence.
+- Codex will review this work read-only before any close decision.
+
+## Evidence Requirements (return report)
+- Summarize modified files.
+- Summarize commands and tests run.
+- State git status and git diff --stat observations.
+- State unresolved risks and unverified items.
+- Keep output concise enough to avoid runner timeout; include AUTORUN-PAYLOAD-OK.
+
+## Secrets Rule
+- Do not read, print, or modify .env files, tokens, cookies, Authorization headers, passwords, API keys, or any secrets.
+
+## Git Rule
+- Do not run git add, git commit, git push, git merge, or deploy. Not explicitly allowed for this run.
+
+## Run Policy
+- run_policy: {policy.name}
+- policy_auto_execute_enabled: {str(policy.auto_execute_enabled).lower()}
+- policy_human_confirm_required: {str(policy.human_confirm_required).lower()}
+- runner_sandbox: {sandbox_mode}
+- read_only_gate: {policy.read_only_gate_label}
+- owner_write_policy: {str(bool(owner_write_policy)).lower()}
+""")
+
+
+def render_executor_prompt_for_target(target_executor: str, payload_text: str, metadata: dict | None = None) -> str:
+    """Claude-bound executor payloads are rendered in English; other targets
+    keep their existing payload text unchanged."""
+    if str(target_executor or "").strip().lower() != "claude":
+        return payload_text
+    meta = metadata or {}
+    return render_claude_english_runner_payload(
+        str(meta.get("exec_id", "")),
+        str(meta.get("dispatch_id", "")),
+        str(meta.get("sandbox_mode", "read-only")),
+        bool(meta.get("owner_write_policy", False)),
+    )
+
+
 def build_runner_payload(exec_id: str, dispatch_id: str, sandbox_mode: str, owner_write_policy: bool = False) -> str:
+    target = task_metadata(read_dispatch(normalize_dispatch_id(dispatch_id))).get("target_executor", "").strip().lower()
+    if target == "claude":
+        return render_executor_prompt_for_target(
+            "claude",
+            "",
+            {
+                "exec_id": exec_id,
+                "dispatch_id": dispatch_id,
+                "sandbox_mode": sandbox_mode,
+                "owner_write_policy": owner_write_policy,
+            },
+        )
     payload = build_exec_payload(exec_id, dispatch_id)
     policy = run_policy_for_sandbox(sandbox_mode, owner_write_policy=owner_write_policy)
     payload = sanitize_sensitive_text(f"""{payload}
@@ -6996,6 +7138,9 @@ reviewer_executor:
 review_required_by:
 codex_review_status:
 codex_review_reason:
+source_language:
+executor_prompt_language:
+executor_prompt_rendered_for:
 auto_postprocess_enabled: false
 auto_qa_done: false
 auto_evidence_verified: false
@@ -8354,6 +8499,15 @@ def execute_exec_runner(
         sandbox_mode,
         owner_write_policy=owner_write_policy,
     )
+    if target_executor == "claude":
+        update_exec_fields(
+            exec_id,
+            {
+                "source_language": detect_source_language(claude_source_request_text(normalized_dispatch_id)),
+                "executor_prompt_language": "en",
+                "executor_prompt_rendered_for": "claude",
+            },
+        )
     pre_run_snapshot = collect_post_run_snapshot() if owner_write_policy else ""
     if probe.get("mode") == "simulated":
         result = build_simulated_runner_result(exec_id, normalized_dispatch_id, package)
