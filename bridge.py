@@ -12248,6 +12248,60 @@ def build_template_help_reply() -> str:
 
 
 
+def classify_auto_task_request(text: str) -> tuple[str, str]:
+    """Triage a one-command /auto task: owner-write, codex review, or safe read-only."""
+    lines = [line for line in str(text or "").splitlines() if line.strip()]
+    if any(
+        re.search(r"\b(review|qa|audit|verify)\b", line, re.IGNORECASE)
+        and re.search(r"\bclaude\b", line, re.IGNORECASE)
+        for line in lines
+    ):
+        return "review_codex", "review of claude-written work runs read-only on codex"
+    if any(line_has_source_write_intent(line) or line_has_explicit_write_target(line) for line in lines):
+        return "owner_write", "code-writing signal; claude writes under owner-write gates with codex review"
+    return "read_only", "no clear code-writing signal; safe read-only codex run (no workspace-write)"
+
+
+def build_auto_routing_summary(run_reply: str, auto_triage: str = "") -> str:
+    reply_text = str(run_reply or "")
+    task_id = reply_field(reply_text, "task_id") or "none"
+    dispatch_id = reply_field(reply_text, "dispatch_id") or "none"
+    exec_id = reply_field(reply_text, "exec_id") or "none"
+    dispatch_meta: dict = {}
+    exec_meta: dict = {}
+    try:
+        if dispatch_id not in ("", "none"):
+            dispatch_meta = task_metadata(read_dispatch(dispatch_id))
+    except Exception:
+        dispatch_meta = {}
+    try:
+        if exec_id not in ("", "none"):
+            exec_meta = task_metadata(read_exec(exec_id))
+    except Exception:
+        exec_meta = {}
+    target = exec_meta.get("target_executor", "") or dispatch_meta.get("target_executor", "") or "none"
+    requested = dispatch_meta.get("requested_executor", "") or target
+    routing_reason = dispatch_meta.get("routing_reason", "") or "none"
+    writer = exec_meta.get("writer_executor", "") or "none"
+    reviewer = exec_meta.get("reviewer_executor", "") or "none"
+    review_status = exec_meta.get("codex_review_status", "") or "not_required"
+    auto_decision = exec_meta.get("auto_decision", "") or "none"
+    next_action = reply_field(reply_text, "next") or f"inspect /dispatch show {dispatch_id}"
+    triage_line = f"\n- auto_triage: {safe_preview(auto_triage, 160)}" if auto_triage else ""
+    return sanitize_sensitive_text(f"""Auto Routing Summary:
+- task_id: {task_id}
+- dispatch_id: {dispatch_id}
+- exec_id: {exec_id}
+- requested_executor: {requested}
+- target_executor: {target}
+- routing_reason: {safe_preview(routing_reason, 160)}{triage_line}
+- writer_executor: {writer}
+- reviewer_executor: {reviewer}
+- codex_review_status: {review_status}
+- auto_decision: {auto_decision}
+- next: {safe_preview(next_action, 200)}""")
+
+
 def build_auto_pipeline_closure_reply(run_reply: str, source_command: str = "/auto") -> str:
     """Best-effort auto closure for /auto runs. Does not execute shell commands."""
     reply_text = sanitize_sensitive_text(str(run_reply or ""))
@@ -12508,9 +12562,35 @@ def prepare_reply(user_text: str, context: dict) -> tuple[str, str]:
         run_reply, run_route = prepare_reply(f"/run codex {auto_codex_tail}", context)
         return build_auto_pipeline_closure_reply(run_reply, "/auto codex"), run_route
 
+    auto_write_tail = _auto_tail("/auto write")
+    if auto_write_tail is not None:
+        if not auto_write_tail:
+            return "Usage: /auto write <task title> [--project project_id]", "auto_help"
+        run_reply, run_route = prepare_reply(f"/run auto-write {auto_write_tail}", context)
+        closure = build_auto_pipeline_closure_reply(run_reply, "/auto write")
+        summary = build_auto_routing_summary(run_reply, "owner-write requested; claude writes, codex reviews")
+        return f"{closure}\n\n{summary}", run_route
+
+    auto_task_tail = _auto_tail("/auto task")
+    if auto_task_tail is not None:
+        if not auto_task_tail:
+            return "Usage: /auto task <task title> [--project project_id]", "auto_help"
+        triage, triage_reason = classify_auto_task_request(auto_task_tail)
+        run_command = (
+            f"/run auto-write {auto_task_tail}"
+            if triage == "owner_write"
+            else f"/run codex {auto_task_tail}"
+        )
+        run_reply, run_route = prepare_reply(run_command, context)
+        closure = build_auto_pipeline_closure_reply(run_reply, "/auto task")
+        summary = build_auto_routing_summary(run_reply, triage_reason)
+        return f"{closure}\n\n{summary}", run_route
+
     if auto_lower == "/auto" or auto_lower.startswith("/auto "):
         return (
             "Auto command help\n"
+            "- /auto task <task title> [--project project_id]  (one command: triage -> claude writes / codex reviews -> gated close)\n"
+            "- /auto write <task title> [--project project_id]  (owner-write: claude writes, codex reviews)\n"
             "- /auto codex <task title> [--project project_id]\n"
             "- /auto codex-write <task title> [--project project_id]\n"
             "Current behavior: /auto delegates to the sealed /run pipeline.",
