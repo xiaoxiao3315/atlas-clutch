@@ -5986,12 +5986,21 @@ def dispatch_context_summary(context_id: str) -> str:
 - playbook_advisory: {safe_preview(task_section(text, 'Playbook Advisory'), 240)}"""
 
 
-def build_dispatch_markdown(dispatch_id: str, task_id: str, target: str, with_context: bool) -> str:
+def build_dispatch_markdown(
+    dispatch_id: str,
+    task_id: str,
+    target: str,
+    with_context: bool,
+    requested_executor: str = "",
+    routing_reason: str = "",
+) -> str:
     normalized_task_id = normalize_task_id(task_id)
     task_text, _project_text, task_summary, _project_summary, _evidence_summary, _evidence_gaps, project_id, _status = task_summary_block(normalized_task_id)
     clean_target = target.strip().lower()
     if clean_target not in SUPPORTED_EXECUTOR_TARGETS:
         raise ValueError("target_executor must be codex, claude, or kiro")
+    clean_requested = str(requested_executor or "").strip().lower() or clean_target
+    clean_routing_reason = sanitize_sensitive_text(str(routing_reason or "").strip()) or "explicit target selection"
     title = task_title_from_text(normalized_task_id, task_text)
     now = iso_now()
     context_id = ""
@@ -6010,6 +6019,8 @@ sent_at:
 task_id: {normalized_task_id}
 project_id: {project_id}
 target_executor: {clean_target}
+requested_executor: {clean_requested}
+routing_reason: {safe_preview(clean_routing_reason, 180)}
 context_id: {context_id}
 mode: manual
 external_execution_enabled: false
@@ -6097,14 +6108,26 @@ def build_dispatch_create_reply(tail: str) -> str:
         return "Usage: /dispatch create <task_id> codex|claude|kiro|auto [--with-context]"
     task_id = normalize_task_id(parts[0])
     target = parts[1].lower()
+    requested_executor = target
+    routing_reason = "explicit target selection"
+    task_text = read_task(task_id)
     if target == "auto":
-        target = "codex"
+        routing_source = "\n".join(
+            [task_title_from_text(task_id, task_text), task_section(task_text, "Goal")]
+        )
+        target, routing_reason = route_auto_executor(routing_source)
     if target not in SUPPORTED_EXECUTOR_TARGETS:
         return "Usage: /dispatch create <task_id> codex|claude|kiro|auto [--with-context]"
     with_context = "--with-context" in [part.lower() for part in parts[2:]]
-    read_task(task_id)
     dispatch_id = generate_dispatch_id()
-    markdown = build_dispatch_markdown(dispatch_id, task_id, target, with_context)
+    markdown = build_dispatch_markdown(
+        dispatch_id,
+        task_id,
+        target,
+        with_context,
+        requested_executor=requested_executor,
+        routing_reason=routing_reason,
+    )
     write_dispatch(dispatch_id, markdown)
     meta = task_metadata(markdown)
     log_event("dispatch_created", dispatch_id=dispatch_id, task_id=task_id, target_executor=target)
@@ -6112,6 +6135,8 @@ def build_dispatch_create_reply(tail: str) -> str:
 - status: ready
 - task_id: {task_id}
 - target_executor: {target}
+- requested_executor: {requested_executor}
+- routing_reason: {safe_preview(routing_reason, 160)}
 - context_id: {meta.get('context_id') or 'none'}
 - path: workbench/dispatches/{dispatch_id}.md
 - external_execution_enabled: false
@@ -7631,6 +7656,27 @@ def probe_claude_workspace_write() -> dict:
     }
 
 
+def route_auto_executor(text: str, owner_write: bool = False) -> tuple[str, str]:
+    """Resolve an auto/default executor. Explicit targets never come here.
+
+    Policy: Claude writes code, Codex reviews. With no clear signal the
+    auto target stays on the current safe default (codex).
+    """
+    lines = [line for line in str(text or "").splitlines() if line.strip()]
+    review_of_claude = any(
+        re.search(r"\b(review|qa|audit|verify)\b", line, re.IGNORECASE)
+        and re.search(r"\bclaude\b", line, re.IGNORECASE)
+        for line in lines
+    )
+    if review_of_claude:
+        return "codex", "auto routing: read-only review of claude-written work goes to codex"
+    if owner_write:
+        return "claude", "auto routing: owner-write code task prefers claude writer with codex review gate"
+    if any(line_has_source_write_intent(line) or line_has_explicit_write_target(line) for line in lines):
+        return "claude", "auto routing: code-writing signal prefers claude writer with codex review gate"
+    return "codex", "auto routing: no clear code-writing signal; codex stays the safe default"
+
+
 def executor_probe_for_target(target_executor: str) -> dict:
     if target_executor == "claude":
         return probe_claude_noninteractive()
@@ -8908,14 +8954,27 @@ def reply_field(reply: str, field: str) -> str:
     return ""
 
 
-def create_codex_dispatch(task_id: str, with_context: bool = True, target: str = "codex") -> tuple[str, dict]:
+def create_codex_dispatch(
+    task_id: str,
+    with_context: bool = True,
+    target: str = "codex",
+    requested_executor: str = "",
+    routing_reason: str = "",
+) -> tuple[str, dict]:
     normalized_task_id = normalize_task_id(task_id)
     clean_target = str(target or "codex").strip().lower()
     if clean_target not in SUPPORTED_EXECUTOR_TARGETS:
         raise ValueError("target_executor must be codex, claude, or kiro")
     read_task(normalized_task_id)
     dispatch_id = generate_dispatch_id()
-    markdown = build_dispatch_markdown(dispatch_id, normalized_task_id, clean_target, with_context)
+    markdown = build_dispatch_markdown(
+        dispatch_id,
+        normalized_task_id,
+        clean_target,
+        with_context,
+        requested_executor=requested_executor,
+        routing_reason=routing_reason,
+    )
     write_dispatch(dispatch_id, markdown)
     meta = task_metadata(markdown)
     log_event("dispatch_created", dispatch_id=dispatch_id, task_id=normalized_task_id, target_executor=clean_target)
@@ -8931,7 +8990,13 @@ def one_command_next_action(record: dict | None, dispatch_id: str) -> str:
     return exec_next_action(record)
 
 
-def build_run_codex_reply(tail: str, owner_write_policy: bool = False, target: str = "codex") -> str:
+def build_run_codex_reply(
+    tail: str,
+    owner_write_policy: bool = False,
+    target: str = "codex",
+    requested_executor: str = "",
+    routing_reason: str = "",
+) -> str:
     clean_target = str(target or "codex").strip().lower()
     clean_title, project_id = parse_task_new_tail(tail)
     if not clean_title:
@@ -8949,7 +9014,13 @@ def build_run_codex_reply(tail: str, owner_write_policy: bool = False, target: s
     task_id, _task_text = create_task(clean_title, project_id=project_id)
     if project_id:
         attach_task_to_project(project_id, task_id)
-    dispatch_id, dispatch_meta = create_codex_dispatch(task_id, with_context=True, target=clean_target)
+    dispatch_id, dispatch_meta = create_codex_dispatch(
+        task_id,
+        with_context=True,
+        target=clean_target,
+        requested_executor=requested_executor,
+        routing_reason=routing_reason,
+    )
     start_reply = ""
     approval_reply = ""
     owner_write_policy_status = "not_requested"
@@ -9078,9 +9149,15 @@ Owner write approval summary:
         if owner_write_policy and approval_reply
         else ""
     )
+    routing_lines = (
+        f"\n- requested_executor: {requested_executor}"
+        f"\n- routing_reason: {safe_preview(routing_reason, 160)}"
+        if requested_executor
+        else ""
+    )
     return sanitize_sensitive_text(f"""{title}
 - status: {exec_status}
-- target_executor: {dispatch_meta.get('target_executor', '') or 'codex'}
+- target_executor: {dispatch_meta.get('target_executor', '') or 'codex'}{routing_lines}
 - command_chain: {command_chain}
 - task_id: {task_id}
 - dispatch_id: {dispatch_id}
@@ -12186,6 +12263,17 @@ def handle_run_command(user_text: str) -> str | None:
             # before any auto close. Plain "/run claude" stays read-only via
             # the standard exec start path.
             return build_run_codex_reply(tail, owner_write_policy=True, target="claude")
+        if subcommand in {"auto-write", "auto-owner-write"}:
+            # Default routing policy: Claude writes code, Codex reviews.
+            # Explicit /run codex-write and /run claude-write stay unchanged.
+            resolved_target, routing_reason = route_auto_executor(tail, owner_write=True)
+            return build_run_codex_reply(
+                tail,
+                owner_write_policy=True,
+                target=resolved_target,
+                requested_executor="auto",
+                routing_reason=routing_reason,
+            )
         return build_run_help_reply()
     except FileNotFoundError as exc:
         return f"run source not found: {safe_preview(str(exc), 180)}"
