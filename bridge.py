@@ -5752,10 +5752,10 @@ def build_context_archive_reply(context_id: str) -> str:
 def build_copyable_handoff_context(task_id: str, platform: str, advisory: str = "", create_file: bool = False) -> str:
     normalized_task_id = normalize_task_id(task_id)
     target = platform.strip().lower()
-    if target not in {"codex", "kiro", "generic"}:
-        raise ValueError("target must be codex, kiro, or generic")
+    if target not in {"codex", "claude", "kiro", "generic"}:
+        raise ValueError("target must be codex, claude, kiro, or generic")
     task_text, _project_text, task_summary, project_summary, evidence_summary, evidence_gaps, project_id, _status = task_summary_block(normalized_task_id)
-    display_target = "Codex" if target == "codex" else ("Kiro" if target == "kiro" else "Generic")
+    display_target = EXECUTOR_DISPLAY_NAMES.get(target, "Generic")
     advisory_text = advisory or playbook_advisory_for_task(normalized_task_id)
     context_file_line = "- context_file: not created"
     if create_file:
@@ -7416,14 +7416,24 @@ def is_allowed_external_command(argv: list[str]) -> bool:
         return False
     name = command_basename(argv[0])
     codex_names = {"codex", "codex.exe", "codex.cmd", "codex.bat"}
-    if name not in codex_names:
+    claude_names = {"claude", "claude.exe", "claude.cmd", "claude.bat"}
+    if name in codex_names:
+        if len(argv) == 2 and argv[1] == "--help":
+            return True
+        if len(argv) == 3 and argv[1:3] == ["exec", "--help"]:
+            return True
+        if len(argv) == 5 and argv[1:3] == ["exec", "--sandbox"] and argv[3] in RUNNER_SANDBOX_MODES and argv[4] == "-":
+            return True
         return False
-    if len(argv) == 2 and argv[1] == "--help":
-        return True
-    if len(argv) == 3 and argv[1:3] == ["exec", "--help"]:
-        return True
-    if len(argv) == 5 and argv[1:3] == ["exec", "--sandbox"] and argv[3] in RUNNER_SANDBOX_MODES and argv[4] == "-":
-        return True
+    if name in claude_names:
+        # Probe commands only.
+        if len(argv) == 2 and argv[1] in {"--version", "--help"}:
+            return True
+        # Read-only non-interactive print mode; prompt arrives via stdin only.
+        # No permission-bypass, no tool-allow, no workspace-write flags.
+        if len(argv) == 2 and argv[1] == "-p":
+            return True
+        return False
     return False
 
 
@@ -7552,13 +7562,43 @@ def probe_codex_workspace_write() -> dict:
 
 
 def probe_claude_noninteractive(sandbox_mode: str = "read-only") -> dict:
-    # Baseline recognition only: claude is a valid dispatch target, but no
-    # subprocess/SDK runner is wired yet, so the probe always fails closed.
+    # Real Claude CLI probe for read-only execution only. Workspace-write
+    # Claude execution is intentionally not enabled and stays fail-closed.
+    if sandbox_mode != "read-only":
+        return {
+            "supported": False,
+            "mode": "not_configured",
+            "reason": f"claude {sandbox_mode} execution is not enabled; only read-only is wired",
+            "command": [],
+        }
+    if os.environ.get("OHB_EXEC_SIMULATE_CLAUDE") == "1":
+        return {"supported": True, "mode": "simulated", "reason": "OHB_EXEC_SIMULATE_CLAUDE enabled", "command": []}
+    claude_path = shutil.which("claude")
+    if not claude_path:
+        return {"supported": False, "mode": "not_configured", "reason": "claude command not found", "command": []}
+    version = run_allowlisted_external_command([claude_path, "--version"], timeout=10)
+    if version.get("returncode") != 0:
+        return {
+            "supported": False,
+            "mode": "version_probe_failed",
+            "reason": f"claude --version failed with returncode {version.get('returncode')}",
+            "command": [],
+        }
+    help_result = run_allowlisted_external_command([claude_path, "--help"], timeout=10)
+    help_text = f"{help_result.get('stdout', '')}\n{help_result.get('stderr', '')}".lower()
+    if help_result.get("returncode") != 0 or "--print" not in help_text:
+        return {
+            "supported": False,
+            "mode": "unsupported_help_shape",
+            "reason": "claude --help did not expose a non-interactive print mode",
+            "command": [],
+        }
+    version_label = safe_preview(str(version.get("stdout", "")).strip() or "unknown version", 60)
     return {
-        "supported": False,
-        "mode": "not_configured",
-        "reason": f"claude executor is recognized but no {sandbox_mode} subprocess/SDK runner is configured yet",
-        "command": [],
+        "supported": True,
+        "mode": "claude_print_read_only_stdin",
+        "reason": f"claude CLI available ({version_label}); non-interactive print mode with prompt via stdin; no permission-bypass flags",
+        "command": [claude_path, "-p"],
     }
 
 
