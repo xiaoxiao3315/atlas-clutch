@@ -1761,7 +1761,7 @@ def update_evidence_mark(task_id: str, evidence_id: str, status: str, note: str)
         raise FileNotFoundError(f"evidence not found: {normalized_evidence_id}")
     section = match.group(0)
     if re.search(r"^verified:.*$", section, re.MULTILINE):
-        section = re.sub(r"^verified:.*$", f"verified: {clean_status}", section, count=1, flags=re.MULTILINE)
+        section = re.sub(r"^verified:.*$", lambda _m: f"verified: {clean_status}", section, count=1, flags=re.MULTILINE)
     else:
         section = section.rstrip() + f"\nverified: {clean_status}\n"
     section = section.rstrip() + f"\nmark_note: {iso_now()} {sanitize_sensitive_text(note).strip() or '未填写说明。'}\n"
@@ -2017,7 +2017,10 @@ def replace_task_field(text: str, field: str, value: str) -> str:
     replacement = f"{field}: {sanitize_sensitive_text(value)}"
     pattern = re.compile(rf"^{re.escape(field)}:.*$", re.MULTILINE)
     if pattern.search(text):
-        return pattern.sub(replacement, text, count=1)
+        # Use a callable replacement so backslashes in dynamic values
+        # (e.g. Windows paths like C:\Users\...) are never interpreted as
+        # regex replacement escapes ("bad escape \U").
+        return pattern.sub(lambda _match: replacement, text, count=1)
     return text.replace("\n\n## Goal", f"\n{replacement}\n\n## Goal", 1)
 
 
@@ -4844,8 +4847,8 @@ def update_registry_application_status(learn_id: str, application_status: str, n
         raise FileNotFoundError(f"learning registry entry not found: {normalized_learn_id}")
     text = path.read_text(encoding="utf-8")
     clean_status = sanitize_sensitive_text(application_status).strip()
-    text = re.sub(r"^application_status:.*$", f"application_status: {clean_status}", text, flags=re.MULTILINE)
-    text = re.sub(r"^-\s*application_status:.*$", f"- application_status: {clean_status}", text, flags=re.MULTILINE)
+    text = re.sub(r"^application_status:.*$", lambda _m: f"application_status: {clean_status}", text, flags=re.MULTILINE)
+    text = re.sub(r"^-\s*application_status:.*$", lambda _m: f"- application_status: {clean_status}", text, flags=re.MULTILINE)
     text = append_to_section(text, "Application History", f"- {iso_now()} application_status={clean_status} note={sanitize_sensitive_text(note).strip() or 'no note'}")
     path.write_text(sanitize_sensitive_text(text), encoding="utf-8")
     rebuild_registry_index()
@@ -4858,7 +4861,7 @@ def update_proposal_application_status(learn_id: str, application_status: str, n
     except FileNotFoundError:
         return
     clean_status = sanitize_sensitive_text(application_status).strip()
-    text = re.sub(r"^-\s*application_status:.*$", f"- application_status: {clean_status}", text, flags=re.MULTILINE)
+    text = re.sub(r"^-\s*application_status:.*$", lambda _m: f"- application_status: {clean_status}", text, flags=re.MULTILINE)
     text = re.sub(r"^- Application Status:.*$", f"- Application Status: {clean_status}", text, flags=re.MULTILINE)
     text = append_to_section(text, "Application Status", f"- {iso_now()} application_status: {clean_status} note={sanitize_sensitive_text(note).strip() or 'no note'}")
     write_proposal(normalized_learn_id, text)
@@ -7627,6 +7630,15 @@ def is_allowed_post_run_command(argv: list[str]) -> bool:
     return False
 
 
+def display_command_attempted(argv: list[str] | None) -> str:
+    """User-facing command string: keep flags, but reduce the executable to
+    its basename so Windows absolute paths are not exposed in replies."""
+    parts = [str(part) for part in (argv or [])]
+    if not parts:
+        return "none"
+    return " ".join([command_basename(parts[0])] + parts[1:])
+
+
 def windows_subprocess_argv(argv: list[str]) -> list[str]:
     """Return an argv that works for Windows .cmd/.bat shims with shell=False."""
     if os.name == "nt" and argv:
@@ -8385,7 +8397,7 @@ review_verdict: pass_candidate OR needs_revision OR failed
 def run_codex_review_of_claude_write(exec_id: str, dispatch_id: str, result: dict, post_run_snapshot: str) -> dict:
     probe = probe_codex_noninteractive("read-only")
     command = list(probe.get("command") or [])
-    command_attempted = " ".join(command) or "none"
+    command_attempted = display_command_attempted(command)
     if not probe.get("supported"):
         return {
             "status": "unavailable",
@@ -8451,7 +8463,7 @@ def execute_exec_runner(
         "started_at": now,
         "executor_status": executor_status_from_probe(target_executor, probe),
         "executor_reason": safe_preview(str(probe.get("reason", "")), 160),
-        "command_attempted": " ".join(probe.get("command") or []) or "none",
+        "command_attempted": display_command_attempted(probe.get("command")),
         "human_confirm_required": str(run_policy.human_confirm_required).lower(),
         "auto_execute_enabled": str(run_policy.auto_execute_enabled).lower(),
         "read_only_auto_run": "false" if write_mode else "true",
@@ -8845,7 +8857,7 @@ def build_exec_start_reply(dispatch_id: str) -> str:
     target_executor = task_metadata(read_exec(exec_id)).get("target_executor", "").strip().lower() or "codex"
     probe = executor_probe_for_target(target_executor)
     executor_status = executor_status_from_probe(target_executor, probe)
-    command_attempted = " ".join(probe.get("command") or []) or "none"
+    command_attempted = display_command_attempted(probe.get("command"))
     update_exec_fields(
         exec_id,
         {
