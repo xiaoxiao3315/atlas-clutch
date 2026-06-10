@@ -8054,6 +8054,14 @@ def extract_file_pack_targets(text: str) -> dict:
         while index < len(lines):
             bullet = FILE_PACK_BULLET_PATTERN.match(lines[index])
             if not bullet:
+                # A dash line that fails the strict bullet shape (e.g. a path
+                # with spaces) is an unsafe declaration, not the end of the
+                # block: silently dropping it would truncate the user's
+                # declared targets while the pack still validates.
+                if re.match(r"^\s*-\s*\S", lines[index]):
+                    unsafe.append(safe_preview(lines[index].strip(), 80))
+                    index += 1
+                    continue
                 break
             raw = bullet.group(1)
             target = normalize_fidelity_path(raw.rstrip(".,;:)]"))
