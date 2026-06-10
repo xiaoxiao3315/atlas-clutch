@@ -6773,8 +6773,8 @@ def resolve_write_approval_target(target_id: str) -> tuple[str, str, bool]:
                 )
             return normalize_exec_id(record.get("exec_id", "")), dispatch_id, False
         target = task_metadata(read_dispatch(dispatch_id)).get("target_executor", "").lower()
-        if target != "codex":
-            raise ValueError("dispatch target_executor must be codex for workspace-write approval")
+        if target not in {"codex", "claude"}:
+            raise ValueError("dispatch target_executor must be codex or claude for workspace-write approval")
         exec_id, _text = create_exec_session(dispatch_id)
         return exec_id, dispatch_id, True
     if re.fullmatch(r"EXEC-\d{8}-\d{6}(?:-\d{2})?", value):
@@ -6966,6 +6966,11 @@ owner_write_policy_reason:
 write_target_fidelity:
 post_run_target_fidelity:
 write_target_lines:
+writer_executor:
+reviewer_executor:
+review_required_by:
+codex_review_status:
+codex_review_reason:
 auto_postprocess_enabled: false
 auto_qa_done: false
 auto_evidence_verified: false
@@ -7433,6 +7438,11 @@ def is_allowed_external_command(argv: list[str]) -> bool:
         # No permission-bypass, no tool-allow, no workspace-write flags.
         if len(argv) == 2 and argv[1] == "-p":
             return True
+        # Owner-approved workspace-write shape: print mode with edit
+        # acceptance only. No --dangerously-skip-permissions, no tool
+        # allowlists, no arbitrary flags.
+        if len(argv) == 4 and argv[1:] == ["-p", "--permission-mode", "acceptEdits"]:
+            return True
         return False
     return False
 
@@ -7599,6 +7609,25 @@ def probe_claude_noninteractive(sandbox_mode: str = "read-only") -> dict:
         "mode": "claude_print_read_only_stdin",
         "reason": f"claude CLI available ({version_label}); non-interactive print mode with prompt via stdin; no permission-bypass flags",
         "command": [claude_path, "-p"],
+    }
+
+
+def probe_claude_workspace_write() -> dict:
+    # Narrow owner-approved write shape only. Availability checks are the
+    # same as the read-only probe; only the command shape differs.
+    base = probe_claude_noninteractive("read-only")
+    if not base.get("supported"):
+        return base
+    if base.get("mode") == "simulated":
+        return base
+    claude_path = (base.get("command") or [None])[0] or shutil.which("claude")
+    if not claude_path:
+        return {"supported": False, "mode": "not_configured", "reason": "claude command not found", "command": []}
+    return {
+        "supported": True,
+        "mode": "claude_print_workspace_write_stdin",
+        "reason": "claude CLI available; narrow accept-edits print mode for owner-approved workspace-write; no permission-bypass flags",
+        "command": [claude_path, "-p", "--permission-mode", "acceptEdits"],
     }
 
 
@@ -8126,6 +8155,88 @@ post_run_snapshot:
         pass
 
 
+CODEX_REVIEW_VERDICTS = {"pass_candidate", "needs_revision", "failed"}
+
+
+def build_codex_review_payload(exec_id: str, dispatch_id: str, result: dict, post_run_snapshot: str) -> str:
+    targets = extract_declared_owner_write_targets(exec_id, dispatch_id)
+    target_lines = "\n".join(f"- {target}" for target in targets) or "- none"
+    return sanitize_sensitive_text(
+        f"""# Codex Read-Only Review of Claude Write
+exec_id: {exec_id}
+dispatch_id: {dispatch_id}
+writer_executor: claude
+reviewer_executor: codex
+
+You are Codex acting as a read-only reviewer of work written by Claude.
+Do not modify any files. Do not run git add/commit/push. Do not deploy.
+Review the Claude write evidence below against the declared targets.
+
+## Declared allowed_write_targets
+{target_lines}
+
+## Claude runner stdout
+{runner_output_limit(str(result.get('stdout', '')), 4000) or '- empty'}
+
+## Claude runner stderr
+{runner_output_limit(str(result.get('stderr', '')), 1500) or '- empty'}
+
+## Post-run snapshot (changed paths evidence)
+{runner_output_limit(post_run_snapshot or '- not captured', 3000)}
+
+## Required verdict format
+Reply with exactly one line in this form, then evidence-based reasons:
+review_verdict: pass_candidate OR needs_revision OR failed
+"""
+    )
+
+
+def run_codex_review_of_claude_write(exec_id: str, dispatch_id: str, result: dict, post_run_snapshot: str) -> dict:
+    probe = probe_codex_noninteractive("read-only")
+    command = list(probe.get("command") or [])
+    command_attempted = " ".join(command) or "none"
+    if not probe.get("supported"):
+        return {
+            "status": "unavailable",
+            "reason": f"codex reviewer unavailable: {probe.get('reason', 'unknown')}",
+            "command_attempted": "none",
+            "returncode": "none",
+        }
+    if probe.get("mode") == "simulated" or not command:
+        return {
+            "status": "inconclusive",
+            "reason": "codex reviewer has no real read-only command; no review verdict",
+            "command_attempted": command_attempted,
+            "returncode": "none",
+        }
+    payload = build_codex_review_payload(exec_id, dispatch_id, result, post_run_snapshot)
+    review_result = run_allowlisted_external_command(command, input_text=payload, timeout=EXEC_START_TIMEOUT_SECONDS)
+    returncode = str(review_result.get("returncode"))
+    if review_result.get("returncode") != 0:
+        return {
+            "status": "failed",
+            "reason": f"codex review command failed with returncode {returncode}",
+            "command_attempted": command_attempted,
+            "returncode": returncode,
+        }
+    output = f"{review_result.get('stdout', '')}\n{review_result.get('stderr', '')}"
+    match = re.search(r"review_verdict:\s*(pass_candidate|needs_revision|failed)\b", output, re.IGNORECASE)
+    if not match:
+        return {
+            "status": "inconclusive",
+            "reason": "codex review returned no recognizable review_verdict line",
+            "command_attempted": command_attempted,
+            "returncode": returncode,
+        }
+    verdict = match.group(1).lower()
+    return {
+        "status": verdict,
+        "reason": f"codex read-only review verdict: {verdict}",
+        "command_attempted": command_attempted,
+        "returncode": returncode,
+    }
+
+
 def execute_exec_runner(
     exec_id: str,
     dispatch_id: str,
@@ -8245,6 +8356,25 @@ def execute_exec_runner(
             else completion["completion_state"]
         )
         update_exec_fields(exec_id, {"owner_write_policy_status": owner_status})
+    if write_mode and target_executor == "claude":
+        # Claude wrote; Codex must review read-only before any auto close.
+        review = run_codex_review_of_claude_write(exec_id, normalized_dispatch_id, result, post_run_snapshot)
+        update_exec_fields(
+            exec_id,
+            {
+                "codex_review_status": review["status"],
+                "codex_review_reason": safe_preview(str(review.get("reason", "")), 200),
+            },
+        )
+        append_exec_autostart_section(
+            exec_id,
+            "codex read-only review of claude write",
+            f"- codex_review_status: {review['status']}\n"
+            f"- codex_review_reason: {safe_preview(str(review.get('reason', '')), 200)}\n"
+            f"- review_command_attempted: {review.get('command_attempted', 'none')}\n"
+            f"- review_returncode: {review.get('returncode', 'none')}\n"
+            "- review_sandbox: read-only",
+        )
     if completion["completion_state"] in {"completed", "timeout_with_output"}:
         report = build_auto_runner_report(
             exec_id,
@@ -8599,14 +8729,39 @@ def build_exec_approve_reply(tail: str, owner_write_metadata: dict[str, str] | N
 - required_status: prepared OR needs_manual_start
 - reason: write approval requires an explicit prepared/manual-start execution or a dispatch id with no existing execution"""
     target_executor = meta.get("target_executor", "").lower()
-    if target_executor != "codex":
-        executor_status = "not_configured" if target_executor == "claude" else "unavailable"
+    requested_owner_policy = str((owner_write_metadata or {}).get("owner_write_policy", "")).lower() == "true"
+    if target_executor == "claude":
+        # Claude workspace-write is allowed only under explicit owner-approved
+        # write policy with resolvable declared allowed_write_targets.
+        # Claude-written work then requires Codex review before auto close.
+        claude_refusal_reason = ""
+        if not requested_owner_policy:
+            claude_refusal_reason = (
+                "claude workspace-write requires explicit owner write policy (/run claude-write); "
+                "plain write approval stays codex-only"
+            )
+        else:
+            declared_targets = extract_declared_owner_write_targets(exec_id, dispatch_id)
+            if not declared_targets:
+                claude_refusal_reason = (
+                    "claude workspace-write refused: declared allowed_write_targets missing or unresolved"
+                )
+        if claude_refusal_reason:
+            return f"""Execution approval refused: {exec_id}
+- target_executor: claude
+- executor_status: not_configured
+- executor_reason: {claude_refusal_reason}
+- command_attempted: none
+- reason: {claude_refusal_reason}
+- next: /exec package {exec_id}"""
+    elif target_executor != "codex":
+        executor_status = "unavailable"
         return f"""Execution approval refused: {exec_id}
 - target_executor: {target_executor or 'unknown'}
 - executor_status: {executor_status}
-- executor_reason: workspace-write runner is currently supported only for Codex dispatches
+- executor_reason: workspace-write runner is currently supported only for Codex and owner-approved Claude dispatches
 - command_attempted: none
-- reason: workspace-write runner is currently supported only for Codex dispatches
+- reason: workspace-write runner is currently supported only for Codex and owner-approved Claude dispatches
 - next: /exec package {exec_id}"""
     gate = write_approval_gate(dispatch_id)
     if not gate["ok"]:
@@ -8634,11 +8789,21 @@ def build_exec_approve_reply(tail: str, owner_write_metadata: dict[str, str] | N
         str(key): sanitize_sensitive_text(value)
         for key, value in (owner_write_metadata or {}).items()
     }
+    if target_executor == "claude":
+        # Claude writes; Codex must review before any auto close.
+        owner_write_fields.update(
+            {
+                "writer_executor": "claude",
+                "reviewer_executor": "codex",
+                "review_required_by": "codex",
+                "codex_review_status": "pending",
+            }
+        )
     if owner_write_fields:
         update_exec_fields(exec_id, owner_write_fields)
-    probe = probe_codex_workspace_write()
+    probe = probe_claude_workspace_write() if target_executor == "claude" else probe_codex_workspace_write()
     if not probe.get("supported"):
-        reason = f"codex workspace-write non-interactive unsupported: {probe.get('reason', 'unknown')}"
+        reason = f"{target_executor} workspace-write non-interactive unsupported: {probe.get('reason', 'unknown')}"
         extra_fields = {
             "auto_execute_enabled": "false",
             "write_confirmed": "true",
@@ -8743,14 +8908,17 @@ def reply_field(reply: str, field: str) -> str:
     return ""
 
 
-def create_codex_dispatch(task_id: str, with_context: bool = True) -> tuple[str, dict]:
+def create_codex_dispatch(task_id: str, with_context: bool = True, target: str = "codex") -> tuple[str, dict]:
     normalized_task_id = normalize_task_id(task_id)
+    clean_target = str(target or "codex").strip().lower()
+    if clean_target not in SUPPORTED_EXECUTOR_TARGETS:
+        raise ValueError("target_executor must be codex, claude, or kiro")
     read_task(normalized_task_id)
     dispatch_id = generate_dispatch_id()
-    markdown = build_dispatch_markdown(dispatch_id, normalized_task_id, "codex", with_context)
+    markdown = build_dispatch_markdown(dispatch_id, normalized_task_id, clean_target, with_context)
     write_dispatch(dispatch_id, markdown)
     meta = task_metadata(markdown)
-    log_event("dispatch_created", dispatch_id=dispatch_id, task_id=normalized_task_id, target_executor="codex")
+    log_event("dispatch_created", dispatch_id=dispatch_id, task_id=normalized_task_id, target_executor=clean_target)
     return dispatch_id, meta
 
 
@@ -8763,13 +8931,14 @@ def one_command_next_action(record: dict | None, dispatch_id: str) -> str:
     return exec_next_action(record)
 
 
-def build_run_codex_reply(tail: str, owner_write_policy: bool = False) -> str:
+def build_run_codex_reply(tail: str, owner_write_policy: bool = False, target: str = "codex") -> str:
+    clean_target = str(target or "codex").strip().lower()
     clean_title, project_id = parse_task_new_tail(tail)
     if not clean_title:
         return (
-            "Usage: /run codex-write <task title> [--project <project_id>]"
+            f"Usage: /run {clean_target}-write <task title> [--project <project_id>]"
             if owner_write_policy
-            else "Usage: /run codex <task title> [--project <project_id>]"
+            else f"Usage: /run {clean_target} <task title> [--project <project_id>]"
         )
     if project_id and not project_path(project_id).exists():
         return f"""One command task run refused
@@ -8780,7 +8949,7 @@ def build_run_codex_reply(tail: str, owner_write_policy: bool = False) -> str:
     task_id, _task_text = create_task(clean_title, project_id=project_id)
     if project_id:
         attach_task_to_project(project_id, task_id)
-    dispatch_id, dispatch_meta = create_codex_dispatch(task_id, with_context=True)
+    dispatch_id, dispatch_meta = create_codex_dispatch(task_id, with_context=True, target=clean_target)
     start_reply = ""
     approval_reply = ""
     owner_write_policy_status = "not_requested"
@@ -8911,7 +9080,7 @@ Owner write approval summary:
     )
     return sanitize_sensitive_text(f"""{title}
 - status: {exec_status}
-- target_executor: codex
+- target_executor: {dispatch_meta.get('target_executor', '') or 'codex'}
 - command_chain: {command_chain}
 - task_id: {task_id}
 - dispatch_id: {dispatch_id}
@@ -9128,6 +9297,10 @@ def build_exec_auto_postprocess_reply(
     if owner_write_policy:
         hard_gates["write_target_fidelity"] = exec_meta.get("write_target_fidelity") == "passed"
         hard_gates["post_run_target_fidelity"] = exec_meta.get("post_run_target_fidelity") == "passed"
+    if str(exec_meta.get("review_required_by", "")).strip().lower() == "codex":
+        # Claude-written work cannot auto-close without a codex pass_candidate
+        # review verdict; missing/pending/inconclusive reviews fail this gate.
+        hard_gates["codex_review"] = exec_meta.get("codex_review_status") == "pass_candidate"
     failed_hard = [name for name, ok in hard_gates.items() if not ok]
     if failed_hard:
         reason = "gate failed: " + ", ".join(failed_hard)
@@ -11939,6 +12112,8 @@ Auto Pipeline Closure:
             ("write_target_fidelity", exec_meta.get("write_target_fidelity") == "passed"),
             ("post_run_target_fidelity", exec_meta.get("post_run_target_fidelity") == "passed"),
         ])
+    if str(exec_meta.get("review_required_by", "")).strip().lower() == "codex":
+        gates.append(("codex_review", exec_meta.get("codex_review_status") == "pass_candidate"))
 
     failed = [name for name, ok in gates if not ok]
     if failed:
@@ -12006,6 +12181,11 @@ def handle_run_command(user_text: str) -> str | None:
             return build_run_codex_reply(tail)
         if subcommand in {"codex-write", "codex-owner-write"}:
             return build_run_codex_reply(tail, owner_write_policy=True)
+        if subcommand in {"claude-write", "claude-owner-write"}:
+            # Claude writes under owner write policy; Codex reviews read-only
+            # before any auto close. Plain "/run claude" stays read-only via
+            # the standard exec start path.
+            return build_run_codex_reply(tail, owner_write_policy=True, target="claude")
         return build_run_help_reply()
     except FileNotFoundError as exc:
         return f"run source not found: {safe_preview(str(exc), 180)}"
