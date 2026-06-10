@@ -1330,6 +1330,10 @@ def sanitize_title(title: str) -> str:
 def build_task_markdown(task_id: str, title: str, project_id: str = "") -> str:
     now = iso_now()
     clean_title = sanitize_title(title)
+    # The display title is truncated to 120 chars; keep the full original
+    # request so concrete acceptance criteria and executor prompts are not
+    # silently cut off for long commands.
+    original_request = sanitize_sensitive_text(" ".join(str(title or "").split())) or clean_title
     clean_project_id = validate_project_id(project_id) if project_id else ""
     return f"""# {task_id} {clean_title}
 
@@ -1344,6 +1348,9 @@ live_skipped: false
 
 ## Goal
 - {clean_title}
+
+## Original Request
+- {original_request}
 
 ## Scope
 - 仅围绕本任务目标生成人工执行工作单。
@@ -6919,7 +6926,10 @@ def claude_source_request_text(dispatch_id: str) -> str:
     if task_id:
         try:
             task_text = read_task(task_id)
-            parts = [task_title_from_text(task_id, task_text), task_section(task_text, "Goal")]
+            original_request = task_section(task_text, "Original Request")
+            title = task_title_from_text(task_id, task_text)
+            # Prefer the untruncated original request over the 120-char title.
+            parts = [original_request or title, task_section(task_text, "Goal")]
         except Exception:
             pass
     return "\n".join(part for part in parts if part and part.strip())
@@ -7141,6 +7151,9 @@ reviewer_executor:
 review_required_by:
 codex_review_status:
 codex_review_reason:
+acceptance_fidelity:
+acceptance_criteria_detected:
+acceptance_fidelity_reason:
 source_language:
 executor_prompt_language:
 executor_prompt_rendered_for:
@@ -7999,6 +8012,145 @@ def path_matches_owner_write_target(path: str, target: str) -> bool:
     )
 
 
+ACCEPTANCE_EXACT_ONE_LINE_PATTERN = re.compile(
+    r"\bwrite\s+exactly\s+one\s+line\s*[:：]\s*([^\n.。]+)", re.IGNORECASE
+)
+
+
+def extract_concrete_acceptance_checks(*texts: str) -> list[dict]:
+    """Narrow parser for concrete acceptance criteria.
+
+    Currently supports the explicit form "Write exactly one line: <content>".
+    The expected content is taken verbatim up to the sentence boundary.
+    """
+    checks: list[dict] = []
+    seen: set[str] = set()
+    for text in texts:
+        for line in str(text or "").splitlines():
+            for match in ACCEPTANCE_EXACT_ONE_LINE_PATTERN.finditer(line):
+                expected = match.group(1).strip()
+                if expected and expected not in seen:
+                    seen.add(expected)
+                    checks.append({"kind": "exact_one_line", "expected": expected})
+    return checks
+
+
+def read_declared_target_file(target: str, max_chars: int = 20000) -> dict:
+    """Read a declared allowed-write target only. Refuses absolute paths,
+    traversal, and secret-looking files. Never scans arbitrary files."""
+    clean = normalize_fidelity_path(target)
+    if not clean or re.match(r"^([A-Za-z]:|/)", clean) or ".." in clean.split("/"):
+        return {"ok": False, "error": f"unsafe target path refused: {safe_preview(clean, 80)}"}
+    if ".env" in Path(clean).name.lower():
+        return {"ok": False, "error": "secret-looking target refused"}
+    base = Path(WORKBENCH_DIR).parent
+    candidate = (base / clean).resolve()
+    try:
+        candidate.relative_to(base.resolve())
+    except ValueError:
+        return {"ok": False, "error": "target resolves outside workspace"}
+    if not candidate.exists() or not candidate.is_file():
+        return {"ok": False, "error": f"declared target file not found: {clean}"}
+    try:
+        content = candidate.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return {"ok": False, "error": f"declared target unreadable: {safe_preview(str(exc), 120)}"}
+    return {"ok": True, "content": content[:max_chars]}
+
+
+def evaluate_acceptance_fidelity(exec_id: str, dispatch_id: str) -> dict:
+    """Check Claude-written output against concrete user acceptance criteria.
+
+    - No criteria detected -> status "unknown" (existing target/review gates
+      keep covering the run; not gated).
+    - Criteria detected -> must verifiably pass against the declared target
+      file content, else "failed". Never fakes a pass.
+    """
+    scope_lines: list[str] = []
+    try:
+        scope_lines = owner_write_scope_lines(dispatch_id)
+    except Exception:
+        scope_lines = []
+    # Titles are truncated to 120 chars for display, so also read the full
+    # untruncated Original Request section from the task record.
+    try:
+        dispatch_task_id = task_metadata(read_dispatch(normalize_dispatch_id(dispatch_id))).get("task_id", "")
+        if dispatch_task_id:
+            task_text = read_task(dispatch_task_id)
+            scope_lines.append(task_section(task_text, "Original Request"))
+            scope_lines.append(task_section(task_text, "Goal"))
+    except Exception:
+        pass
+    try:
+        exec_meta = task_metadata(read_exec(exec_id))
+    except Exception:
+        exec_meta = {}
+    checks = extract_concrete_acceptance_checks(*scope_lines, str(exec_meta.get("write_target_lines", "")))
+    if not checks:
+        return {
+            "status": "unknown",
+            "detected": False,
+            "reason": "no concrete acceptance criteria detected; target and review gates apply",
+            "checks": [],
+        }
+    targets = extract_declared_owner_write_targets(exec_id, dispatch_id)
+    if not targets:
+        return {
+            "status": "failed",
+            "detected": True,
+            "reason": "criteria detected but no declared allowed_write_targets to verify against",
+            "checks": checks,
+        }
+    target = targets[0]
+    read_result = read_declared_target_file(target)
+    if not read_result.get("ok"):
+        return {
+            "status": "failed",
+            "detected": True,
+            "reason": f"criteria detected but target not verifiable: {read_result.get('error', 'unknown')}",
+            "checks": checks,
+        }
+    content = str(read_result.get("content", ""))
+    lines = [line.rstrip("\r") for line in content.rstrip("\n").split("\n")]
+    for check in checks:
+        if check["kind"] != "exact_one_line":
+            continue
+        expected = check["expected"]
+        if len(lines) != 1:
+            return {
+                "status": "failed",
+                "detected": True,
+                "reason": f"expected exactly one line in {target}; found {len(lines)} lines",
+                "checks": checks,
+            }
+        if lines[0].strip() != expected:
+            return {
+                "status": "failed",
+                "detected": True,
+                "reason": f"single line in {target} differs from expected content: {safe_preview(lines[0].strip(), 80)} != {safe_preview(expected, 80)}",
+                "checks": checks,
+            }
+    return {
+        "status": "passed",
+        "detected": True,
+        "reason": f"target {target} matches concrete acceptance criteria",
+        "checks": checks,
+    }
+
+
+def acceptance_fidelity_gate_ok(exec_meta: dict) -> bool:
+    """failed always blocks; when criteria were detected, only passed allows;
+    unknown without detected criteria is non-blocking (covered by the
+    existing target-fidelity and codex-review gates)."""
+    status = str(exec_meta.get("acceptance_fidelity", "")).strip().lower()
+    detected = str(exec_meta.get("acceptance_criteria_detected", "")).strip().lower() == "true"
+    if status == "failed":
+        return False
+    if detected and status != "passed":
+        return False
+    return True
+
+
 def owner_write_post_run_target_fidelity(
     exec_id: str, dispatch_id: str, post_run_snapshot: str, pre_run_snapshot: str = ""
 ) -> dict:
@@ -8364,6 +8516,17 @@ CODEX_REVIEW_VERDICTS = {"pass_candidate", "needs_revision", "failed"}
 def build_codex_review_payload(exec_id: str, dispatch_id: str, result: dict, post_run_snapshot: str) -> str:
     targets = extract_declared_owner_write_targets(exec_id, dispatch_id)
     target_lines = "\n".join(f"- {target}" for target in targets) or "- none"
+    acceptance = evaluate_acceptance_fidelity(exec_id, dispatch_id)
+    criteria_lines = "\n".join(
+        f"- {check['kind']}: {check['expected']}" for check in acceptance.get("checks", [])
+    ) or "- none detected"
+    target_content_block = "- no declared target to show"
+    if targets:
+        target_read = read_declared_target_file(targets[0], max_chars=4000)
+        if target_read.get("ok"):
+            target_content_block = f"target file: {targets[0]}\n```text\n{runner_output_limit(str(target_read.get('content', '')), 3500) or '- empty'}\n```"
+        else:
+            target_content_block = f"target file: {targets[0]}\n- not readable: {target_read.get('error', 'unknown')}"
     return sanitize_sensitive_text(
         f"""# Codex Read-Only Review of Claude Write
 exec_id: {exec_id}
@@ -8386,6 +8549,14 @@ Review the Claude write evidence below against the declared targets.
 
 ## Post-run snapshot (changed paths evidence)
 {runner_output_limit(post_run_snapshot or '- not captured', 3000)}
+
+## Concrete Acceptance Criteria (must be satisfied exactly)
+{criteria_lines}
+- bridge_acceptance_fidelity: {acceptance.get('status', 'unknown')}
+- bridge_acceptance_reason: {safe_preview(str(acceptance.get('reason', '')), 200)}
+
+## Declared Target File Content
+{target_content_block}
 
 ## Required verdict format
 Reply with exactly one line in this form, then evidence-based reasons:
@@ -8569,7 +8740,17 @@ def execute_exec_runner(
         )
         update_exec_fields(exec_id, {"owner_write_policy_status": owner_status})
     if write_mode and target_executor == "claude":
-        # Claude wrote; Codex must review read-only before any auto close.
+        # Claude wrote; check concrete user acceptance criteria first, then
+        # Codex must review read-only before any auto close.
+        acceptance = evaluate_acceptance_fidelity(exec_id, normalized_dispatch_id)
+        update_exec_fields(
+            exec_id,
+            {
+                "acceptance_fidelity": acceptance["status"],
+                "acceptance_criteria_detected": str(bool(acceptance.get("detected"))).lower(),
+                "acceptance_fidelity_reason": safe_preview(str(acceptance.get("reason", "")), 200),
+            },
+        )
         review = run_codex_review_of_claude_write(exec_id, normalized_dispatch_id, result, post_run_snapshot)
         update_exec_fields(
             exec_id,
@@ -9544,6 +9725,8 @@ def build_exec_auto_postprocess_reply(
         # Claude-written work cannot auto-close without a codex pass_candidate
         # review verdict; missing/pending/inconclusive reviews fail this gate.
         hard_gates["codex_review"] = exec_meta.get("codex_review_status") == "pass_candidate"
+        # Concrete user acceptance criteria, when detected, must verifiably pass.
+        hard_gates["acceptance_fidelity"] = acceptance_fidelity_gate_ok(exec_meta)
     failed_hard = [name for name, ok in hard_gates.items() if not ok]
     if failed_hard:
         reason = "gate failed: " + ", ".join(failed_hard)
@@ -12310,6 +12493,9 @@ def build_auto_routing_summary(run_reply: str, auto_triage: str = "") -> str:
 - writer_executor: {writer}
 - reviewer_executor: {reviewer}
 - codex_review_status: {review_status}
+- acceptance_fidelity: {exec_meta.get('acceptance_fidelity', '') or 'unknown'}
+- acceptance_criteria_detected: {exec_meta.get('acceptance_criteria_detected', '') or 'false'}
+- acceptance_fidelity_reason: {safe_preview(exec_meta.get('acceptance_fidelity_reason', '') or 'none', 160)}
 - auto_decision: {auto_decision}
 - next: {safe_preview(next_action, 200)}""")
 
@@ -12411,6 +12597,7 @@ Auto Pipeline Closure:
         ])
     if str(exec_meta.get("review_required_by", "")).strip().lower() == "codex":
         gates.append(("codex_review", exec_meta.get("codex_review_status") == "pass_candidate"))
+        gates.append(("acceptance_fidelity", acceptance_fidelity_gate_ok(exec_meta)))
 
     failed = [name for name, ok in gates if not ok]
     if failed:
