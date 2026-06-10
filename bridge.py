@@ -858,6 +858,50 @@ def read_only_false_pass_reasons(report: str) -> list[str]:
     return reasons
 
 
+VERIFICATION_DENIAL_PATTERNS = (
+    ("verification_not_run", r"\bverification(?:\s+(?:command|commands|step|steps))?\s+(?:was\s+|were\s+)?not\s+run\b"),
+    ("tests_not_run", r"\btests?\s+(?:was\s+|were\s+)?not\s+run\b"),
+    ("permission_denied", r"\bpermission\s+denied\b"),
+    ("hard_blocked", r"\bhard[- ]blocked\b"),
+    ("could_not_run", r"\bcould\s+not\s+(?:be\s+)?run\b"),
+    ("could_not_be_executed", r"\bcould\s+not\s+be\s+executed\b"),
+    ("unable_to_verify", r"\b(?:unable|not\s+able)\s+to\s+verify\b"),
+    ("cannot_verify", r"\b(?:cannot|can'?t)\s+verify\b"),
+    ("verification_skipped", r"\bverification(?:\s+(?:command|commands|step|steps))?\s+(?:was\s+|were\s+)?skipped\b"),
+    ("verification_unavailable", r"\bverification(?:\s+(?:command|commands|tool|tools))?\s+(?:is\s+|are\s+|was\s+|were\s+)?unavailable\b"),
+    ("refuses_to_fabricate_verification", r"\b(?:won'?t|will\s+not|refuse\s+to|refusing\s+to)\s+fabricate\s+verification\b"),
+)
+
+
+def evaluate_verification_result(runner_output: str) -> dict:
+    """Detect explicit executor reports that required verification commands
+    were denied, not run, unavailable, skipped, or could not be executed.
+
+    - Denial phrases found -> status "blocked" (auto close must not pass).
+    - No denial phrases -> status "not_blocked" (runs with no verification
+      requirement keep their existing gate behavior unchanged).
+    """
+    text = str(runner_output or "")
+    hits = [label for label, pattern in VERIFICATION_DENIAL_PATTERNS if re.search(pattern, text, re.IGNORECASE)]
+    if hits:
+        return {
+            "status": "blocked",
+            "reason": "executor reported required verification was denied or not run: " + ", ".join(hits[:4]),
+        }
+    return {
+        "status": "not_blocked",
+        "reason": "no explicit verification denial detected in runner output",
+    }
+
+
+def verification_gate_ok(exec_meta: dict) -> bool:
+    """blocked verification always blocks auto close; empty or not_blocked
+    statuses keep prior behavior (covered by the existing returncode,
+    target-fidelity, codex-review, and acceptance-fidelity gates)."""
+    status = str(exec_meta.get("verification_status", "")).strip().lower()
+    return status not in {"blocked", "denied", "failed", "not_run", "skipped", "unavailable"}
+
+
 def report_has_modified_files_field(report: str) -> bool:
     text = str(report or "")
     lowered = text.lower()
@@ -7154,6 +7198,8 @@ codex_review_reason:
 acceptance_fidelity:
 acceptance_criteria_detected:
 acceptance_fidelity_reason:
+verification_status:
+verification_reason:
 source_language:
 executor_prompt_language:
 executor_prompt_rendered_for:
@@ -8371,6 +8417,7 @@ def update_exec_fields(exec_id: str, fields: dict[str, str]) -> str:
 def persist_runner_result(exec_id: str, result: dict, probe: dict, completion: dict, post_run_snapshot: str = "") -> None:
     stdout = sanitize_sensitive_text(result.get("stdout", ""))
     stderr = sanitize_sensitive_text(result.get("stderr", ""))
+    verification = evaluate_verification_result(f"{stdout}\n{stderr}")
     fields = {
         "runner_mode": str(probe.get("mode", "")),
         "auto_run_mode": str(probe.get("mode", "")),
@@ -8381,6 +8428,8 @@ def persist_runner_result(exec_id: str, result: dict, probe: dict, completion: d
         "stderr_chars": completion["stderr_chars"],
         "completion_state": completion["completion_state"],
         "payload_state": completion["payload_state"],
+        "verification_status": verification["status"],
+        "verification_reason": safe_preview(str(verification["reason"]), 200),
     }
     update_exec_fields(exec_id, fields)
     now = iso_now()
@@ -8395,6 +8444,8 @@ def persist_runner_result(exec_id: str, result: dict, probe: dict, completion: d
                 f"- payload_state: {completion['payload_state']}",
                 f"- stdout_chars: {completion['stdout_chars']}",
                 f"- stderr_chars: {completion['stderr_chars']}",
+                f"- verification_status: {verification['status']}",
+                f"- verification_reason: {safe_preview(str(verification['reason']), 200)}",
                 f"- recorded_at: {now}",
             ]
         ),
@@ -9751,6 +9802,9 @@ def build_exec_auto_postprocess_reply(
         "dispatch_receive_synced": bool(receive_synced),
         "no_git_add_commit_push": True,
         "deploy_forbidden": True,
+        # Executor-reported verification denial (denied/not run/skipped/
+        # unavailable) always blocks; absent status keeps prior behavior.
+        "verification_result": verification_gate_ok(exec_meta),
     }
     if owner_write_policy:
         hard_gates["write_target_fidelity"] = exec_meta.get("write_target_fidelity") == "passed"
@@ -12622,6 +12676,7 @@ Auto Pipeline Closure:
         ("timed_out", str(exec_meta.get("timed_out", "")).lower() == "false"),
         ("completion_state", exec_meta.get("completion_state") == "completed"),
         ("payload_state", exec_meta.get("payload_state", "payload_seen") in {"payload_seen", ""}),
+        ("verification_result", verification_gate_ok(exec_meta)),
     ]
     if owner_write:
         gates.extend([
