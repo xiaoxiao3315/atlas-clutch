@@ -107,9 +107,13 @@ def main() -> int:
                 post_run_commands.append(list(argv))
                 if not bridge.is_allowed_post_run_command(list(argv)):
                     raise AssertionError(f"unexpected post-run command: {argv}")
+                # git status must report a clean tree: pre-existing dirty
+                # paths outside a run's declared targets now block auto close
+                # (worktree ownership gate); dirty-tree cases are exercised in
+                # autocommit_guard_synthetic_check.py.
                 return {
                     "returncode": 0,
-                    "stdout": " M bridge.py" if argv == ["git", "status", "--short"] else " bridge.py | 1 +",
+                    "stdout": "" if argv == ["git", "status", "--short"] else " bridge.py | 1 +",
                     "stderr": "",
                 }
 

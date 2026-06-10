@@ -7197,6 +7197,8 @@ owner_write_policy_status:
 owner_write_policy_reason:
 write_target_fidelity:
 post_run_target_fidelity:
+worktree_ownership:
+worktree_ownership_reason:
 write_target_lines:
 writer_executor:
 reviewer_executor:
@@ -8526,6 +8528,58 @@ def owner_write_post_run_target_fidelity(
     }
 
 
+def evaluate_worktree_ownership(
+    targets: list[str], post_run_snapshot: str, pre_run_snapshot: str
+) -> dict:
+    """Attribute working-tree dirt to the current run before auto close.
+
+    Path-level ownership: every dirty path — pre-existing baseline dirt and
+    post-run changes alike — must match a declared allowed-write target,
+    otherwise auto commit/close must not proceed as pass. Unlike
+    owner_write_post_run_target_fidelity (which judges only paths that became
+    dirty during the run), this gate also refuses to close over pre-existing
+    dirt that no declared target owns: a concurrent actor's uncommitted work
+    must never be swept into this run's commit or closure. Fail-closed when
+    git status is unavailable in either snapshot.
+    """
+    pre_returncode = post_run_snapshot_returncode(pre_run_snapshot, "git status --short")
+    post_returncode = post_run_snapshot_returncode(post_run_snapshot, "git status --short")
+    if pre_returncode != 0 or post_returncode != 0:
+        return {
+            "status": "blocked",
+            "unowned_paths": [],
+            "reason": "auto_commit_blocked: git status unavailable for ownership attribution",
+        }
+    baseline_paths = parse_git_status_short_paths(pre_run_snapshot)
+    unowned_baseline = [
+        path for path in baseline_paths
+        if not any(path_matches_owner_write_target(path, target) for target in targets)
+    ]
+    if unowned_baseline:
+        return {
+            "status": "blocked",
+            "unowned_paths": unowned_baseline,
+            "reason": "unowned_dirty_worktree: pre-run dirty paths outside current run targets: "
+            + "; ".join(unowned_baseline[:5]),
+        }
+    changed_paths = parse_git_status_short_paths(post_run_snapshot)
+    outside = [
+        path for path in changed_paths
+        if not any(path_matches_owner_write_target(path, target) for target in targets)
+    ]
+    if outside:
+        return {
+            "status": "blocked",
+            "unowned_paths": outside,
+            "reason": "changed_paths_outside_run_targets: " + "; ".join(outside[:5]),
+        }
+    return {
+        "status": "owned",
+        "unowned_paths": [],
+        "reason": "all dirty paths attributable to current run targets",
+    }
+
+
 def extract_test_results_summary(stdout: str) -> str:
     text = sanitize_sensitive_text(stdout)
     pattern = re.compile(r"(?im)^(test results|tests?|测试结果)\s*:\s*$")
@@ -9002,6 +9056,9 @@ def execute_exec_runner(
         owner_fidelity_result = owner_write_post_run_target_fidelity(
             exec_id, normalized_dispatch_id, post_run_snapshot, pre_run_snapshot
         )
+        ownership_result = evaluate_worktree_ownership(
+            owner_fidelity_result.get("targets", []), post_run_snapshot, pre_run_snapshot
+        )
         update_exec_fields(
             exec_id,
             {
@@ -9009,6 +9066,11 @@ def execute_exec_runner(
                 # the post-run verdict is gated via post_run_target_fidelity
                 # in every owner-write hard gate.
                 "post_run_target_fidelity": owner_fidelity_result["status"],
+                # worktree_ownership additionally blocks auto commit/close
+                # when any dirty path (pre-existing or new) is not owned by
+                # this run's declared targets.
+                "worktree_ownership": ownership_result["status"],
+                "worktree_ownership_reason": safe_preview(ownership_result["reason"], 240),
                 "write_target_lines": safe_preview(
                     "; ".join(owner_fidelity_result.get("targets", []))
                     or owner_write_fields.get("write_target_lines", "")
@@ -9017,6 +9079,13 @@ def execute_exec_runner(
                 ),
             },
         )
+        if ownership_result["status"] != "owned":
+            log_event(
+                "auto_commit_blocked",
+                exec_id=exec_id,
+                dispatch_id=normalized_dispatch_id,
+                reason=safe_preview(ownership_result["reason"], 160),
+            )
     persist_runner_result(exec_id, result, probe, completion, post_run_snapshot)
     if owner_write_policy:
         owner_status = (
@@ -10012,6 +10081,9 @@ def build_exec_auto_postprocess_reply(
     if owner_write_policy:
         hard_gates["write_target_fidelity"] = exec_meta.get("write_target_fidelity") == "passed"
         hard_gates["post_run_target_fidelity"] = exec_meta.get("post_run_target_fidelity") == "passed"
+        # Ownership attribution: auto commit/close may only proceed when every
+        # dirty path — including pre-run dirt — is owned by this run's targets.
+        hard_gates["worktree_ownership"] = exec_meta.get("worktree_ownership") == "owned"
     if str(exec_meta.get("review_required_by", "")).strip().lower() == "codex":
         # Claude-written work cannot auto-close without a codex pass_candidate
         # review verdict; missing/pending/inconclusive reviews fail this gate.
@@ -12904,6 +12976,7 @@ Auto Pipeline Closure:
             ("owner_write_policy_status", owner_status == "returned"),
             ("write_target_fidelity", exec_meta.get("write_target_fidelity") == "passed"),
             ("post_run_target_fidelity", exec_meta.get("post_run_target_fidelity") == "passed"),
+            ("worktree_ownership", exec_meta.get("worktree_ownership") == "owned"),
         ])
     if str(exec_meta.get("review_required_by", "")).strip().lower() == "codex":
         gates.append(("codex_review", exec_meta.get("codex_review_status") == "pass_candidate"))
