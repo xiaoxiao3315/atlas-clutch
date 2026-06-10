@@ -2721,15 +2721,19 @@ def task_status(task_id: str) -> str:
     return task_metadata(read_task(task_id)).get("status", "unknown")
 
 
+SUPPORTED_EXECUTOR_TARGETS = {"codex", "kiro", "claude"}
+EXECUTOR_DISPLAY_NAMES = {"codex": "Codex", "kiro": "Kiro", "claude": "Claude"}
+
+
 def build_task_handoff_reply(task_id: str, platform: str) -> str:
     platform_parts = platform.strip().lower().split()
     with_context = "--with-context" in platform_parts
     target = " ".join(part for part in platform_parts if part != "--with-context").strip()
-    if target not in {"codex", "kiro"}:
-        return "用法：/task handoff <task_id> codex|kiro [--with-context]"
+    if target not in SUPPORTED_EXECUTOR_TARGETS:
+        return "用法：/task handoff <task_id> codex|claude|kiro [--with-context]"
     text = read_task(task_id)
     title = task_title_from_text(task_id, text)
-    display_platform = "Codex" if target == "codex" else "Kiro"
+    display_platform = EXECUTOR_DISPLAY_NAMES.get(target, target.title())
     goal = task_section(text, "Goal") or "- 未填写。"
     scope = task_section(text, "Scope") or "- 未填写。"
     boundary = task_section(text, "Execution Boundary") or "- 未填写。"
@@ -5986,8 +5990,8 @@ def build_dispatch_markdown(dispatch_id: str, task_id: str, target: str, with_co
     normalized_task_id = normalize_task_id(task_id)
     task_text, _project_text, task_summary, _project_summary, _evidence_summary, _evidence_gaps, project_id, _status = task_summary_block(normalized_task_id)
     clean_target = target.strip().lower()
-    if clean_target not in {"codex", "kiro"}:
-        raise ValueError("target_executor must be codex or kiro")
+    if clean_target not in SUPPORTED_EXECUTOR_TARGETS:
+        raise ValueError("target_executor must be codex, claude, or kiro")
     title = task_title_from_text(normalized_task_id, task_text)
     now = iso_now()
     context_id = ""
@@ -6090,11 +6094,13 @@ Boundary: manual dispatch ledger only. It does not call Codex/Kiro, does not run
 def build_dispatch_create_reply(tail: str) -> str:
     parts = str(tail or "").strip().split()
     if len(parts) < 2:
-        return "Usage: /dispatch create <task_id> codex|kiro [--with-context]"
+        return "Usage: /dispatch create <task_id> codex|claude|kiro|auto [--with-context]"
     task_id = normalize_task_id(parts[0])
     target = parts[1].lower()
-    if target not in {"codex", "kiro"}:
-        return "Usage: /dispatch create <task_id> codex|kiro [--with-context]"
+    if target == "auto":
+        target = "codex"
+    if target not in SUPPORTED_EXECUTOR_TARGETS:
+        return "Usage: /dispatch create <task_id> codex|claude|kiro|auto [--with-context]"
     with_context = "--with-context" in [part.lower() for part in parts[2:]]
     read_task(task_id)
     dispatch_id = generate_dispatch_id()
@@ -6189,10 +6195,10 @@ def build_dispatch_package_reply(dispatch_id: str) -> str:
     meta = task_metadata(text)
     task_id = normalize_task_id(meta.get("task_id", ""))
     target = meta.get("target_executor", "").strip().lower()
-    if target not in {"codex", "kiro"}:
-        return "Dispatch target is invalid. Expected codex or kiro."
+    if target not in SUPPORTED_EXECUTOR_TARGETS:
+        return "Dispatch target is invalid. Expected codex, claude, or kiro."
     task_text = read_task(task_id)
-    display_target = "Codex" if target == "codex" else "Kiro"
+    display_target = EXECUTOR_DISPLAY_NAMES.get(target, target.title())
     latest_exec = latest_exec_for_dispatch(normalized_dispatch_id)
     latest_exec_id = latest_exec.get("exec_id") if latest_exec else "none"
     exec_status = latest_exec.get("status") if latest_exec else "none"
@@ -6912,8 +6918,8 @@ def build_exec_markdown(exec_id: str, dispatch_id: str) -> str:
     meta = task_metadata(dispatch_text)
     task_id = normalize_task_id(meta.get("task_id", ""))
     target = meta.get("target_executor", "").strip().lower()
-    if target not in {"codex", "kiro"}:
-        raise ValueError("dispatch target_executor must be codex or kiro")
+    if target not in SUPPORTED_EXECUTOR_TARGETS:
+        raise ValueError("dispatch target_executor must be codex, claude, or kiro")
     title = dispatch_title_from_text(normalized_dispatch_id, dispatch_text)
     now = iso_now()
     payload = build_exec_payload(normalized_exec_id, normalized_dispatch_id)
@@ -6943,6 +6949,9 @@ auto_run_mode:
 runner_probe:
 runner_mode:
 runner_sandbox:
+executor_status: pending
+executor_reason:
+command_attempted:
 returncode:
 timed_out: false
 stdout_chars: 0
@@ -7541,6 +7550,29 @@ def probe_codex_workspace_write() -> dict:
     return probe_codex_noninteractive("workspace-write")
 
 
+def probe_claude_noninteractive(sandbox_mode: str = "read-only") -> dict:
+    # Baseline recognition only: claude is a valid dispatch target, but no
+    # subprocess/SDK runner is wired yet, so the probe always fails closed.
+    return {
+        "supported": False,
+        "mode": "not_configured",
+        "reason": f"claude executor is recognized but no {sandbox_mode} subprocess/SDK runner is configured yet",
+        "command": [],
+    }
+
+
+def executor_probe_for_target(target_executor: str) -> dict:
+    if target_executor == "claude":
+        return probe_claude_noninteractive()
+    return probe_codex_noninteractive()
+
+
+def executor_status_from_probe(target_executor: str, probe: dict) -> str:
+    if probe.get("supported"):
+        return "available"
+    return "not_configured" if target_executor == "claude" else "unavailable"
+
+
 def build_manual_start_hint(exec_id: str, dispatch_id: str, reason: str) -> str:
     return sanitize_sensitive_text(f"""Manual start required for {exec_id}
 - reason: {reason}
@@ -7917,12 +7949,15 @@ def build_auto_runner_report(
     completion = completion or {"completion_state": "completed", "timed_out": "false"}
     stdout_summary = safe_preview(stdout, 1400) or "- none"
     stderr_summary = safe_preview(stderr, 800) or "- none"
-    return sanitize_sensitive_text(f"""Task id: {task_metadata(read_exec(exec_id)).get('task_id', '')}
+    exec_meta = task_metadata(read_exec(exec_id))
+    return sanitize_sensitive_text(f"""Task id: {exec_meta.get('task_id', '')}
 Dispatch id: {dispatch_id}
 Execution id: {exec_id}
 
 Execution summary:
 - Dispatch runner completed with mode={mode}.
+- Target executor: {exec_meta.get('target_executor', '') or 'codex'}
+- Executor status: {exec_meta.get('executor_status', '') or 'available'}
 - Runner sandbox: {sandbox_mode}
 - Return code: {result.get('returncode')}
 - Timed out: {completion.get('timed_out', 'false')}
@@ -8022,8 +8057,12 @@ def execute_exec_runner(
     }
     owner_write_policy = str(owner_write_fields.get("owner_write_policy", "")).lower() == "true"
     run_policy = run_policy_for_sandbox(sandbox_mode, owner_write_policy=owner_write_policy)
+    target_executor = task_metadata(read_exec(exec_id)).get("target_executor", "").strip().lower() or "codex"
     extra_fields = {
         "started_at": now,
+        "executor_status": executor_status_from_probe(target_executor, probe),
+        "executor_reason": safe_preview(str(probe.get("reason", "")), 160),
+        "command_attempted": " ".join(probe.get("command") or []) or "none",
         "human_confirm_required": str(run_policy.human_confirm_required).lower(),
         "auto_execute_enabled": str(run_policy.auto_execute_enabled).lower(),
         "read_only_auto_run": "false" if write_mode else "true",
@@ -8381,9 +8420,20 @@ def build_exec_start_reply(dispatch_id: str) -> str:
 - next: /exec approve {normalized_dispatch_id} write OR /exec approve {exec_id} write OR /exec package {exec_id}
 
 {hint}"""
-    probe = probe_codex_noninteractive()
+    target_executor = task_metadata(read_exec(exec_id)).get("target_executor", "").strip().lower() or "codex"
+    probe = executor_probe_for_target(target_executor)
+    executor_status = executor_status_from_probe(target_executor, probe)
+    command_attempted = " ".join(probe.get("command") or []) or "none"
+    update_exec_fields(
+        exec_id,
+        {
+            "executor_status": executor_status,
+            "executor_reason": safe_preview(str(probe.get("reason", "")), 160),
+            "command_attempted": command_attempted,
+        },
+    )
     if not probe.get("supported"):
-        reason = f"codex non-interactive unsupported: {probe.get('reason', 'unknown')}"
+        reason = f"{target_executor} non-interactive unsupported: {probe.get('reason', 'unknown')}"
         hint = mark_exec_needs_manual_start(exec_id, normalized_dispatch_id, reason)
         log_event("exec_needs_manual_start", exec_id=exec_id, dispatch_id=normalized_dispatch_id)
         return f"""Execution needs manual start: {exec_id}
@@ -8391,6 +8441,10 @@ def build_exec_start_reply(dispatch_id: str) -> str:
 - dispatch_id: {normalized_dispatch_id}
 - run_policy: {RUN_POLICY_MANUAL.name}
 - read_only_gate: passed
+- target_executor: {target_executor}
+- executor_status: {executor_status}
+- executor_reason: {safe_preview(str(probe.get('reason', 'unknown')), 200)}
+- command_attempted: {command_attempted}
 - runner_probe: {safe_preview(probe.get('mode', 'unknown'), 80)}
 - reason: {safe_preview(reason, 260)}
 - human_confirm_required: true
@@ -8454,8 +8508,12 @@ def build_exec_approve_reply(tail: str, owner_write_metadata: dict[str, str] | N
 - reason: write approval requires an explicit prepared/manual-start execution or a dispatch id with no existing execution"""
     target_executor = meta.get("target_executor", "").lower()
     if target_executor != "codex":
+        executor_status = "not_configured" if target_executor == "claude" else "unavailable"
         return f"""Execution approval refused: {exec_id}
 - target_executor: {target_executor or 'unknown'}
+- executor_status: {executor_status}
+- executor_reason: workspace-write runner is currently supported only for Codex dispatches
+- command_attempted: none
 - reason: workspace-write runner is currently supported only for Codex dispatches
 - next: /exec package {exec_id}"""
     gate = write_approval_gate(dispatch_id)
