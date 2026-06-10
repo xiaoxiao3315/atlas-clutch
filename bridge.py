@@ -6964,6 +6964,7 @@ owner_write_policy: false
 owner_write_policy_status:
 owner_write_policy_reason:
 write_target_fidelity:
+post_run_target_fidelity:
 write_target_lines:
 auto_postprocess_enabled: false
 auto_qa_done: false
