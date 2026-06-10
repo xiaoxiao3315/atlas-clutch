@@ -7502,7 +7502,12 @@ def owner_write_target_gate(dispatch_id: str) -> dict:
     target_lines = [
         sanitize_sensitive_text(line.strip())
         for line in combined.splitlines()
-        if line.strip() and (line_has_source_write_intent(line) or line_has_explicit_write_target(line))
+        if line.strip()
+        and (
+            line_has_source_write_intent(line)
+            or line_has_explicit_write_target(line)
+            or extract_explicit_owner_targets_from_line(line)
+        )
     ][:5]
     return {
         "ok": bool(target_lines),
@@ -7912,6 +7917,42 @@ def normalize_fidelity_path(value: str) -> str:
     return text
 
 
+OWNER_WRITE_TARGET_PATH_GROUP = (
+    r"[`'\"]?([A-Za-z0-9_.-]+(?:[\\/][A-Za-z0-9_.-]+)*\."
+    r"(?:txt|md|json|py|yaml|yml|toml|cmd|bat|ps1|tsx?|jsx?|css|html))\b"
+)
+EXPLICIT_OWNER_TARGET_EN_PATTERN = re.compile(
+    r"\bcreate or update only\s+" + OWNER_WRITE_TARGET_PATH_GROUP, re.IGNORECASE
+)
+# Narrow Chinese owner declarations, same single-line/same-phrase rule as the
+# English explicit form. Exactly two phrases are recognized:
+# "只允许修改 <path>" and "只允许创建或更新 <path>".
+EXPLICIT_OWNER_TARGET_CN_PATTERN = re.compile(
+    r"只允许(?:修改|创建或更新)\s*" + OWNER_WRITE_TARGET_PATH_GROUP, re.IGNORECASE
+)
+
+
+def extract_explicit_owner_targets_from_line(line: str) -> list[str]:
+    """Shared narrow English/Chinese explicit owner-write target extraction.
+
+    Used by both the owner-write preflight target gate and exec-time declared
+    target extraction so the two layers cannot drift. Per physical line only;
+    captures only the path immediately following the phrase. Unsafe paths
+    (absolute Windows/POSIX, traversal, .env-like) are refused.
+    """
+    targets: list[str] = []
+    for pattern in (EXPLICIT_OWNER_TARGET_EN_PATTERN, EXPLICIT_OWNER_TARGET_CN_PATTERN):
+        for match in pattern.finditer(str(line or "")):
+            target = normalize_fidelity_path(match.group(1).rstrip(".,;:)]"))
+            if not target or re.match(r"^([A-Za-z]:|/)", target) or ".." in target.split("/"):
+                continue
+            if ".env" in Path(target).name.lower():
+                continue
+            if target not in targets:
+                targets.append(target)
+    return targets
+
+
 def extract_declared_owner_write_targets(exec_id: str, dispatch_id: str) -> list[str]:
     try:
         exec_meta = task_metadata(read_exec(exec_id))
@@ -7936,19 +7977,6 @@ def extract_declared_owner_write_targets(exec_id: str, dispatch_id: str) -> list
         r"(?:txt|md|json|py|yaml|yml|toml|cmd|bat|ps1|tsx?|jsx?|css|html))\b",
         re.IGNORECASE,
     )
-    explicit_only_pattern = re.compile(
-        r"\bcreate or update only\s+[`'\"]?([A-Za-z0-9_.-]+(?:[\\/][A-Za-z0-9_.-]+)*\."
-        r"(?:txt|md|json|py|yaml|yml|toml|cmd|bat|ps1|tsx?|jsx?|css|html))\b",
-        re.IGNORECASE,
-    )
-    # Narrow Chinese owner declarations, same single-line/same-phrase rule as
-    # the English explicit form. Exactly two phrases are recognized:
-    # "只允许修改 <path>" and "只允许创建或更新 <path>".
-    explicit_cn_only_pattern = re.compile(
-        r"只允许(?:修改|创建或更新)\s*[`'\"]?([A-Za-z0-9_.-]+(?:[\\/][A-Za-z0-9_.-]+)*\."
-        r"(?:txt|md|json|py|yaml|yml|toml|cmd|bat|ps1|tsx?|jsx?|css|html))\b",
-        re.IGNORECASE,
-    )
     for block in source_lines:
         for line in block.splitlines():
             lowered = line.lower()
@@ -7958,20 +7986,10 @@ def extract_declared_owner_write_targets(exec_id: str, dispatch_id: str) -> list
                     if target and target not in targets:
                         targets.append(target)
                 continue
-            # Bridge's own explicit single-target declaration: accept only the
-            # path immediately following the phrase, on the same physical line.
-            # Strip trailing sentence punctuation from the captured target only.
-            # No arbitrary unlabeled path harvesting.
-            for match in explicit_only_pattern.finditer(line):
-                target = normalize_fidelity_path(match.group(1).rstrip(".,;:)]"))
-                if target and target not in targets:
-                    targets.append(target)
-            # Chinese declarations refuse absolute and traversal paths at
-            # parse time; only safe workspace-relative targets resolve.
-            for match in explicit_cn_only_pattern.finditer(line):
-                target = normalize_fidelity_path(match.group(1).rstrip(".,;:)]"))
-                if not target or re.match(r"^([A-Za-z]:|/)", target) or ".." in target.split("/"):
-                    continue
+            # Bridge-blessed explicit single-target declarations (English and
+            # narrow Chinese), per physical line, path-adjacent only. No
+            # arbitrary unlabeled path harvesting.
+            for target in extract_explicit_owner_targets_from_line(line):
                 if target not in targets:
                     targets.append(target)
     return targets
