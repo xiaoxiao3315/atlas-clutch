@@ -1617,6 +1617,7 @@ def generated_owner_write_exec_is_verified(task_id: str, exec_id: str) -> bool:
         "owner_write_policy": str(exec_meta.get("owner_write_policy", "")).lower() == "true",
         "owner_write_policy_status": exec_meta.get("owner_write_policy_status") == "returned",
         "write_target_fidelity": exec_meta.get("write_target_fidelity") == "passed",
+        "post_run_target_fidelity": exec_meta.get("post_run_target_fidelity") == "passed",
         "runner_sandbox": exec_meta.get("runner_sandbox") == "workspace-write",
         "write_confirmed": str(exec_meta.get("write_confirmed", "")).lower() == "true",
         "returncode": str(exec_meta.get("returncode")) == "0",
@@ -7584,6 +7585,167 @@ def collect_post_run_snapshot() -> str:
     return sanitize_sensitive_text("\n".join(lines))
 
 
+def normalize_fidelity_path(value: str) -> str:
+    text = str(value or "").strip().strip("`'\"")
+    text = text.strip(".,;:")
+    text = text.replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    return text
+
+
+def extract_declared_owner_write_targets(exec_id: str, dispatch_id: str) -> list[str]:
+    try:
+        exec_meta = task_metadata(read_exec(exec_id))
+    except Exception:
+        exec_meta = {}
+    labels = (
+        "allowed_write_targets",
+        "allowed write targets",
+        "write target",
+    )
+    source_lines = [str(exec_meta.get("write_target_lines", ""))]
+    try:
+        source_lines.extend(owner_write_scope_lines(dispatch_id))
+    except Exception:
+        pass
+    targets: list[str] = []
+    path_pattern = re.compile(
+        r"(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]+(?:[\\/][A-Za-z0-9_.-]+)*\."
+        r"(?:txt|md|json|py|yaml|yml|toml|cmd|bat|ps1|tsx?|jsx?|css|html))\b",
+        re.IGNORECASE,
+    )
+    for block in source_lines:
+        for line in block.splitlines():
+            lowered = line.lower()
+            if not any(label in lowered for label in labels):
+                continue
+            for match in path_pattern.finditer(line):
+                target = normalize_fidelity_path(match.group(1))
+                if target and target not in targets:
+                    targets.append(target)
+    return targets
+
+
+def post_run_snapshot_command_section(post_run_snapshot: str, label: str) -> str:
+    pattern = re.compile(rf"(?ms)^### {re.escape(label)}\s*$.*?(?=^### |\Z)")
+    match = pattern.search(str(post_run_snapshot or ""))
+    return match.group(0) if match else ""
+
+
+def post_run_snapshot_stdout_block(post_run_snapshot: str, label: str) -> str:
+    section = post_run_snapshot_command_section(post_run_snapshot, label)
+    match = re.search(r"(?ms)^stdout:\s*\n```text\n(.*?)\n```", section)
+    return match.group(1) if match else ""
+
+
+def post_run_snapshot_returncode(post_run_snapshot: str, label: str) -> int | None:
+    section = post_run_snapshot_command_section(post_run_snapshot, label)
+    match = re.search(r"(?m)^-\s*returncode:\s*(-?\d+)\s*$", section)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def parse_git_status_short_paths(post_run_snapshot: str) -> list[str]:
+    stdout_block = post_run_snapshot_stdout_block(post_run_snapshot, "git status --short")
+    paths: list[str] = []
+    for raw_line in stdout_block.splitlines():
+        line = raw_line.rstrip()
+        match = re.match(r"^([ MADRCU?!]{1,2})\s+(.+)$", line)
+        if not match:
+            continue
+        status = match.group(1)
+        if not any(ch in status for ch in "MADRCU?!"):
+            continue
+        path_text = match.group(2).strip()
+        if " -> " in path_text:
+            path_text = path_text.rsplit(" -> ", 1)[1].strip()
+        path = normalize_fidelity_path(path_text)
+        if path and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def path_matches_owner_write_target(path: str, target: str) -> bool:
+    clean_path = normalize_fidelity_path(path)
+    clean_target = normalize_fidelity_path(target)
+    return bool(clean_path and clean_target) and (
+        clean_path == clean_target or clean_path.startswith(clean_target.rstrip("/") + "/")
+    )
+
+
+def owner_write_post_run_target_fidelity(exec_id: str, dispatch_id: str, post_run_snapshot: str) -> dict:
+    targets = extract_declared_owner_write_targets(exec_id, dispatch_id)
+    status_section = post_run_snapshot_command_section(post_run_snapshot, "git status --short")
+    status_returncode = post_run_snapshot_returncode(post_run_snapshot, "git status --short")
+    changed_paths = parse_git_status_short_paths(post_run_snapshot)
+    if "...[truncated runner output]" in status_section:
+        return {
+            "status": "failed",
+            "targets": targets,
+            "changed_paths": changed_paths,
+            "unauthorized_paths": [],
+            "reason": "snapshot_truncated: git status --short section was truncated",
+            "git_status_returncode": status_returncode,
+        }
+    if not targets:
+        return {
+            "status": "failed",
+            "targets": targets,
+            "changed_paths": changed_paths,
+            "unauthorized_paths": [],
+            "reason": "target_unresolved: no declared allowed_write_targets/write target labels found",
+            "git_status_returncode": status_returncode,
+        }
+    if status_returncode != 0:
+        return {
+            "status": "failed",
+            "targets": targets,
+            "changed_paths": changed_paths,
+            "unauthorized_paths": [],
+            "reason": "git_status_returncode_missing_or_failed",
+            "git_status_returncode": status_returncode,
+        }
+    if not changed_paths:
+        return {
+            "status": "failed",
+            "targets": targets,
+            "changed_paths": changed_paths,
+            "unauthorized_paths": [],
+            "reason": "no_changed_files: owner-write produced no changed paths",
+            "git_status_returncode": status_returncode,
+        }
+    unauthorized = [
+        path for path in changed_paths
+        if not any(path_matches_owner_write_target(path, target) for target in targets)
+    ]
+    matched_allowed = [
+        path for path in changed_paths
+        if any(path_matches_owner_write_target(path, target) for target in targets)
+    ]
+    if unauthorized:
+        status = "failed"
+        reason = "post-run changed paths outside declared targets"
+    elif not matched_allowed:
+        status = "failed"
+        reason = "no_changed_files: no changed path matched declared targets"
+    else:
+        status = "passed"
+        reason = "post-run changed paths stayed inside declared targets"
+    return {
+        "status": status,
+        "targets": targets,
+        "changed_paths": changed_paths,
+        "unauthorized_paths": unauthorized,
+        "reason": reason,
+        "git_status_returncode": status_returncode,
+    }
+
+
 def extract_test_results_summary(stdout: str) -> str:
     text = sanitize_sensitive_text(stdout)
     pattern = re.compile(r"(?im)^(test results|tests?|测试结果)\s*:\s*$")
@@ -7926,6 +8088,22 @@ def execute_exec_runner(
     task_id = task_metadata(read_exec(exec_id)).get("task_id", "")
     completion = classify_runner_completion(exec_id, normalized_dispatch_id, task_id, result)
     post_run_snapshot = collect_post_run_snapshot()
+    owner_fidelity_result = None
+    if owner_write_policy:
+        owner_fidelity_result = owner_write_post_run_target_fidelity(exec_id, normalized_dispatch_id, post_run_snapshot)
+        update_exec_fields(
+            exec_id,
+            {
+                "write_target_fidelity": owner_fidelity_result["status"],
+                "post_run_target_fidelity": owner_fidelity_result["status"],
+                "write_target_lines": safe_preview(
+                    "; ".join(owner_fidelity_result.get("targets", []))
+                    or owner_write_fields.get("write_target_lines", "")
+                    or "none",
+                    240,
+                ),
+            },
+        )
     persist_runner_result(exec_id, result, probe, completion, post_run_snapshot)
     if owner_write_policy:
         owner_status = (
@@ -7991,6 +8169,7 @@ def execute_exec_runner(
 - dispatch_receive_synced: true
 - evidence_intake: generated through dispatch/task report chain
 - post_run_snapshot: recorded
+- owner_write_post_run_fidelity: {owner_fidelity_result.get('status') if owner_fidelity_result else 'not_applicable'}
 - no_git_add_commit_push: true
 - deploy_forbidden: true
 - next: /dispatch qa {normalized_dispatch_id}, then /task review {task_metadata(read_exec(exec_id)).get('task_id', '')}
@@ -8516,16 +8695,21 @@ def build_run_codex_reply(tail: str, owner_write_policy: bool = False) -> str:
     if owner_preflight_stopped:
         exec_status = owner_write_policy_status
     if owner_write_policy and exec_id != "none":
+        current_exec_meta = task_metadata(read_exec(exec_id))
+        final_write_target_fidelity = current_exec_meta.get("write_target_fidelity") or write_target_fidelity
+        final_write_target_lines = current_exec_meta.get("write_target_lines") or write_target_lines
         update_exec_fields(
             exec_id,
             {
                 "owner_write_policy": "true",
                 "owner_write_policy_status": owner_write_policy_status,
                 "owner_write_policy_reason": owner_write_policy_reason,
-                "write_target_fidelity": write_target_fidelity,
-                "write_target_lines": write_target_lines,
+                "write_target_fidelity": final_write_target_fidelity,
+                "write_target_lines": final_write_target_lines,
             },
         )
+        write_target_fidelity = final_write_target_fidelity
+        write_target_lines = final_write_target_lines
     exec_meta = task_metadata(read_exec(exec_id)) if record and exec_id != "none" else {}
     read_only_gate = reply_field(start_reply, "read_only_gate") or ("bypassed_owner_write_policy" if owner_write_policy else "not_reported")
     auto_execute_enabled = exec_meta.get("auto_execute_enabled", "false")
@@ -8791,6 +8975,9 @@ def build_exec_auto_postprocess_reply(
         "no_git_add_commit_push": True,
         "deploy_forbidden": True,
     }
+    if owner_write_policy:
+        hard_gates["write_target_fidelity"] = exec_meta.get("write_target_fidelity") == "passed"
+        hard_gates["post_run_target_fidelity"] = exec_meta.get("post_run_target_fidelity") == "passed"
     failed_hard = [name for name, ok in hard_gates.items() if not ok]
     if failed_hard:
         reason = "gate failed: " + ", ".join(failed_hard)
@@ -11600,6 +11787,7 @@ Auto Pipeline Closure:
         gates.extend([
             ("owner_write_policy_status", owner_status == "returned"),
             ("write_target_fidelity", exec_meta.get("write_target_fidelity") == "passed"),
+            ("post_run_target_fidelity", exec_meta.get("post_run_target_fidelity") == "passed"),
         ])
 
     failed = [name for name, ok in gates if not ok]
