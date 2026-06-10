@@ -1383,7 +1383,9 @@ def build_task_markdown(task_id: str, title: str, project_id: str = "") -> str:
     # The display title is truncated to 120 chars; keep the full original
     # request so concrete acceptance criteria and executor prompts are not
     # silently cut off for long commands.
-    original_request = sanitize_sensitive_text(" ".join(str(title or "").split())) or clean_title
+    # Preserve line structure: bounded file-pack declarations use bullet
+    # lists, so newlines are significant. Only trim outer whitespace.
+    original_request = sanitize_sensitive_text(str(title or "").strip()) or clean_title
     clean_project_id = validate_project_id(project_id) if project_id else ""
     return f"""# {task_id} {clean_title}
 
@@ -1400,7 +1402,7 @@ live_skipped: false
 - {clean_title}
 
 ## Original Request
-- {original_request}
+{original_request}
 
 ## Scope
 - 仅围绕本任务目标生成人工执行工作单。
@@ -7555,6 +7557,16 @@ def owner_write_target_gate(dispatch_id: str) -> dict:
             task_section(task_text, "Original Request"),
         ]
     )
+    # Bounded multi-file packs are judged as a whole, before any per-line
+    # acceptance: an invalid pack (unsafe path, too many targets) must refuse
+    # preflight even if other lines carry write intent.
+    pack = extract_file_pack_targets(combined)
+    if pack["found"] and not pack["ok"]:
+        return {
+            "ok": False,
+            "target_lines": [],
+            "reason": f"file pack refused: {pack['reason']}",
+        }
     target_lines = [
         sanitize_sensitive_text(line.strip())
         for line in combined.splitlines()
@@ -7565,6 +7577,10 @@ def owner_write_target_gate(dispatch_id: str) -> dict:
             or extract_explicit_owner_targets_from_line(line)
         )
     ][:5]
+    if pack["found"] and pack["ok"]:
+        pack_line = sanitize_sensitive_text("allowed_write_targets: " + "; ".join(pack["targets"]))
+        target_lines = [pack_line] + [line for line in target_lines if line != pack_line]
+        target_lines = target_lines[:5]
     return {
         "ok": bool(target_lines),
         "target_lines": target_lines,
@@ -7905,6 +7921,8 @@ def route_auto_executor(text: str, owner_write: bool = False) -> tuple[str, str]
         return "codex", "auto routing: read-only review of claude-written work goes to codex"
     if owner_write:
         return "claude", "auto routing: owner-write code task prefers claude writer with codex review gate"
+    if extract_file_pack_targets(text)["found"]:
+        return "claude", "auto routing: file pack declaration prefers claude writer with codex review gate"
     if any(
         line_has_source_write_intent(line)
         or line_has_explicit_write_target(line)
@@ -8000,6 +8018,78 @@ EXPLICIT_OWNER_TARGET_CN_PATTERN = re.compile(
 # "写入一行：<content>" and "只写一行：<content>".
 CJK_WRITE_ONE_LINE_INTENT_PATTERN = re.compile(r"(?:写入一行|只写一行)\s*[:：]")
 
+# Bounded multi-file "file pack" declarations: a bare heading line followed
+# by consecutive "- <path>" bullets. Exactly these headings, nothing broader.
+FILE_PACK_HEADING_PATTERN = re.compile(
+    r"^\s*(?:allowed write targets|只允许创建或更新)\s*[:：]\s*$", re.IGNORECASE
+)
+FILE_PACK_BULLET_PATTERN = re.compile(r"^\s*-\s+(\S+)\s*$")
+FILE_PACK_SAFE_TARGET_PATTERN = re.compile(
+    r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\."
+    r"(?:txt|md|json|py|yaml|yml|toml|cmd|bat|ps1|tsx?|jsx?|css|html)$",
+    re.IGNORECASE,
+)
+FILE_PACK_MAX_TARGETS = 5
+
+
+def extract_file_pack_targets(text: str) -> dict:
+    """Parse bounded bullet-list owner-write target blocks.
+
+    Returns {"found", "ok", "targets", "unsafe", "reason"}. Fail-closed:
+    any unsafe bullet (absolute, traversal, .env-like, disallowed extension)
+    or more than FILE_PACK_MAX_TARGETS deduped targets marks the whole pack
+    not ok, which must refuse owner-write preflight.
+    """
+    lines = str(text or "").splitlines()
+    found = False
+    targets: list[str] = []
+    unsafe: list[str] = []
+    index = 0
+    while index < len(lines):
+        if not FILE_PACK_HEADING_PATTERN.match(lines[index]):
+            index += 1
+            continue
+        found = True
+        index += 1
+        while index < len(lines):
+            bullet = FILE_PACK_BULLET_PATTERN.match(lines[index])
+            if not bullet:
+                break
+            raw = bullet.group(1)
+            target = normalize_fidelity_path(raw.rstrip(".,;:)]"))
+            if (
+                not target
+                or re.match(r"^([A-Za-z]:|/)", target)
+                or ".." in target.split("/")
+                or ".env" in Path(target).name.lower()
+                or not FILE_PACK_SAFE_TARGET_PATTERN.match(target)
+            ):
+                unsafe.append(safe_preview(raw, 80))
+            elif target not in targets:
+                targets.append(target)
+            index += 1
+    if not found:
+        return {"found": False, "ok": False, "targets": [], "unsafe": [], "reason": "no file pack heading"}
+    if unsafe:
+        return {
+            "found": True,
+            "ok": False,
+            "targets": targets,
+            "unsafe": unsafe,
+            "reason": "file pack contains unsafe target paths: " + "; ".join(unsafe[:3]),
+        }
+    if len(targets) > FILE_PACK_MAX_TARGETS:
+        return {
+            "found": True,
+            "ok": False,
+            "targets": targets,
+            "unsafe": [],
+            "reason": f"file pack declares {len(targets)} targets; maximum is {FILE_PACK_MAX_TARGETS}",
+        }
+    if not targets:
+        return {"found": True, "ok": False, "targets": [], "unsafe": [], "reason": "file pack heading without any valid target bullet"}
+    return {"found": True, "ok": True, "targets": targets, "unsafe": [], "reason": "file pack targets accepted"}
+
 
 def line_has_cjk_write_one_line_intent(line: str) -> bool:
     return bool(CJK_WRITE_ONE_LINE_INTENT_PATTERN.search(str(line or "")))
@@ -8051,6 +8141,13 @@ def extract_declared_owner_write_targets(exec_id: str, dispatch_id: str) -> list
         re.IGNORECASE,
     )
     for block in source_lines:
+        # Bounded multi-file pack blocks (heading + bullets). Only packs that
+        # pass the fail-closed pack validation contribute targets.
+        pack = extract_file_pack_targets(block)
+        if pack["found"] and pack["ok"]:
+            for target in pack["targets"]:
+                if target not in targets:
+                    targets.append(target)
         for line in block.splitlines():
             lowered = line.lower()
             if any(label in lowered for label in labels):
@@ -8127,25 +8224,65 @@ ACCEPTANCE_EXACT_ONE_LINE_PATTERN = re.compile(
 ACCEPTANCE_EXACT_ONE_LINE_CN_PATTERN = re.compile(
     r"(?:写入一行|只写一行)\s*[:：]\s*([^\n.。]+)"
 )
+# Bounded per-target acceptance blocks: an "Acceptance:"/"验收:" heading line
+# followed by "- <path> => <exact-one-line form>: <content>" bullets.
+ACCEPTANCE_BLOCK_HEADING_PATTERN = re.compile(r"^\s*(?:acceptance|验收)\s*[:：]\s*$", re.IGNORECASE)
+ACCEPTANCE_TARGET_BULLET_PATTERN = re.compile(
+    r"^\s*-\s+(\S+)\s*=>\s*(?:exactly\s+one\s+line|写入一行|只写一行)\s*[:：]\s*([^\n.。]+)",
+    re.IGNORECASE,
+)
 
 
 def extract_concrete_acceptance_checks(*texts: str) -> list[dict]:
     """Narrow parser for concrete acceptance criteria.
 
-    Supports the explicit English form "Write exactly one line: <content>"
-    and its two narrow CJK equivalents (写入一行/只写一行). The expected
-    content is taken verbatim up to the sentence boundary.
+    Supports the explicit English form "Write exactly one line: <content>",
+    its two narrow CJK equivalents (写入一行/只写一行), and bounded
+    per-target acceptance blocks ("Acceptance:"/"验收:" heading followed by
+    "- <path> => exactly one line: <content>" bullets). Expected content is
+    taken verbatim up to the sentence boundary. Target-specific checks carry
+    a "target" key; generic checks have target "".
     """
     checks: list[dict] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, str]] = set()
+
+    def add(expected: str, target: str = "") -> None:
+        expected = expected.strip()
+        clean_target = normalize_fidelity_path(target) if target else ""
+        key = (clean_target, expected)
+        if expected and key not in seen:
+            seen.add(key)
+            checks.append({"kind": "exact_one_line", "expected": expected, "target": clean_target})
+
     for text in texts:
-        for line in str(text or "").splitlines():
-            for pattern in (ACCEPTANCE_EXACT_ONE_LINE_PATTERN, ACCEPTANCE_EXACT_ONE_LINE_CN_PATTERN):
-                for match in pattern.finditer(line):
-                    expected = match.group(1).strip()
-                    if expected and expected not in seen:
-                        seen.add(expected)
-                        checks.append({"kind": "exact_one_line", "expected": expected})
+        lines = str(text or "").splitlines()
+        index = 0
+        while index < len(lines):
+            line = lines[index]
+            if ACCEPTANCE_BLOCK_HEADING_PATTERN.match(line):
+                index += 1
+                while index < len(lines):
+                    bullet = ACCEPTANCE_TARGET_BULLET_PATTERN.match(lines[index])
+                    if not bullet:
+                        break
+                    add(bullet.group(2), bullet.group(1))
+                    index += 1
+                continue
+            # Standalone per-target bullet outside a heading is still explicit.
+            standalone = ACCEPTANCE_TARGET_BULLET_PATTERN.match(line)
+            if standalone:
+                add(standalone.group(2), standalone.group(1))
+                index += 1
+                continue
+            # Lines carrying "=>" target-specific acceptance syntax must never
+            # feed the generic parsers: flattened titles collapse the bullet
+            # block onto one line, and a generic no-target criterion harvested
+            # from it would wrongly trip the multi-target ambiguity gate.
+            if "=>" not in line:
+                for pattern in (ACCEPTANCE_EXACT_ONE_LINE_PATTERN, ACCEPTANCE_EXACT_ONE_LINE_CN_PATTERN):
+                    for match in pattern.finditer(line):
+                        add(match.group(1))
+            index += 1
     return checks
 
 
@@ -8215,39 +8352,57 @@ def evaluate_acceptance_fidelity(exec_id: str, dispatch_id: str) -> dict:
             "reason": "criteria detected but no declared allowed_write_targets to verify against",
             "checks": checks,
         }
-    target = targets[0]
-    read_result = read_declared_target_file(target)
-    if not read_result.get("ok"):
-        return {
-            "status": "failed",
-            "detected": True,
-            "reason": f"criteria detected but target not verifiable: {read_result.get('error', 'unknown')}",
-            "checks": checks,
-        }
-    content = str(read_result.get("content", ""))
-    lines = [line.rstrip("\r") for line in content.rstrip("\n").split("\n")]
-    for check in checks:
+
+    def fail(reason: str) -> dict:
+        return {"status": "failed", "detected": True, "reason": reason, "checks": checks}
+
+    def check_exact_one_line(target: str, expected: str) -> str:
+        read_result = read_declared_target_file(target)
+        if not read_result.get("ok"):
+            return f"target not verifiable: {read_result.get('error', 'unknown')}"
+        content = str(read_result.get("content", ""))
+        lines = [line.rstrip("\r") for line in content.rstrip("\n").split("\n")]
+        if len(lines) != 1:
+            return f"expected exactly one line in {target}; found {len(lines)} lines"
+        if lines[0].strip() != expected:
+            return (
+                f"single line in {target} differs from expected content: "
+                f"{safe_preview(lines[0].strip(), 80)} != {safe_preview(expected, 80)}"
+            )
+        return ""
+
+    target_specific = [check for check in checks if check.get("target")]
+    generic = [check for check in checks if not check.get("target")]
+
+    # Target-specific acceptance may only reference declared targets.
+    for check in target_specific:
+        if check["target"] not in targets:
+            return fail(
+                f"acceptance target {check['target']} is not in declared allowed_write_targets"
+            )
+    # A generic exact-one-line criterion is ambiguous when several targets are
+    # declared: do not guess which file it applies to.
+    if generic and len(targets) > 1:
+        return fail(
+            f"ambiguous acceptance: exact-one-line criterion without target while {len(targets)} targets are declared"
+        )
+    for check in target_specific:
         if check["kind"] != "exact_one_line":
             continue
-        expected = check["expected"]
-        if len(lines) != 1:
-            return {
-                "status": "failed",
-                "detected": True,
-                "reason": f"expected exactly one line in {target}; found {len(lines)} lines",
-                "checks": checks,
-            }
-        if lines[0].strip() != expected:
-            return {
-                "status": "failed",
-                "detected": True,
-                "reason": f"single line in {target} differs from expected content: {safe_preview(lines[0].strip(), 80)} != {safe_preview(expected, 80)}",
-                "checks": checks,
-            }
+        error = check_exact_one_line(check["target"], check["expected"])
+        if error:
+            return fail(error)
+    for check in generic:
+        if check["kind"] != "exact_one_line":
+            continue
+        error = check_exact_one_line(targets[0], check["expected"])
+        if error:
+            return fail(error)
+    verified = sorted({check["target"] or targets[0] for check in checks})
     return {
         "status": "passed",
         "detected": True,
-        "reason": f"target {target} matches concrete acceptance criteria",
+        "reason": "concrete acceptance criteria satisfied for: " + "; ".join(verified),
         "checks": checks,
     }
 
@@ -8637,15 +8792,21 @@ def build_codex_review_payload(exec_id: str, dispatch_id: str, result: dict, pos
     target_lines = "\n".join(f"- {target}" for target in targets) or "- none"
     acceptance = evaluate_acceptance_fidelity(exec_id, dispatch_id)
     criteria_lines = "\n".join(
-        f"- {check['kind']}: {check['expected']}" for check in acceptance.get("checks", [])
+        f"- {check['kind']}{(' [' + check['target'] + ']') if check.get('target') else ''}: {check['expected']}"
+        for check in acceptance.get("checks", [])
     ) or "- none detected"
     target_content_block = "- no declared target to show"
     if targets:
-        target_read = read_declared_target_file(targets[0], max_chars=4000)
-        if target_read.get("ok"):
-            target_content_block = f"target file: {targets[0]}\n```text\n{runner_output_limit(str(target_read.get('content', '')), 3500) or '- empty'}\n```"
-        else:
-            target_content_block = f"target file: {targets[0]}\n- not readable: {target_read.get('error', 'unknown')}"
+        content_sections = []
+        for target in targets[:FILE_PACK_MAX_TARGETS]:
+            target_read = read_declared_target_file(target, max_chars=4000)
+            if target_read.get("ok"):
+                content_sections.append(
+                    f"target file: {target}\n```text\n{runner_output_limit(str(target_read.get('content', '')), 1500) or '- empty'}\n```"
+                )
+            else:
+                content_sections.append(f"target file: {target}\n- not readable: {target_read.get('error', 'unknown')}")
+        target_content_block = "\n".join(content_sections)
     return sanitize_sensitive_text(
         f"""# Codex Read-Only Review of Claude Write
 exec_id: {exec_id}
@@ -12574,6 +12735,10 @@ def classify_auto_task_request(text: str) -> tuple[str, str]:
         for line in lines
     ):
         return "review_codex", "review of claude-written work runs read-only on codex"
+    if extract_file_pack_targets(text)["found"]:
+        # Even an invalid pack classifies owner-write so the owner-write
+        # preflight can refuse it with the precise pack reason (fail-closed).
+        return "owner_write", "file pack declaration; claude writes under owner-write gates with codex review"
     if any(
         line_has_source_write_intent(line)
         or line_has_explicit_write_target(line)
@@ -12585,7 +12750,7 @@ def classify_auto_task_request(text: str) -> tuple[str, str]:
     return "read_only", "no clear code-writing signal; safe read-only codex run (no workspace-write)"
 
 
-def build_auto_routing_summary(run_reply: str, auto_triage: str = "") -> str:
+def build_auto_routing_summary(run_reply: str, auto_triage: str = "", closure_text: str = "") -> str:
     reply_text = str(run_reply or "")
     task_id = reply_field(reply_text, "task_id") or "none"
     dispatch_id = reply_field(reply_text, "dispatch_id") or "none"
@@ -12610,6 +12775,14 @@ def build_auto_routing_summary(run_reply: str, auto_triage: str = "") -> str:
     review_status = exec_meta.get("codex_review_status", "") or "not_required"
     auto_decision = exec_meta.get("auto_decision", "") or "none"
     next_action = reply_field(reply_text, "next") or f"inspect /dispatch show {dispatch_id}"
+    # UX: when the pipeline already closed the task, do not tell the user to
+    # run QA/review manually. Display-only; closure/ledger behavior unchanged.
+    already_closed = (
+        "auto_pipeline_status: already_closed" in str(closure_text or "")
+        or str(exec_meta.get("auto_closed", "")).strip().lower() == "true"
+    )
+    if already_closed:
+        next_action = "none; task already auto-closed"
     triage_line = f"\n- auto_triage: {safe_preview(auto_triage, 160)}" if auto_triage else ""
     return sanitize_sensitive_text(f"""Auto Routing Summary:
 - task_id: {task_id}
@@ -12896,7 +13069,9 @@ def prepare_reply(user_text: str, context: dict) -> tuple[str, str]:
             return "Usage: /auto write <task title> [--project project_id]", "auto_help"
         run_reply, run_route = prepare_reply(f"/run auto-write {auto_write_tail}", context)
         closure = build_auto_pipeline_closure_reply(run_reply, "/auto write")
-        summary = build_auto_routing_summary(run_reply, "owner-write requested; claude writes, codex reviews")
+        summary = build_auto_routing_summary(
+            run_reply, "owner-write requested; claude writes, codex reviews", closure_text=closure
+        )
         return f"{closure}\n\n{summary}", run_route
 
     auto_task_tail = _auto_tail("/auto task")
@@ -12911,7 +13086,7 @@ def prepare_reply(user_text: str, context: dict) -> tuple[str, str]:
         )
         run_reply, run_route = prepare_reply(run_command, context)
         closure = build_auto_pipeline_closure_reply(run_reply, "/auto task")
-        summary = build_auto_routing_summary(run_reply, triage_reason)
+        summary = build_auto_routing_summary(run_reply, triage_reason, closure_text=closure)
         return f"{closure}\n\n{summary}", run_route
 
     if auto_lower == "/auto" or auto_lower.startswith("/auto "):
