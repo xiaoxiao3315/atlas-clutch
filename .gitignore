@@ -17,6 +17,7 @@ workbench/projects/
 __pycache__/
 *.pyc
 .codegraph/
+.understand-anything/
 %SystemDrive%/
 *.zip
 *.patch

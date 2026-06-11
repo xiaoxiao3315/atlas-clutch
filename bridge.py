@@ -13069,6 +13069,7 @@ def build_help_reply() -> str:
 - /run help: one-command task -> dispatch -> exec start helper.
 - /collect help: read-only whitelist evidence collection.
 - /tools status: read-only local tool registry and integration status.
+- /tool help: thin read-only tool adapters (codegraph/understand/research/memory/headroom).
 - /pilot help: real-project pilot metrics and operating notes.
 - /context help: Context Pack commands.
 - /playbook help: local Playbook reference commands.
@@ -13510,6 +13511,215 @@ def handle_tools_command(user_text: str) -> str | None:
     return build_tools_help_reply()
 
 
+# TOOL-INTEGRATION-002: thin read-only / dry-run adapters for lab tools.
+# Every /tool reply states whether an external tool was executed or only
+# prepared. browser-harness is never reachable from /tool. The only live
+# execution path is a read-only codegraph query, and only when the CLI and
+# a local .codegraph/ index both already exist.
+UNDERSTAND_DIR = ROOT / ".understand-anything"
+HEADROOM_VENV_PYTHON = Path(r"E:\ai\tools-lab\.venv-headroom\Scripts\python.exe")
+
+
+def codegraph_cli_available() -> tuple[str | None, str]:
+    cli = shutil.which("codegraph")
+    if not cli:
+        return None, "codegraph_not_installed: binary not on PATH"
+    if not (ROOT / ".codegraph").is_dir():
+        return None, "index_missing: no .codegraph/ index in this repo ('codegraph init' is an owner decision)"
+    return cli, "ok"
+
+
+def run_tool_codegraph_query(keyword: str) -> str:
+    clean = " ".join(str(keyword or "").split())[:120]
+    if not clean:
+        return "Usage: /tool codegraph query <keyword>"
+    prepared = f'codegraph query "{clean}" --json'
+    cli, reason = codegraph_cli_available()
+    if cli is None:
+        return f"""codegraph query (read-only)
+- query: {clean}
+- external_execution: none (command prepared only)
+- unavailable_reason: {reason}
+- run_manually_in_powershell: Set-Location {ROOT}; {prepared}
+- boundary: no install, no agent/MCP config changes."""
+    try:
+        proc = subprocess.run(
+            [cli, "query", clean, "--json"],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        output = (proc.stdout or "").strip() or (proc.stderr or "").strip() or "(no output)"
+        return f"""codegraph query (read-only)
+- query: {clean}
+- external_execution: codegraph CLI (read-only index query)
+- command: {prepared}
+- returncode: {proc.returncode}
+- result_summary: {safe_preview(output, 600)}
+- boundary: index consumed read-only; source files untouched."""
+    except Exception as exc:
+        return f"""codegraph query (read-only)
+- query: {clean}
+- external_execution: attempted codegraph CLI, query failed
+- command: {prepared}
+- failure_reason: {safe_preview(str(exc), 200)}
+- boundary: no install, no agent/MCP config changes."""
+
+
+def build_tool_understand_summary_reply() -> str:
+    graph_file = UNDERSTAND_DIR / "knowledge-graph.json"
+    header = [
+        "understand-anything summary (read-only)",
+        "- external_execution: none (no rebuild, no dashboard, graph read only)",
+    ]
+    if not graph_file.is_file():
+        return "\n".join(
+            header
+            + [
+                "- graph: missing",
+                f"- expected_path: {graph_file}",
+                "- node_count: unknown",
+                "- edge_count: unknown",
+                "- layers: unknown",
+                "- next_allowed: manual /understand run outside the bridge (owner decision)",
+            ]
+        )
+    try:
+        data = json.loads(graph_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return "\n".join(
+            header
+            + [
+                "- graph: unreadable",
+                f"- failure_reason: {safe_preview(str(exc), 180)}",
+                "- next_allowed: manual /understand rebuild outside the bridge (owner decision)",
+            ]
+        )
+    nodes = data.get("nodes")
+    edges = data.get("edges")
+    node_count = len(nodes) if isinstance(nodes, list) else "unknown"
+    edge_count = len(edges) if isinstance(edges, list) else "unknown"
+    layers: list[str] = []
+    if isinstance(nodes, list):
+        for node in nodes:
+            if isinstance(node, dict) and str(node.get("id", "")).startswith("layer:"):
+                layers.append(str(node.get("name") or node.get("id")))
+    if not layers and isinstance(data.get("layers"), list):
+        layers = [
+            str(item.get("name") or item.get("id") or "?")
+            for item in data["layers"]
+            if isinstance(item, dict)
+        ]
+    layers_text = ", ".join(layers[:8]) if layers else "unknown"
+    return "\n".join(
+        header
+        + [
+            "- graph: exists",
+            f"- graph_path: {graph_file}",
+            f"- node_count: {node_count}",
+            f"- edge_count: {edge_count}",
+            f"- layers: {layers_text}",
+            "- next_allowed: read-only /understand-chat style queries outside the bridge; rebuild is an owner decision",
+        ]
+    )
+
+
+def build_tool_research_plan_reply(topic: str) -> str:
+    clean = " ".join(str(topic or "").split())[:160]
+    if not clean:
+        return "Usage: /tool research plan <topic>"
+    return f"""research plan package (plan only)
+- topic: {clean}
+- external_execution: none (no ARS pipeline run, no web research, no paper generated)
+- suggested_usage: /ars-plan {clean}  (run in the dev harness, not through the bridge)
+- expected_output: Socratic chapter-by-chapter plan and outline skeleton only
+- risk_boundary: no web research, no fabricated citations, no long-form drafting; a human reviews the plan before any drafting stage."""
+
+
+def build_tool_memory_status_reply() -> str:
+    entry = next(item for item in TOOL_REGISTRY if item["tool_id"] == "agentmemory")
+    report = tool_lab_artifact_status("report", entry["report_file"])
+    status = entry["status"] if report == "found" else "unknown"
+    return f"""agentmemory status (read-only)
+- status: {status}
+- external_execution: none (no service started, no MCP connection, no memory ingested, no database read)
+- connection: not-connected to real Atlas/Hermes memory
+- lab_report: {report}
+- next_allowed: any real memory connection or ingestion requires explicit owner approval."""
+
+
+def build_tool_headroom_compress_reply(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return "Usage: /tool headroom compress <pasted text>"
+    char_count = len(raw)
+    token_estimate = max(1, char_count // 4)
+    venv_state = "found" if HEADROOM_VENV_PYTHON.is_file() else "missing"
+    return f"""headroom compress (dry-run)
+- external_execution: none (dry-run report; pinned lab venv not invoked from the bridge)
+- original_length: {char_count} chars (~{token_estimate} tokens, rough chars/4 estimate)
+- compressed_preview: not produced in dry-run mode
+- tokens_saved: unknown (requires a library run in the pinned venv, headroom-ai==0.10.16)
+- fail_open_warning: headroom fails open - a broken install silently reports 0% savings; run the startup canary before trusting any result
+- lab_venv: {venv_state} ({HEADROOM_VENV_PYTHON.parent.parent})
+- boundary: pasted text only; no live traffic proxying, no agent wrapping, no file reads."""
+
+
+def build_tool_status_compact_reply() -> str:
+    lines = ["tool status (compact, read-only)"]
+    for item in TOOL_REGISTRY:
+        lines.append(f"- {item['tool_id']}: {item['status']} | risk {item['risk']} | {item['mode']}")
+    lines.append("")
+    lines.append("Full detail: /tools status. No tool is executed by this command.")
+    return "\n".join(lines)
+
+
+def build_tool_adapter_help_reply() -> str:
+    return """Atlas Clutch thin tool adapters (read-only / dry-run)
+- /tool help: show this help.
+- /tool status: compact tool status (full detail: /tools status).
+- /tool codegraph query <keyword>: read-only code intelligence; runs codegraph only if CLI and index already exist, otherwise prepares the exact command.
+- /tool understand summary: read the existing .understand-anything graph; never rebuilds, never opens the dashboard.
+- /tool research plan <topic>: lightweight research plan package; no ARS pipeline run, no web research.
+- /tool memory status: agentmemory lab status; never starts a service or touches memory data.
+- /tool headroom compress <text>: dry-run compression report for pasted text only.
+
+Boundaries:
+- No installs, no MCP config changes, no persistent services, no LAN or public exposure.
+- browser-harness is gated and is never executed by any /tool command.
+- agentmemory stays not-connected to real Atlas/Hermes memory.
+- headroom never proxies live Claude/Codex/Kiro/Hermes traffic.
+- Every reply states whether an external tool was executed or only prepared."""
+
+
+def handle_tool_command(user_text: str) -> str | None:
+    lines = user_text.strip().splitlines()
+    first_line = lines[0] if lines else ""
+    parts = first_line.split(maxsplit=3)
+    if not parts or parts[0].lower() != "/tool":
+        return None
+    subcommand = parts[1].lower() if len(parts) > 1 else "help"
+    action = parts[2].lower() if len(parts) > 2 else ""
+    tail = parts[3] if len(parts) > 3 else ""
+    body = "\n".join(lines[1:]).strip()
+    if body:
+        tail = f"{tail}\n{body}".strip() if tail else body
+    if subcommand == "status":
+        return build_tool_status_compact_reply()
+    if subcommand == "codegraph" and action == "query":
+        return run_tool_codegraph_query(tail)
+    if subcommand == "understand" and action == "summary":
+        return build_tool_understand_summary_reply()
+    if subcommand == "research" and action == "plan":
+        return build_tool_research_plan_reply(tail)
+    if subcommand == "memory" and action == "status":
+        return build_tool_memory_status_reply()
+    if subcommand == "headroom" and action == "compress":
+        return build_tool_headroom_compress_reply(tail)
+    return build_tool_adapter_help_reply()
+
+
 def handle_local_command(user_text: str, context: dict) -> str | None:
     parts = user_text.strip().split(maxsplit=1)
     command = parts[0].lower() if parts else ""
@@ -13517,6 +13727,8 @@ def handle_local_command(user_text: str, context: dict) -> str | None:
         return handle_run_command(user_text)
     if command == "/tools":
         return handle_tools_command(user_text)
+    if command == "/tool":
+        return handle_tool_command(user_text)
     if command == "/apply":
         return handle_apply_command(user_text)
     if command == "/playbook":
