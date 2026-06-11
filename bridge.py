@@ -6995,6 +6995,17 @@ def render_claude_english_runner_payload(exec_id: str, dispatch_id: str, sandbox
     source_language = detect_source_language(source_text)
     policy = run_policy_for_sandbox(sandbox_mode, owner_write_policy=owner_write_policy)
     targets = extract_declared_owner_write_targets(normalized_exec_id, normalized_dispatch_id)
+    validation_declaration = extract_required_validation_commands(source_text)
+    if validation_declaration["found"] and validation_declaration["ok"]:
+        validation_command_lines = "\n".join(f"- {command}" for command in validation_declaration["commands"])
+        required_validation_section = f"""
+## Required Validation Commands (run each, then report evidence)
+{validation_command_lines}
+- After running each command, report exactly one line per command in this form:
+- validation: <command> => returncode: <n>
+"""
+    else:
+        required_validation_section = ""
     if sandbox_mode == "workspace-write":
         target_lines = "\n".join(f"- {target}" for target in targets) or "- none declared; do not write anything"
         write_rules = """## Allowed Write Targets
@@ -7058,7 +7069,7 @@ executor_prompt_rendered_for: claude
 - State git status and git diff --stat observations.
 - State unresolved risks and unverified items.
 - Keep output concise enough to avoid runner timeout; include AUTORUN-PAYLOAD-OK.
-
+{required_validation_section}
 ## Secrets Rule
 - Do not read, print, or modify .env files, tokens, cookies, Authorization headers, passwords, API keys, or any secrets.
 
@@ -7208,6 +7219,9 @@ codex_review_reason:
 acceptance_fidelity:
 acceptance_criteria_detected:
 acceptance_fidelity_reason:
+required_validation_detected:
+required_validation_status:
+required_validation_reason:
 verification_status:
 verification_reason:
 source_language:
@@ -8235,12 +8249,38 @@ ACCEPTANCE_EXACT_ONE_LINE_CN_PATTERN = re.compile(
     r"(?:写入一行|只写一行)\s*[:：]\s*([^\n.。]+)"
 )
 # Bounded per-target acceptance blocks: an "Acceptance:"/"验收:" heading line
-# followed by "- <path> => <exact-one-line form>: <content>" bullets.
+# followed by "- <path> => <criterion>" bullets. Criteria: exact-one-line,
+# exists/存在, non-empty/非空, contains/包含 with a literal payload.
 ACCEPTANCE_BLOCK_HEADING_PATTERN = re.compile(r"^\s*(?:acceptance|验收)\s*[:：]\s*$", re.IGNORECASE)
 ACCEPTANCE_TARGET_BULLET_PATTERN = re.compile(
-    r"^\s*-\s+(\S+)\s*=>\s*(?:exactly\s+one\s+line|写入一行|只写一行)\s*[:：]\s*([^\n.。]+)",
+    r"^\s*-\s+(?P<target>\S+)\s*=>\s*(?:"
+    r"(?:exactly\s+one\s+line|写入一行|只写一行)\s*[:：]\s*(?P<one_line>[^\n.。]+)"
+    r"|(?:contains|包含)\s*[:：]\s*(?P<literal>.+?)"
+    r"|(?P<exists>exists|存在)"
+    r"|(?P<non_empty>non-empty|非空)"
+    r")\s*$",
     re.IGNORECASE,
 )
+
+
+def parse_acceptance_target_bullet(line: str) -> dict | None:
+    match = ACCEPTANCE_TARGET_BULLET_PATTERN.match(str(line or ""))
+    if not match:
+        return None
+    target = normalize_fidelity_path(match.group("target"))
+    if not target:
+        return None
+    if match.group("one_line") is not None:
+        expected = match.group("one_line").strip()
+        return {"kind": "exact_one_line", "expected": expected, "target": target} if expected else None
+    if match.group("literal") is not None:
+        literal = match.group("literal").strip()
+        return {"kind": "contains", "expected": literal, "target": target} if literal else None
+    if match.group("exists") is not None:
+        return {"kind": "exists", "expected": "", "target": target}
+    if match.group("non_empty") is not None:
+        return {"kind": "non_empty", "expected": "", "target": target}
+    return None
 
 
 def extract_concrete_acceptance_checks(*texts: str) -> list[dict]:
@@ -8254,15 +8294,20 @@ def extract_concrete_acceptance_checks(*texts: str) -> list[dict]:
     a "target" key; generic checks have target "".
     """
     checks: list[dict] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
 
-    def add(expected: str, target: str = "") -> None:
-        expected = expected.strip()
-        clean_target = normalize_fidelity_path(target) if target else ""
-        key = (clean_target, expected)
-        if expected and key not in seen:
+    def add_check(check: dict | None) -> None:
+        if not check:
+            return
+        key = (check["kind"], check.get("target", ""), check.get("expected", ""))
+        if key not in seen:
             seen.add(key)
-            checks.append({"kind": "exact_one_line", "expected": expected, "target": clean_target})
+            checks.append(check)
+
+    def add_generic(expected: str) -> None:
+        expected = expected.strip()
+        if expected:
+            add_check({"kind": "exact_one_line", "expected": expected, "target": ""})
 
     for text in texts:
         lines = str(text or "").splitlines()
@@ -8272,16 +8317,16 @@ def extract_concrete_acceptance_checks(*texts: str) -> list[dict]:
             if ACCEPTANCE_BLOCK_HEADING_PATTERN.match(line):
                 index += 1
                 while index < len(lines):
-                    bullet = ACCEPTANCE_TARGET_BULLET_PATTERN.match(lines[index])
+                    bullet = parse_acceptance_target_bullet(lines[index])
                     if not bullet:
                         break
-                    add(bullet.group(2), bullet.group(1))
+                    add_check(bullet)
                     index += 1
                 continue
             # Standalone per-target bullet outside a heading is still explicit.
-            standalone = ACCEPTANCE_TARGET_BULLET_PATTERN.match(line)
+            standalone = parse_acceptance_target_bullet(line)
             if standalone:
-                add(standalone.group(2), standalone.group(1))
+                add_check(standalone)
                 index += 1
                 continue
             # Lines carrying "=>" target-specific acceptance syntax must never
@@ -8291,7 +8336,7 @@ def extract_concrete_acceptance_checks(*texts: str) -> list[dict]:
             if "=>" not in line:
                 for pattern in (ACCEPTANCE_EXACT_ONE_LINE_PATTERN, ACCEPTANCE_EXACT_ONE_LINE_CN_PATTERN):
                     for match in pattern.finditer(line):
-                        add(match.group(1))
+                        add_generic(match.group(1))
             index += 1
     return checks
 
@@ -8381,6 +8426,25 @@ def evaluate_acceptance_fidelity(exec_id: str, dispatch_id: str) -> dict:
             )
         return ""
 
+    def run_target_check(check: dict) -> str:
+        target = check["target"]
+        kind = check["kind"]
+        if kind == "exact_one_line":
+            return check_exact_one_line(target, check["expected"])
+        read_result = read_declared_target_file(target)
+        if not read_result.get("ok"):
+            return f"target not verifiable: {read_result.get('error', 'unknown')}"
+        content = str(read_result.get("content", ""))
+        if kind == "exists":
+            return ""
+        if kind == "non_empty":
+            return "" if content.strip() else f"{target} is empty or whitespace-only"
+        if kind == "contains":
+            return "" if check["expected"] in content else (
+                f"{target} does not contain required literal: {safe_preview(check['expected'], 80)}"
+            )
+        return f"unsupported acceptance check kind: {kind}"
+
     target_specific = [check for check in checks if check.get("target")]
     generic = [check for check in checks if not check.get("target")]
 
@@ -8397,9 +8461,7 @@ def evaluate_acceptance_fidelity(exec_id: str, dispatch_id: str) -> dict:
             f"ambiguous acceptance: exact-one-line criterion without target while {len(targets)} targets are declared"
         )
     for check in target_specific:
-        if check["kind"] != "exact_one_line":
-            continue
-        error = check_exact_one_line(check["target"], check["expected"])
+        error = run_target_check(check)
         if error:
             return fail(error)
     for check in generic:
@@ -8415,6 +8477,156 @@ def evaluate_acceptance_fidelity(exec_id: str, dispatch_id: str) -> dict:
         "reason": "concrete acceptance criteria satisfied for: " + "; ".join(verified),
         "checks": checks,
     }
+
+
+REQUIRED_VALIDATION_HEADING_PATTERN = re.compile(
+    r"^\s*(?:required validation|必须验证)\s*[:：]\s*$", re.IGNORECASE
+)
+REQUIRED_VALIDATION_BULLET_PATTERN = re.compile(r"^\s*-\s+(.+?)\s*$")
+REQUIRED_VALIDATION_FIXED_COMMANDS = (
+    "git diff --check",
+    "git status --short",
+    "python smoke_exec_start.py",
+    "python smoke_task_loop.py",
+)
+REQUIRED_VALIDATION_FORBIDDEN_CHARS = re.compile(r"[&|;`<>$]")
+REQUIRED_VALIDATION_FORBIDDEN_ACTIONS = re.compile(
+    r"\bgit\s+(?:add|commit|push|merge)\b|\bdeploy\b", re.IGNORECASE
+)
+
+
+def is_allowed_required_validation_command(command: str) -> bool:
+    """Narrow allowlist for declared validation commands. The bridge never
+    executes these; it only matches them against runner evidence."""
+    text = " ".join(str(command or "").split())
+    if not text or REQUIRED_VALIDATION_FORBIDDEN_CHARS.search(text):
+        return False
+    if REQUIRED_VALIDATION_FORBIDDEN_ACTIONS.search(text):
+        return False
+    if text in REQUIRED_VALIDATION_FIXED_COMMANDS:
+        return True
+    match = re.fullmatch(r"python\s+-B\s+-m\s+py_compile\s+(\S+)", text) or re.fullmatch(
+        r"python\s+([^-\s]\S*)", text
+    )
+    if not match:
+        return False
+    path = normalize_fidelity_path(match.group(1))
+    if not path or re.match(r"^([A-Za-z]:|/)", path) or ".." in path.split("/"):
+        return False
+    if ".env" in Path(path).name.lower():
+        return False
+    return path.lower().endswith(".py") and bool(FILE_PACK_SAFE_TARGET_PATTERN.match(path))
+
+
+def extract_required_validation_commands(text: str) -> dict:
+    """Parse bounded required-validation blocks (heading + command bullets).
+
+    Fail-closed: any bullet outside the narrow command allowlist marks the
+    whole declaration not ok, which must fail the validation evidence gate.
+    """
+    lines = str(text or "").splitlines()
+    found = False
+    commands: list[str] = []
+    unsafe: list[str] = []
+    index = 0
+    while index < len(lines):
+        if not REQUIRED_VALIDATION_HEADING_PATTERN.match(lines[index]):
+            index += 1
+            continue
+        found = True
+        index += 1
+        while index < len(lines):
+            bullet = REQUIRED_VALIDATION_BULLET_PATTERN.match(lines[index])
+            if not bullet:
+                break
+            command = " ".join(bullet.group(1).split())
+            if is_allowed_required_validation_command(command):
+                if command not in commands:
+                    commands.append(command)
+            else:
+                unsafe.append(safe_preview(command, 80))
+            index += 1
+    if not found:
+        return {"found": False, "ok": False, "commands": [], "unsafe": [], "reason": "no required validation block"}
+    if unsafe:
+        return {
+            "found": True,
+            "ok": False,
+            "commands": commands,
+            "unsafe": unsafe,
+            "reason": "required validation contains non-allowlisted commands: " + "; ".join(unsafe[:3]),
+        }
+    if not commands:
+        return {"found": True, "ok": False, "commands": [], "unsafe": [], "reason": "required validation heading without any valid command bullet"}
+    return {"found": True, "ok": True, "commands": commands, "unsafe": [], "reason": "required validation commands accepted"}
+
+
+def evaluate_required_validation(dispatch_id: str, runner_output: str, post_run_snapshot: str) -> dict:
+    """Verify declared validation commands against runner/post-run evidence.
+
+    The bridge does not execute the commands. It requires, per command, an
+    explicit evidence line: "validation: <command> => returncode: <n>" with
+    n == 0. Missing evidence or nonzero returncode fails.
+    """
+    scope_text = ""
+    try:
+        scope_text = "\n".join(owner_write_scope_lines(dispatch_id))
+    except Exception:
+        scope_text = ""
+    declaration = extract_required_validation_commands(scope_text)
+    if not declaration["found"]:
+        return {
+            "status": "unknown",
+            "detected": False,
+            "reason": "no required validation commands declared",
+            "commands": [],
+        }
+    if not declaration["ok"]:
+        return {
+            "status": "failed",
+            "detected": True,
+            "reason": declaration["reason"],
+            "commands": declaration["commands"],
+        }
+    evidence = f"{runner_output}\n{post_run_snapshot}"
+    for command in declaration["commands"]:
+        pattern = re.compile(
+            r"validation:\s*" + re.escape(command) + r"\s*=>\s*returncode:\s*(-?\d+)",
+            re.IGNORECASE,
+        )
+        match = pattern.search(evidence)
+        if not match:
+            return {
+                "status": "failed",
+                "detected": True,
+                "reason": f"missing validation evidence for: {command}",
+                "commands": declaration["commands"],
+            }
+        if match.group(1) != "0":
+            return {
+                "status": "failed",
+                "detected": True,
+                "reason": f"validation command failed with returncode {match.group(1)}: {command}",
+                "commands": declaration["commands"],
+            }
+    return {
+        "status": "passed",
+        "detected": True,
+        "reason": "all required validation commands reported returncode 0",
+        "commands": declaration["commands"],
+    }
+
+
+def required_validation_gate_ok(exec_meta: dict) -> bool:
+    """failed always blocks; when validation commands were declared, only
+    passed allows; unknown without a declaration is non-blocking."""
+    status = str(exec_meta.get("required_validation_status", "")).strip().lower()
+    detected = str(exec_meta.get("required_validation_detected", "")).strip().lower() == "true"
+    if status == "failed":
+        return False
+    if detected and status != "passed":
+        return False
+    return True
 
 
 def acceptance_fidelity_gate_ok(exec_meta: dict) -> bool:
@@ -9100,12 +9312,20 @@ def execute_exec_runner(
         # Claude wrote; check concrete user acceptance criteria first, then
         # Codex must review read-only before any auto close.
         acceptance = evaluate_acceptance_fidelity(exec_id, normalized_dispatch_id)
+        validation = evaluate_required_validation(
+            normalized_dispatch_id,
+            f"{result.get('stdout', '')}\n{result.get('stderr', '')}",
+            post_run_snapshot,
+        )
         update_exec_fields(
             exec_id,
             {
                 "acceptance_fidelity": acceptance["status"],
                 "acceptance_criteria_detected": str(bool(acceptance.get("detected"))).lower(),
                 "acceptance_fidelity_reason": safe_preview(str(acceptance.get("reason", "")), 200),
+                "required_validation_detected": str(bool(validation.get("detected"))).lower(),
+                "required_validation_status": validation["status"],
+                "required_validation_reason": safe_preview(str(validation.get("reason", "")), 200),
             },
         )
         review = run_codex_review_of_claude_write(exec_id, normalized_dispatch_id, result, post_run_snapshot)
@@ -10090,6 +10310,8 @@ def build_exec_auto_postprocess_reply(
         hard_gates["codex_review"] = exec_meta.get("codex_review_status") == "pass_candidate"
         # Concrete user acceptance criteria, when detected, must verifiably pass.
         hard_gates["acceptance_fidelity"] = acceptance_fidelity_gate_ok(exec_meta)
+        # Declared validation commands must show returncode-0 evidence.
+        hard_gates["required_validation"] = required_validation_gate_ok(exec_meta)
     failed_hard = [name for name, ok in hard_gates.items() if not ok]
     if failed_hard:
         reason = "gate failed: " + ", ".join(failed_hard)
@@ -12855,6 +13077,12 @@ def build_auto_routing_summary(run_reply: str, auto_triage: str = "", closure_te
     review_status = exec_meta.get("codex_review_status", "") or "not_required"
     auto_decision = exec_meta.get("auto_decision", "") or "none"
     next_action = reply_field(reply_text, "next") or f"inspect /dispatch show {dispatch_id}"
+    required_validation_lines = (
+        f"\n- required_validation_status: {exec_meta.get('required_validation_status', '') or 'unknown'}"
+        f"\n- required_validation_reason: {safe_preview(exec_meta.get('required_validation_reason', '') or 'none', 160)}"
+        if str(exec_meta.get("required_validation_detected", "")).strip().lower() == "true"
+        else ""
+    )
     # UX: when the pipeline already closed the task, do not tell the user to
     # run QA/review manually. Display-only; closure/ledger behavior unchanged.
     already_closed = (
@@ -12876,7 +13104,7 @@ def build_auto_routing_summary(run_reply: str, auto_triage: str = "", closure_te
 - codex_review_status: {review_status}
 - acceptance_fidelity: {exec_meta.get('acceptance_fidelity', '') or 'unknown'}
 - acceptance_criteria_detected: {exec_meta.get('acceptance_criteria_detected', '') or 'false'}
-- acceptance_fidelity_reason: {safe_preview(exec_meta.get('acceptance_fidelity_reason', '') or 'none', 160)}
+- acceptance_fidelity_reason: {safe_preview(exec_meta.get('acceptance_fidelity_reason', '') or 'none', 160)}{required_validation_lines}
 - auto_decision: {auto_decision}
 - next: {safe_preview(next_action, 200)}""")
 
@@ -12981,6 +13209,7 @@ Auto Pipeline Closure:
     if str(exec_meta.get("review_required_by", "")).strip().lower() == "codex":
         gates.append(("codex_review", exec_meta.get("codex_review_status") == "pass_candidate"))
         gates.append(("acceptance_fidelity", acceptance_fidelity_gate_ok(exec_meta)))
+        gates.append(("required_validation", required_validation_gate_ok(exec_meta)))
 
     failed = [name for name, ok in gates if not ok]
     if failed:
