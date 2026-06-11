@@ -1,5 +1,7 @@
 # Atlas Clutch
 
+[![CI](https://github.com/xiaoxiao3315/atlas-clutch/actions/workflows/ci.yml/badge.svg)](https://github.com/xiaoxiao3315/atlas-clutch/actions/workflows/ci.yml)
+
 **The local AI workforce control plane.**
 
 *Claude writes. Codex reviews. Safety gates decide.*
