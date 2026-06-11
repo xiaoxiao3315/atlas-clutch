@@ -71,6 +71,24 @@ def is_synthetic(project_id: str, title: str) -> bool:
     return project_id in SYNTHETIC_PROJECTS or bool(SYNTHETIC_TITLE.search(title or ""))
 
 
+def load_task_index() -> dict[str, dict]:
+    index = {}
+    for path in sorted(bridge.TASKS_DIR.glob("OHB-*.md")):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        meta = bridge.task_metadata(text)
+        title = bridge.task_title_from_text(path.stem, text)
+        project_id = meta.get("project_id", "")
+        index[path.stem] = {
+            "title": title,
+            "project_id": project_id,
+            "synthetic": is_synthetic(project_id, title),
+        }
+    return index
+
+
 def load_tasks(since: datetime | None) -> list[dict]:
     tasks = []
     for path in sorted(bridge.TASKS_DIR.glob("OHB-*.md")):
@@ -82,6 +100,8 @@ def load_tasks(since: datetime | None) -> list[dict]:
         created = parse_ts(meta.get("created_at", ""))
         if created is None or (since and created < since):
             continue
+        title = bridge.task_title_from_text(path.stem, text)
+        project_id = meta.get("project_id", "")
         events = timeline_events(text)
         decisions = [(ts, line) for ts, line in events if "user decision" in line]
         pass_ts = next((ts for ts, line in decisions if "user decision pass" in line), None)
@@ -94,8 +114,9 @@ def load_tasks(since: datetime | None) -> list[dict]:
         tasks.append(
             {
                 "task_id": path.stem,
-                "title": bridge.task_title_from_text(path.stem, text),
-                "project_id": meta.get("project_id", ""),
+                "title": title,
+                "project_id": project_id,
+                "synthetic": is_synthetic(project_id, title),
                 "status": meta.get("status", "unknown"),
                 "created": created,
                 "pass_ts": pass_ts,
@@ -106,8 +127,8 @@ def load_tasks(since: datetime | None) -> list[dict]:
     return tasks
 
 
-def load_manual_dispatch_count(since: datetime | None) -> int:
-    count = 0
+def load_manual_dispatches(since: datetime | None, task_index: dict[str, dict]) -> list[dict]:
+    dispatches = []
     for path in sorted(bridge.DISPATCHES_DIR.glob("DISPATCH-*.md")):
         try:
             text = path.read_text(encoding="utf-8")
@@ -118,11 +139,21 @@ def load_manual_dispatch_count(since: datetime | None) -> int:
         if since and (created is None or created < since):
             continue
         if "manual_copy_only: true" in bridge.task_section(text, "Sent Record"):
-            count += 1
-    return count
+            task_id = meta.get("task_id", "")
+            task_info = task_index.get(task_id, {})
+            project_id = task_info.get("project_id") or meta.get("project_id", "")
+            title = task_info.get("title") or bridge.dispatch_title_from_text(path.stem, text)
+            dispatches.append(
+                {
+                    "dispatch_id": path.stem,
+                    "task_id": task_id,
+                    "synthetic": task_info.get("synthetic", is_synthetic(project_id, title)),
+                }
+            )
+    return dispatches
 
 
-def load_exec_failures(since: datetime | None) -> dict:
+def load_execs(since: datetime | None, task_index: dict[str, dict]) -> list[dict]:
     execs = []
     for path in sorted(bridge.EXECUTIONS_DIR.glob("EXEC-*.md")):
         try:
@@ -133,17 +164,28 @@ def load_exec_failures(since: datetime | None) -> dict:
         created = parse_ts(meta.get("created_at", ""))
         if since and (created is None or created < since):
             continue
+        task_id = meta.get("task_id", "")
+        task_info = task_index.get(task_id, {})
+        project_id = task_info.get("project_id") or meta.get("project_id", "")
+        title = task_info.get("title") or bridge.exec_title_from_text(path.stem, text)
         execs.append(
             {
                 "exec_id": path.stem,
                 "dispatch_id": meta.get("dispatch_id", ""),
+                "task_id": task_id,
+                "synthetic": task_info.get("synthetic", is_synthetic(project_id, title)),
                 "status": meta.get("status", ""),
                 "completion_state": meta.get("completion_state", ""),
                 "returncode": meta.get("returncode", ""),
                 "timed_out": meta.get("timed_out", ""),
+                "recovered_from": meta.get("recovered_from", ""),
                 "created": created,
             }
         )
+    return execs
+
+
+def exec_failure_stats(execs: list[dict]) -> dict:
     def failed(e: dict) -> bool:
         return (
             e["status"] in {"needs_manual_start", "failed"}
@@ -161,14 +203,23 @@ def load_exec_failures(since: datetime | None) -> dict:
         if e["dispatch_id"]
         and any(ts and e["created"] and ts > e["created"] for ts in ok_by_dispatch.get(e["dispatch_id"], []))
     )
-    return {"failure_count": len(failures), "recovered_any_means": recovered, "auto_recovered": 0}
+    recovered_via_rerun = sum(
+        1 for e in execs
+        if e["recovered_from"] and not failed(e) and e["completion_state"] == "completed"
+    )
+    return {
+        "failure_count": len(failures),
+        "recovered_any_means": recovered,
+        "recovered_via_rerun": recovered_via_rerun,
+        "auto_recovered": 0,
+    }
 
 
 def pct(numerator: int, denominator: int) -> float | None:
     return round(100.0 * numerator / denominator, 1) if denominator else None
 
 
-def cohort_metrics(tasks: list[dict], manual_dispatches: int, exec_stats: dict, scale: float) -> dict:
+def cohort_metrics(tasks: list[dict], manual_dispatch_count: int, exec_stats: dict) -> dict:
     closed = [t for t in tasks if t["status"] in CLOSED_OK]
     accepted = [t for t in closed if t["pass_ts"]]
     durations = [
@@ -183,7 +234,7 @@ def cohort_metrics(tasks: list[dict], manual_dispatches: int, exec_stats: dict, 
         "tasks_closed": len(closed),
         "median_time_to_accepted_minutes": round(statistics.median(durations), 1) if durations else None,
         "human_handoff_proxy_per_closed_task": (
-            round(manual_dispatches * scale / len(closed), 2) if closed else None
+            round(manual_dispatch_count / len(closed), 2) if closed else None
         ),
         "evidence_completeness_rate": pct(len(complete), len(closed)),
         "first_pass_review_rate": pct(len(first_pass), len(accepted)),
@@ -191,6 +242,7 @@ def cohort_metrics(tasks: list[dict], manual_dispatches: int, exec_stats: dict, 
         "rework_cycles_total": sum(t["rework_cycles"] for t in tasks),
         "failures": exec_stats["failure_count"],
         "recovered_any_means": exec_stats["recovered_any_means"],
+        "recovered_via_rerun": exec_stats.get("recovered_via_rerun", 0),
     }
 
 
@@ -209,7 +261,8 @@ def render(name: str, metrics: dict) -> str:
         lines.append(f"  {key:<38} {shown}{suffix:<4} [{TARGETS[key]}]")
     lines.append(
         f"  supporting: rework_cycles={metrics['rework_cycles_total']}, "
-        f"exec_failures={metrics['failures']}, recovered_any_means={metrics['recovered_any_means']}"
+        f"exec_failures={metrics['failures']}, recovered_any_means={metrics['recovered_any_means']}, "
+        f"recovered_via_rerun={metrics.get('recovered_via_rerun', 0)}"
     )
     return "\n".join(lines)
 
@@ -225,23 +278,27 @@ def main() -> int:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     since = None if args.all else datetime.now().astimezone() - timedelta(days=args.days)
+    task_index = load_task_index()
     tasks = load_tasks(since)
-    manual_dispatches = load_manual_dispatch_count(since)
-    exec_stats = load_exec_failures(since)
+    manual_dispatches = load_manual_dispatches(since, task_index)
+    execs = load_execs(since, task_index)
 
-    real = [t for t in tasks if not is_synthetic(t["project_id"], t["title"])]
-    synthetic = [t for t in tasks if is_synthetic(t["project_id"], t["title"])]
-    share = (len(real) / len(tasks)) if tasks else 0.0
+    real = [t for t in tasks if not t["synthetic"]]
+    synthetic = [t for t in tasks if t["synthetic"]]
+    real_dispatches = [d for d in manual_dispatches if not d["synthetic"]]
+    synthetic_dispatches = [d for d in manual_dispatches if d["synthetic"]]
+    real_execs = [e for e in execs if not e["synthetic"]]
+    synthetic_execs = [e for e in execs if e["synthetic"]]
 
     result = {
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "window": "all" if args.all else f"last {args.days} days",
-        "note_handoff": "proxy = manual-copy dispatches per closed task; manual dispatch split between cohorts by task share",
-        "note_auto_recovery": "always 0 until /exec rerun exists (audit M6); recovered_any_means counts manual redo",
+        "note_handoff": "proxy = manual-copy dispatches per closed task; manual dispatches are attributed through each dispatch task's REAL/SYNTHETIC cohort",
+        "note_auto_recovery": "auto_recovery stays 0 until auto-rerun policy exists; /exec rerun recoveries are counted separately as recovered_via_rerun",
         "cohorts": {
-            "ALL": cohort_metrics(tasks, manual_dispatches, exec_stats, 1.0),
-            "REAL": cohort_metrics(real, manual_dispatches, exec_stats, share),
-            "SYNTHETIC": cohort_metrics(synthetic, manual_dispatches, exec_stats, 1.0 - share),
+            "ALL": cohort_metrics(tasks, len(manual_dispatches), exec_failure_stats(execs)),
+            "REAL": cohort_metrics(real, len(real_dispatches), exec_failure_stats(real_execs)),
+            "SYNTHETIC": cohort_metrics(synthetic, len(synthetic_dispatches), exec_failure_stats(synthetic_execs)),
         },
         "synthetic_projects": sorted(SYNTHETIC_PROJECTS),
     }

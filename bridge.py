@@ -9591,6 +9591,7 @@ def build_exec_help_reply() -> str:
 - /exec help
 - /exec prepare <dispatch_id>
 - /exec start <dispatch_id>
+- /exec rerun <exec_id>  (recover a failed/timed-out/manual-start execution; same gates as start)
 - /exec approve <exec_id|dispatch_id> write
 - /exec approve-latest write
 - /exec package <exec_id>
@@ -10754,6 +10755,90 @@ def build_exec_stale_reply() -> str:
     return "\n".join(lines)
 
 
+def upsert_exec_field(exec_id: str, field: str, value: str) -> None:
+    """Set a metadata field on an execution record, adding it when absent.
+
+    replace_task_field's add-fallback anchors on a Goal section that execution
+    records do not have, so new fields (recovered_from, superseded_by) are
+    inserted at the end of the metadata block instead.
+    """
+    normalized = normalize_exec_id(exec_id)
+    text = read_exec(normalized)
+    if re.search(rf"^{re.escape(field)}:", text, re.MULTILINE):
+        text = replace_task_field(text, field, value)
+    else:
+        lines = text.splitlines()
+        insert_at = next((index for index, line in enumerate(lines) if line.startswith("## ")), len(lines))
+        lines.insert(insert_at, f"{field}: {sanitize_sensitive_text(value)}")
+        text = "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+    write_exec(normalized, text)
+
+
+def build_exec_rerun_reply(tail: str) -> str:
+    """One-command recovery for a failed/timed-out/manual-start execution.
+
+    Reuses the sealed /exec start path so every gate (read-only gate, write
+    approval, owner-write preflight) re-applies. Links old and new records via
+    recovered_from / superseded_by so recovery becomes a measurable metric.
+    """
+    parts = str(tail or "").strip().split()
+    if len(parts) != 1:
+        return "Usage: /exec rerun <exec_id>"
+    old_exec_id = normalize_exec_id(parts[0])
+    old_meta = task_metadata(read_exec(old_exec_id))
+    dispatch_id = old_meta.get("dispatch_id", "")
+    if not dispatch_id:
+        return f"exec rerun refused: {old_exec_id} has no dispatch_id."
+    if old_meta.get("superseded_by", ""):
+        return f"exec rerun refused: {old_exec_id} was already superseded by {old_meta.get('superseded_by')}."
+    status = old_meta.get("status", "unknown")
+    completion = old_meta.get("completion_state", "unknown")
+    if status == "cancelled":
+        return (
+            f"exec rerun refused: {old_exec_id} status=cancelled. "
+            "Cancelled executions are treated as explicit human stop/cancel decisions; create a new dispatch instead."
+        )
+    recoverable = (
+        status in {"failed", "needs_manual_start"}
+        or completion in {"timeout_with_output", "timeout_with_payload", "payload_missing", "failed"}
+        or old_meta.get("timed_out", "") == "true"
+        or (status == "returned" and old_meta.get("returncode", "0") not in {"0", ""})
+    )
+    if not recoverable:
+        return (
+            f"exec rerun refused: {old_exec_id} status={status} completion_state={completion}. "
+            "Rerun only recovers failed, timed-out, payload-missing, or needs_manual_start executions."
+        )
+    normalized_dispatch_id = normalize_dispatch_id(dispatch_id)
+    dispatch_status = task_metadata(read_dispatch(normalized_dispatch_id)).get("status", "unknown")
+    if dispatch_status in {"reviewed", "closed"}:
+        return (
+            f"exec rerun refused: dispatch {normalized_dispatch_id} status={dispatch_status}; "
+            "the task already moved past execution. Create a new dispatch instead."
+        )
+    if dispatch_status not in {"ready", "sent"}:
+        update_dispatch_status(
+            normalized_dispatch_id,
+            "sent",
+            f"rerun requested; superseding {old_exec_id}",
+        )
+    reply = build_exec_start_reply(normalized_dispatch_id)
+    match = re.search(r"\bEXEC-\d{8}-\d{6}(?:-\d{2})?\b", reply)
+    new_exec_id = match.group(0) if match else ""
+    stamped = "false"
+    if new_exec_id and new_exec_id != old_exec_id:
+        upsert_exec_field(new_exec_id, "recovered_from", old_exec_id)
+        upsert_exec_field(old_exec_id, "superseded_by", new_exec_id)
+        stamped = "true"
+        log_event("exec_rerun", old_exec_id=old_exec_id, new_exec_id=new_exec_id, dispatch_id=normalized_dispatch_id)
+    return f"""Execution rerun: {old_exec_id} -> {new_exec_id or 'unknown'}
+- recovered_from_stamped: {stamped}
+- dispatch_id: {normalized_dispatch_id}
+- gates: identical to /exec start (read-only gate, write approval, owner-write preflight unchanged)
+
+{reply}"""
+
+
 def handle_exec_command(user_text: str) -> str | None:
     lines = user_text.strip().splitlines()
     first_line = lines[0] if lines else ""
@@ -10769,6 +10854,8 @@ def handle_exec_command(user_text: str) -> str | None:
             return build_exec_prepare_reply(tail)
         if subcommand == "start":
             return build_exec_start_reply(tail)
+        if subcommand == "rerun":
+            return build_exec_rerun_reply(tail)
         if subcommand == "approve":
             return build_exec_approve_reply(tail)
         if subcommand == "approve-latest":
@@ -12952,6 +13039,49 @@ def format_uptime(seconds: float) -> str:
     return f"{seconds}s"
 
 
+def build_metrics_reply(tail: str) -> str:
+    """Run scripts/metrics_snapshot.py --json (read-only) and format for chat."""
+    arg = str(tail or "").strip().split()
+    command = [sys.executable, "-B", str(ROOT / "scripts" / "metrics_snapshot.py"), "--json"]
+    if arg and arg[0].lower() == "all":
+        command.append("--all")
+    elif arg and arg[0].isdigit():
+        command.extend(["--days", arg[0]])
+    else:
+        command.extend(["--days", "7"])
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+        )
+    except Exception as exc:
+        return f"metrics failed: {safe_preview(str(exc), 180)}"
+    if proc.returncode != 0:
+        return f"metrics failed rc={proc.returncode}: {safe_preview(proc.stderr or proc.stdout, 300)}"
+    try:
+        data = json.loads(proc.stdout)
+    except ValueError:
+        return f"metrics produced invalid JSON: {safe_preview(proc.stdout, 200)}"
+    lines = [f"Atlas Clutch metrics | {data.get('window', '')}"]
+    for cohort in ("ALL", "REAL", "SYNTHETIC"):
+        m = data.get("cohorts", {}).get(cohort, {})
+        if not m:
+            continue
+        lines.append(f"{cohort}: created={m.get('tasks_created')} closed={m.get('tasks_closed')}")
+        lines.append(f"- median_time_to_accepted_min: {m.get('median_time_to_accepted_minutes')}")
+        lines.append(f"- evidence_completeness: {m.get('evidence_completeness_rate')}%")
+        lines.append(f"- first_pass_review: {m.get('first_pass_review_rate')}%")
+        lines.append(f"- handoff_proxy_per_closed_task: {m.get('human_handoff_proxy_per_closed_task')}")
+        lines.append(f"- auto_recovery: {m.get('auto_recovery_rate')}% (rerun recoveries: {m.get('recovered_via_rerun', 0)})")
+    lines.append("source: scripts/metrics_snapshot.py (read-only; no ledger writes)")
+    return "\n".join(lines)
+
+
 def build_status_reply(context: dict) -> str:
     state = context.get("state") or {}
     processed = state.get(PROCESSED_STATE_KEY) or []
@@ -13851,6 +13981,8 @@ def handle_local_command(user_text: str, context: dict) -> str | None:
         return handle_daily_command(user_text)
     if command == "/status":
         return build_status_reply(context)
+    if command == "/metrics":
+        return build_metrics_reply(parts[1] if len(parts) > 1 else "")
     if command == "/help":
         return build_help_reply()
     if command == "/workflow":
