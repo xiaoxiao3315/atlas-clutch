@@ -107,6 +107,11 @@ SLICE_COMMAND = "\n".join(
 
 with tempfile.TemporaryDirectory(prefix="ohb-featureslice-diag-") as tmp:
     root = Path(tmp)
+    # OHB-RUNNER-015: the bridge now executes declared validation commands
+    # itself when runner evidence is missing. git-init the temp workspace so
+    # `git diff --check` behaves deterministically here.
+    import subprocess as _subprocess
+    _subprocess.run(["git", "init", "-q", str(root)], capture_output=True, text=True, shell=False)
     old_paths = configure_temp_paths(root)
     orig_runner = bridge.run_allowlisted_external_command
     orig_post = bridge.run_allowlisted_post_run_command
@@ -207,12 +212,26 @@ with tempfile.TemporaryDirectory(prefix="ohb-featureslice-diag-") as tmp:
         write_meta = bridge.task_metadata(bridge.read_exec(extract_exec_id(write_reply)))
         check("11 /auto write slice passes", write_meta.get("required_validation_status") == "passed" and "auto_decision: pass" in write_reply, write_reply[-400:])
 
-        # ---- 12. missing validation evidence blocks ----
+        # ---- 12. missing runner evidence: bridge fills it (OHB-RUNNER-015) ----
+        # The bridge now executes declared, allowlisted validation commands
+        # itself when the runner reports no parseable evidence. With real
+        # files and a git-inited workspace both commands succeed, so this
+        # case auto-passes via bridge-generated evidence. A deterministic
+        # bridge-run FAILURE (py_compile on a missing file) still blocks.
         state.update({"wrote": False, "commands": [], "files": {TOOL: TOOL_CONTENT, NOTES: NOTES_CONTENT}, "evidence": ""})
         miss_reply, _ = bridge.prepare_reply(SLICE_COMMAND, ctx)
         miss_meta = bridge.task_metadata(bridge.read_exec(extract_exec_id(miss_reply)))
-        check("12 missing evidence fails validation", miss_meta.get("required_validation_status") == "failed" and "missing validation evidence" in miss_meta.get("required_validation_reason", ""), miss_meta.get("required_validation_reason"))
-        check("12 missing evidence blocked", "auto_decision: needs_human_review" in miss_reply, miss_reply[-400:])
+        check("12 bridge fills missing evidence", miss_meta.get("required_validation_status") == "passed", miss_meta.get("required_validation_reason"))
+        check("12 bridge-backed run passes", "auto_decision: pass" in miss_reply, miss_reply[-400:])
+        ghost_command = SLICE_COMMAND.replace(
+            f"- python -B -m py_compile {TOOL}",
+            f"- python -B -m py_compile {TOOL}\n- python -B -m py_compile workbench/tmp/featureslice/ghost.py",
+        )
+        state.update({"wrote": False, "commands": [], "files": {TOOL: TOOL_CONTENT, NOTES: NOTES_CONTENT}, "evidence": ""})
+        ghost_reply, _ = bridge.prepare_reply(ghost_command, ctx)
+        ghost_meta = bridge.task_metadata(bridge.read_exec(extract_exec_id(ghost_reply)))
+        check("12b bridge-run failure fails validation", ghost_meta.get("required_validation_status") == "failed", ghost_meta.get("required_validation_reason"))
+        check("12b bridge-run failure blocked", "auto_decision: needs_human_review" in ghost_reply, ghost_reply[-400:])
 
         # ---- 13. nonzero validation returncode blocks ----
         state.update({"wrote": False, "commands": [], "evidence": f"validation: python -B -m py_compile {TOOL} => returncode: 1\nvalidation: git diff --check => returncode: 0"})
@@ -238,6 +257,9 @@ with tempfile.TemporaryDirectory(prefix="ohb-featureslice-diag-") as tmp:
 
         # 5: missing file (claude "forgets" to write notes.md)
         state.update({"wrote": False, "commands": [], "files": {TOOL: TOOL_CONTENT}, "evidence": VALID_EVIDENCE})
+        # Earlier scenarios wrote notes.md to disk and the fake runner never
+        # deletes files, so drop the stale copy to make the target genuinely missing.
+        (root / NOTES).unlink(missing_ok=True)
         missing_reply, _ = bridge.prepare_reply(SLICE_COMMAND, ctx)
         missing_meta = bridge.task_metadata(bridge.read_exec(extract_exec_id(missing_reply)))
         check("5 missing file fails acceptance", missing_meta.get("acceptance_fidelity") == "failed" and "not verifiable" in missing_meta.get("acceptance_fidelity_reason", ""), missing_meta.get("acceptance_fidelity_reason"))
