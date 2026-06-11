@@ -13129,6 +13129,31 @@ def classify_auto_task_request(text: str) -> tuple[str, str]:
     return "read_only", "no clear code-writing signal; safe read-only codex run (no workspace-write)"
 
 
+def terminal_auto_closed_next_text(final_text: str) -> str:
+    """Display-only cleanup of the user-visible final reply for auto-closed runs.
+
+    When the final reply already indicates a successful auto close
+    (auto_pipeline_status: already_closed, or auto_decision: pass), the
+    stale manual guidance "next: run /dispatch qa ..., then /task review ..."
+    is rewritten to "next: none; task already auto-closed". Ledger writes,
+    task/dispatch/exec records, gates, closure and review behavior are
+    untouched; failure and needs_human_review replies keep their actionable
+    manual next steps.
+    """
+    text = str(final_text or "")
+    auto_close_succeeded = re.search(
+        r"(?m)^- (?:auto_pipeline_status: already_closed|auto_decision: pass)\s*$",
+        text,
+    )
+    if not auto_close_succeeded:
+        return text
+    return re.sub(
+        r"(?m)^(\s*(?:-\s*)?)next:(?=[^\n]*(?:/dispatch qa|/task review))[^\n]*$",
+        r"\1next: none; task already auto-closed",
+        text,
+    )
+
+
 def build_auto_routing_summary(run_reply: str, auto_triage: str = "", closure_text: str = "") -> str:
     reply_text = str(run_reply or "")
     task_id = reply_field(reply_text, "task_id") or "none"
@@ -13786,14 +13811,14 @@ def prepare_reply(user_text: str, context: dict) -> tuple[str, str]:
         if not auto_codex_write_tail:
             return "Usage: /auto codex-write <task title> [--project project_id]", "auto_help"
         run_reply, run_route = prepare_reply(f"/run codex-write {auto_codex_write_tail}", context)
-        return build_auto_pipeline_closure_reply(run_reply, "/auto codex-write"), run_route
+        return terminal_auto_closed_next_text(build_auto_pipeline_closure_reply(run_reply, "/auto codex-write")), run_route
 
     auto_codex_tail = _auto_tail("/auto codex")
     if auto_codex_tail is not None:
         if not auto_codex_tail:
             return "Usage: /auto codex <task title> [--project project_id]", "auto_help"
         run_reply, run_route = prepare_reply(f"/run codex {auto_codex_tail}", context)
-        return build_auto_pipeline_closure_reply(run_reply, "/auto codex"), run_route
+        return terminal_auto_closed_next_text(build_auto_pipeline_closure_reply(run_reply, "/auto codex")), run_route
 
     auto_write_tail = _auto_tail("/auto write")
     if auto_write_tail is not None:
@@ -13804,7 +13829,7 @@ def prepare_reply(user_text: str, context: dict) -> tuple[str, str]:
         summary = build_auto_routing_summary(
             run_reply, "owner-write requested; claude writes, codex reviews", closure_text=closure
         )
-        return f"{closure}\n\n{summary}", run_route
+        return terminal_auto_closed_next_text(f"{closure}\n\n{summary}"), run_route
 
     auto_task_tail = _auto_tail("/auto task")
     if auto_task_tail is not None:
@@ -13819,7 +13844,7 @@ def prepare_reply(user_text: str, context: dict) -> tuple[str, str]:
         run_reply, run_route = prepare_reply(run_command, context)
         closure = build_auto_pipeline_closure_reply(run_reply, "/auto task")
         summary = build_auto_routing_summary(run_reply, triage_reason, closure_text=closure)
-        return f"{closure}\n\n{summary}", run_route
+        return terminal_auto_closed_next_text(f"{closure}\n\n{summary}"), run_route
 
     if auto_lower == "/auto" or auto_lower.startswith("/auto "):
         return (
