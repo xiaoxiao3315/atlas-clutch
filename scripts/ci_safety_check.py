@@ -41,8 +41,8 @@ CONTENT_PATTERNS = [
 ]
 
 # Known dummy fixtures used by the sanitizer smoke tests (fake values by
-# construction, verified 2026-06-11; the secret_assignment hits are all the
-# 'secret = "bf_<smoke>_secret_123456"' redaction fixtures). Pairs are pinned
+# construction, verified 2026-06-11; the secret_assignment hits are all
+# bf_<smoke>_secret_123456 style redaction fixtures). Pairs are pinned
 # per (path, label): a NEW match in these files under any other label still
 # fails the gate.
 ALLOWLIST = {
