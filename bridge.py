@@ -7003,6 +7003,10 @@ def render_claude_english_runner_payload(exec_id: str, dispatch_id: str, sandbox
 {validation_command_lines}
 - After running each command, report exactly one line per command in this form:
 - validation: <command> => returncode: <n>
+- A command counts as passed only with returncode 0 in exactly that format.
+- If your harness forbids running a command, report exactly:
+- validation: <command> => returncode: unavailable
+- The bridge re-runs any command lacking parseable evidence and its result is authoritative.
 """
     else:
         required_validation_section = ""
@@ -8561,6 +8565,59 @@ def extract_required_validation_commands(text: str) -> dict:
     return {"found": True, "ok": True, "commands": commands, "unsafe": [], "reason": "required validation commands accepted"}
 
 
+VALIDATION_COMMAND_TIMEOUT_SECONDS = 120
+
+
+def validation_evidence_match(command: str, evidence: str):
+    """Last parseable evidence line wins: bridge-side evidence is appended
+    after runner output, so it is authoritative over runner claims."""
+    pattern = re.compile(
+        r"validation:\s*" + re.escape(str(command or "")) + r"\s*=>\s*returncode:\s*(-?\d+)",
+        re.IGNORECASE,
+    )
+    matches = list(pattern.finditer(str(evidence or "")))
+    return matches[-1] if matches else None
+
+
+def run_bridge_validation_commands(commands: list[str], existing_evidence: str = "") -> tuple[str, list[str]]:
+    """Execute declared validation commands the runner produced no parseable
+    evidence for. Narrow by construction:
+
+    - only commands that pass is_allowed_required_validation_command,
+    - argv-based subprocess, shell=False, cwd at the workspace root,
+    - output is discarded; only the returncode becomes evidence,
+    - refusal markers are non-numeric so they can never satisfy the gate.
+    """
+    lines: list[str] = []
+    executed: list[str] = []
+    for command in commands:
+        if validation_evidence_match(command, existing_evidence):
+            continue
+        if not is_allowed_required_validation_command(command):
+            lines.append(f"validation: {command} => returncode: refused-not-allowlisted")
+            continue
+        argv = command.split()
+        try:
+            completed = subprocess.run(
+                argv,
+                cwd=str(Path(WORKBENCH_DIR).parent),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=VALIDATION_COMMAND_TIMEOUT_SECONDS,
+                shell=False,
+            )
+            returncode = completed.returncode
+        except FileNotFoundError:
+            returncode = 127
+        except subprocess.TimeoutExpired:
+            returncode = 124
+        executed.append(command)
+        lines.append(f"validation: {command} => returncode: {returncode}")
+    return sanitize_sensitive_text("\n".join(lines)), executed
+
+
 def evaluate_required_validation(dispatch_id: str, runner_output: str, post_run_snapshot: str) -> dict:
     """Verify declared validation commands against runner/post-run evidence.
 
@@ -8590,11 +8647,7 @@ def evaluate_required_validation(dispatch_id: str, runner_output: str, post_run_
         }
     evidence = f"{runner_output}\n{post_run_snapshot}"
     for command in declaration["commands"]:
-        pattern = re.compile(
-            r"validation:\s*" + re.escape(command) + r"\s*=>\s*returncode:\s*(-?\d+)",
-            re.IGNORECASE,
-        )
-        match = pattern.search(evidence)
+        match = validation_evidence_match(command, evidence)
         if not match:
             return {
                 "status": "failed",
@@ -9312,9 +9365,31 @@ def execute_exec_runner(
         # Claude wrote; check concrete user acceptance criteria first, then
         # Codex must review read-only before any auto close.
         acceptance = evaluate_acceptance_fidelity(exec_id, normalized_dispatch_id)
+        runner_output = f"{result.get('stdout', '')}\n{result.get('stderr', '')}"
+        bridge_validation_evidence = ""
+        try:
+            validation_scope = "\n".join(owner_write_scope_lines(normalized_dispatch_id))
+        except Exception:
+            validation_scope = ""
+        validation_declaration = extract_required_validation_commands(validation_scope)
+        if validation_declaration["found"] and validation_declaration["ok"]:
+            # The executor harness may not be allowed to run shell commands.
+            # The bridge fills the evidence gap itself, but only for commands
+            # already accepted by the narrow validation allowlist and only
+            # when the runner produced no parseable evidence line.
+            bridge_validation_evidence, bridge_validation_executed = run_bridge_validation_commands(
+                validation_declaration["commands"], runner_output
+            )
+            if bridge_validation_evidence:
+                append_exec_autostart_section(
+                    exec_id,
+                    "bridge validation evidence",
+                    bridge_validation_evidence
+                    + f"\n- executed_by_bridge: {len(bridge_validation_executed)} command(s); argv subprocess, shell=False, workspace root cwd",
+                )
         validation = evaluate_required_validation(
             normalized_dispatch_id,
-            f"{result.get('stdout', '')}\n{result.get('stderr', '')}",
+            f"{runner_output}\n{bridge_validation_evidence}",
             post_run_snapshot,
         )
         update_exec_fields(
