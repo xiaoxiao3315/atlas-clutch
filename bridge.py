@@ -4125,8 +4125,12 @@ def build_learn_review_reply(learn_id: str) -> str:
         try:
             retro_text = read_retro(source_task_id)
             retro_status = task_metadata(retro_text).get("status", "unknown")
-            retro_gap_text = task_section(retro_text, "Evidence Gaps")
-            live_or_gap = "live_skipped" in retro_text or "live skipped" in retro_text.lower() or "missing" in retro_gap_text
+            # Structured check. The gaps-text template always contains the word
+            # "missing" as a heading, so the old substring match deferred every
+            # retro-sourced proposal. Read the Evidence Summary fields instead.
+            live_or_gap = ("- live_skipped: true" in retro_text) or bool(
+                re.search(r"- missing_count:\s*[1-9]", retro_text)
+            )
         except Exception:
             retro_status = "missing"
             evidence_enough = False
@@ -6508,7 +6512,7 @@ def build_dispatch_link_review_reply(dispatch_id: str) -> str:
     task_text = read_task(task_id)
     review = task_section(task_text, "Atlas Review")
     decision = task_section(task_text, "User Decision")
-    has_review = "Review at" in review or "å®¡æŸ¥" in review
+    has_review = "Review at" in review or "审查" in review
     now = iso_now()
     link_body = f"""- linked_at: {now}
 - task_file: workbench/tasks/{task_id}.md
@@ -13324,11 +13328,10 @@ Auto Pipeline Closure:
         )
         review_reply = build_task_review_reply(task_id)
         link_reply = build_dispatch_link_review_reply(dispatch_id)
-        review_reply = build_task_review_reply(task_id)
 
         review_ready = (
             "remaining_gaps: none" in review_reply
-            and ("?????pass" in review_reply or "recommendation: ready_for_review" in review_reply or "recommendation: pass" in review_reply)
+            and ("建议决策：pass" in review_reply or "recommendation: ready_for_review" in review_reply or "recommendation: pass" in review_reply)
         )
         if not review_ready:
             return _block("needs_human_review", "review still has remaining gaps after evidence acceptance")
@@ -13346,7 +13349,7 @@ Auto Pipeline Closure:
         try:
             build_retro_create_reply(task_id)
             retro_reply = build_retro_approve_reply(task_id, f"auto pipeline retro approved after {source_command}")
-            retro_status = "approved" if "approved" in retro_reply.lower() or "?????" in retro_reply else "created"
+            retro_status = "approved" if "approved" in retro_reply.lower() or "复盘已确认" in retro_reply else "created"
         except Exception as exc:
             retro_status = "needs_human_review"
             return _block("needs_human_review", f"retro closure failed: {exc}", final_task_status=task_status, retro_status=retro_status)
