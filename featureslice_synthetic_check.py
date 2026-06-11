@@ -119,15 +119,22 @@ with tempfile.TemporaryDirectory(prefix="ohb-featureslice-diag-") as tmp:
         "files": {TOOL: TOOL_CONTENT, NOTES: NOTES_CONTENT},
         "evidence": VALID_EVIDENCE,
         "payloads": [],
+        # Pre-run worktree dirt the mock reports in every `git status --short`
+        # snapshot (pre-run and post-run alike). Clean by default so auto-pass
+        # scenarios own all dirty paths under the worktree ownership guard
+        # (commit 86e456c). Scenario 10b sets it to bridge.py to exercise the
+        # guard's unowned-dirt block.
+        "baseline_dirt": "",
     }
 
     def fake_post_run(argv):
         if argv == ["git", "status", "--short"]:
-            out = " M bridge.py"
+            lines = []
+            if state["baseline_dirt"]:
+                lines.append(state["baseline_dirt"])
             if state["wrote"]:
-                for rel in state["files"]:
-                    out += f"\n?? {rel}"
-            return {"returncode": 0, "stdout": out, "stderr": ""}
+                lines.extend(f"?? {rel}" for rel in state["files"])
+            return {"returncode": 0, "stdout": "\n".join(lines), "stderr": ""}
         return {"returncode": 0, "stdout": " bridge.py | 1 +", "stderr": ""}
 
     def fake_runner(argv, *, input_text="", **_):
@@ -178,6 +185,21 @@ with tempfile.TemporaryDirectory(prefix="ohb-featureslice-diag-") as tmp:
         check("10 verification not blocked", meta.get("verification_status") == "not_blocked", meta.get("verification_status"))
         check("10 auto pass", "auto_decision: pass" in reply, reply[-700:])
         check("10 summary shows validation", "required_validation_status: passed" in reply, reply[-700:])
+
+        # ---- 10b. unowned pre-run worktree dirt -> needs_human_review ----
+        # Stale-fixture regression guard. A concurrent actor's uncommitted
+        # bridge.py (dirty before this run, outside the declared targets) must
+        # never be swept into an auto pass. The worktree ownership guard
+        # (commit 86e456c) blocks auto close here while acceptance/validation
+        # still pass, isolating the ownership gate as the sole blocker.
+        state.update({"wrote": False, "commands": [], "payloads": [], "files": {TOOL: TOOL_CONTENT, NOTES: NOTES_CONTENT}, "evidence": VALID_EVIDENCE, "baseline_dirt": " M bridge.py"})
+        unowned_reply, _ = bridge.prepare_reply(SLICE_COMMAND, ctx)
+        unowned_meta = bridge.task_metadata(bridge.read_exec(extract_exec_id(unowned_reply)))
+        check("10b worktree ownership blocked", unowned_meta.get("worktree_ownership") == "blocked", unowned_meta.get("worktree_ownership"))
+        check("10b reason flags unowned bridge.py", "unowned_dirty_worktree" in unowned_meta.get("worktree_ownership_reason", "") and "bridge.py" in unowned_meta.get("worktree_ownership_reason", ""), unowned_meta.get("worktree_ownership_reason"))
+        check("10b acceptance still passes", unowned_meta.get("acceptance_fidelity") == "passed", unowned_meta.get("acceptance_fidelity_reason"))
+        check("10b unowned dirt needs human review", "auto_decision: needs_human_review" in unowned_reply, unowned_reply[-700:])
+        state["baseline_dirt"] = ""
 
         # ---- 11. /auto write feature slice auto-passes ----
         state.update({"wrote": False, "commands": [], "payloads": [], "files": {TOOL: TOOL_CONTENT, NOTES: NOTES_CONTENT}, "evidence": VALID_EVIDENCE})
