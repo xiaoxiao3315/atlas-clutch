@@ -19,32 +19,12 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Compile bridge
-        run: python -B -m py_compile bridge.py
-
-      - name: Safety scan (tracked files only)
+      # Kept outside the quality gate on purpose: the public-repo secret and
+      # path scan must stay independently enforced even if the gate's check
+      # list is ever edited. The gate also runs it (single source of truth
+      # for the full suite); this step is the defense-in-depth copy.
+      - name: Safety scan (independent of quality gate)
         run: python -B scripts/ci_safety_check.py
 
-      - name: Smoke runtime
-        run: python -B smoke_runtime.py
-
-      - name: Smoke task loop
-        run: python -B smoke_task_loop.py
-
-      - name: Smoke tools status
-        run: python -B smoke_tools_status.py
-
-      - name: Smoke tool adapters
-        run: python -B smoke_tool_adapters.py
-
-      - name: File pack synthetic check
-        run: python -B filepack_synthetic_check.py
-
-      - name: Autocommit guard synthetic check
-        run: python -B autocommit_guard_synthetic_check.py
-
-      - name: Feature slice synthetic check
-        run: python -B featureslice_synthetic_check.py
-
-      - name: Git whitespace check
-        run: git diff --check
+      - name: Quality gate
+        run: python -B scripts/quality_gate.py --ci
