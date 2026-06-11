@@ -13068,6 +13068,7 @@ def build_help_reply() -> str:
 - /exec help: semi-auto execution session ledger; human confirmation required.
 - /run help: one-command task -> dispatch -> exec start helper.
 - /collect help: read-only whitelist evidence collection.
+- /tools status: read-only local tool registry and integration status.
 - /pilot help: real-project pilot metrics and operating notes.
 - /context help: Context Pack commands.
 - /playbook help: local Playbook reference commands.
@@ -13377,11 +13378,145 @@ def handle_run_command(user_text: str) -> str | None:
         return f"run operation failed: {safe_preview(str(exc), 180)}"
 
 
+# TOOL-INTEGRATION-001: read-only registry of lab-installed helper tools.
+# /tools is a status surface only. It never installs, executes, probes, or
+# connects any registered tool; its only filesystem access is an existence
+# check on tool-lab report/contract files (file names only, contents unread).
+TOOL_LAB_ROOT = Path(r"E:\ai\tools-lab")
+
+TOOL_REGISTRY = [
+    {
+        "tool_id": "codegraph",
+        "role": "Code Intelligence Worker",
+        "status": "validated",
+        "risk": "low",
+        "mode": "read-only index queries in dev sessions; not wired into bridge runtime",
+        "next_allowed": "design read-only bridge adapter per codegraph-adapter-contract",
+        "report_file": "codegraph-install-report.md",
+        "contract_file": "codegraph-adapter-contract.md",
+    },
+    {
+        "tool_id": "understand-anything",
+        "role": "Project Comprehension Worker",
+        "status": "installed-lab",
+        "risk": "low",
+        "mode": "manual analysis runs outside the bridge; not wired into bridge runtime",
+        "next_allowed": "manual read-only knowledge-graph run on this repo",
+        "report_file": "understand-anything-install-report.md",
+        "contract_file": "understand-anything-adapter-contract.md",
+    },
+    {
+        "tool_id": "academic-research-skills",
+        "role": "Research / Report Skill Pack",
+        "status": "installed-lab",
+        "risk": "low",
+        "mode": "skill pack loaded in the dev harness; not callable from the bridge",
+        "next_allowed": "draft a research dispatch template (no execution)",
+        "report_file": "academic-research-skills-install-report.md",
+        "contract_file": "research-skills-contract.md",
+    },
+    {
+        "tool_id": "agentmemory",
+        "role": "Persistent Memory Worker (gated)",
+        "status": "installed-lab",
+        "risk": "medium",
+        "mode": "sandbox demo only; not-connected to real Atlas/Hermes memory",
+        "next_allowed": "stay sandboxed; real memory connection needs explicit owner approval",
+        "report_file": "agentmemory-install-report.md",
+        "contract_file": "agentmemory-adapter-contract.md",
+    },
+    {
+        "tool_id": "headroom",
+        "role": "Context Compression Worker (gated)",
+        "status": "installed-lab",
+        "risk": "medium",
+        "mode": "library-only; not proxying live Claude/Codex/Kiro/Hermes traffic",
+        "next_allowed": "offline benchmark only; live proxying needs explicit owner approval",
+        "report_file": "headroom-install-report.md",
+        "contract_file": "headroom-context-contract.md",
+    },
+    {
+        "tool_id": "browser-harness",
+        "role": "Browser Evidence Collector (gated)",
+        "status": "not-connected",
+        "risk": "high",
+        "mode": "loopback lab only; no real browser profile or live connection from the bridge",
+        "next_allowed": "remain disconnected; evidence-collection design needs explicit owner approval",
+        "report_file": "browser-harness-install-report.md",
+        "contract_file": "browser-harness-worker-contract.md",
+    },
+]
+
+
+def tool_lab_artifact_status(kind: str, filename: str) -> str:
+    """Existence check only; tool-lab file contents are never read."""
+    base = TOOL_LAB_ROOT / ("reports" if kind == "report" else "contracts")
+    try:
+        if not base.is_dir():
+            return "unknown"
+        return "found" if (base / filename).is_file() else "unknown"
+    except OSError:
+        return "unknown"
+
+
+def build_tools_help_reply() -> str:
+    return """Atlas Clutch tool registry commands
+- /tools help: show this help.
+- /tools status: read-only status of lab-installed helper tools.
+
+/tools is a status surface only. It does not install, execute, probe, or
+connect any tool, and it never reads .env, tokens, or tool data."""
+
+
+def build_tools_status_reply() -> str:
+    lines = [
+        "Atlas Clutch local tool registry (read-only)",
+        "mode: status_surface_only - no tool is executed or connected by this command",
+        "",
+    ]
+    for item in TOOL_REGISTRY:
+        lines.extend(
+            [
+                f"- {item['tool_id']}",
+                f"  status: {item['status']}",
+                f"  role: {item['role']}",
+                f"  risk: {item['risk']}",
+                f"  mode: {item['mode']}",
+                f"  next_allowed: {item['next_allowed']}",
+                f"  lab_report: {tool_lab_artifact_status('report', item['report_file'])}"
+                f" | lab_contract: {tool_lab_artifact_status('contract', item['contract_file'])}",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "Boundary:",
+            "- /tools does not execute, install, or connect tools.",
+            "- browser-harness stays not-connected; no real browser or profile access.",
+            "- agentmemory stays not-connected to real Atlas/Hermes memory.",
+            "- headroom stays library-only and does not proxy live traffic.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def handle_tools_command(user_text: str) -> str | None:
+    parts = user_text.strip().split(maxsplit=2)
+    if not parts or parts[0].lower() != "/tools":
+        return None
+    subcommand = parts[1].lower() if len(parts) > 1 else "help"
+    if subcommand == "status":
+        return build_tools_status_reply()
+    return build_tools_help_reply()
+
+
 def handle_local_command(user_text: str, context: dict) -> str | None:
     parts = user_text.strip().split(maxsplit=1)
     command = parts[0].lower() if parts else ""
     if command == "/run":
         return handle_run_command(user_text)
+    if command == "/tools":
+        return handle_tools_command(user_text)
     if command == "/apply":
         return handle_apply_command(user_text)
     if command == "/playbook":
