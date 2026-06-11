@@ -34,7 +34,8 @@ auto-close ─────────── or ──────────�
 ## Core capabilities
 
 - Natural-language owner-write tasks
-- CJK / Chinese target parsing (`只允许创建或更新：`)
+- CJK / multilingual owner-write parsing (English and Chinese task headings)
+- Multilingual acceptance parsing
 - Single-file writes
 - Bounded file packs (2–5 declared files)
 - Feature-slice automation
@@ -59,38 +60,40 @@ auto-close ─────────── or ──────────�
 
 All examples write only under `workbench/tmp/`, which is local runtime state and never committed.
 
-**Single file, Chinese exact-one-line acceptance:**
+**Single file, exact-one-line acceptance:**
 
 ```text
-/auto task 只允许创建或更新 workbench/tmp/cn-single.txt. 只写一行：cn single ok. Do not modify source code. No git add/commit/push. --project auto_exec
+/auto task Allowed write target: workbench/tmp/single.txt. Write exactly one line: single ok. Do not modify source code. No git add/commit/push. --project auto_exec
 ```
 
 **Two-file file pack:**
 
 ```text
-/auto task 只允许创建或更新：
+/auto task Allowed write targets:
 - workbench/tmp/filepack/a.txt
 - workbench/tmp/filepack/b.md
-验收：
-- workbench/tmp/filepack/a.txt => 只写一行：alpha ok
-- workbench/tmp/filepack/b.md => 只写一行：beta ok
+Acceptance:
+- workbench/tmp/filepack/a.txt => exactly one line: alpha ok
+- workbench/tmp/filepack/b.md => exactly one line: beta ok
 Do not modify source code. No git add/commit/push. --project auto_exec
 ```
 
 **Feature slice with acceptance criteria and required validation:**
 
 ```text
-/auto task 只允许创建或更新：
+/auto task Allowed write targets:
 - workbench/tmp/featureslice/tool.py
 - workbench/tmp/featureslice/notes.md
-验收：
-- workbench/tmp/featureslice/tool.py => 包含：def answer
-- workbench/tmp/featureslice/notes.md => 包含：Feature Slice
-必须验证：
+Acceptance:
+- workbench/tmp/featureslice/tool.py => contains: def answer
+- workbench/tmp/featureslice/notes.md => contains: Feature Slice
+Required validation:
 - python -B -m py_compile workbench/tmp/featureslice/tool.py
 - git diff --check
 Do not modify source code except the allowed targets. No git add/commit/push. --project auto_exec
 ```
+
+Equivalent Chinese task headings and acceptance bullets are parsed natively; the CJK forms are exercised by the project's synthetic checks.
 
 ## What it is not
 
