@@ -13709,6 +13709,7 @@ def build_tool_adapter_help_reply() -> str:
 - /tool research plan <topic>: lightweight research plan package; no ARS pipeline run, no web research.
 - /tool memory status: agentmemory lab status; never starts a service or touches memory data.
 - /tool headroom compress <text>: dry-run compression report for pasted text only.
+- /tool evidence <task_id> <tool command...>: run a safe adapter command and record its output in the task evidence ledger as a report.
 
 Boundaries:
 - No installs, no MCP config changes, no persistent services, no LAN or public exposure.
@@ -13718,20 +13719,21 @@ Boundaries:
 - Every reply states whether an external tool was executed or only prepared."""
 
 
-def handle_tool_command(user_text: str) -> str | None:
-    lines = user_text.strip().splitlines()
+def run_tool_adapter_command(command_text: str) -> str | None:
+    """Dispatch '<tool> <action> [args]' to the thin adapters.
+
+    Returns None for unsupported commands. browser-harness deliberately has
+    no adapter here, so it can never be executed or recorded as evidence.
+    """
+    lines = str(command_text or "").strip().splitlines()
     first_line = lines[0] if lines else ""
-    parts = first_line.split(maxsplit=3)
-    if not parts or parts[0].lower() != "/tool":
-        return None
-    subcommand = parts[1].lower() if len(parts) > 1 else "help"
-    action = parts[2].lower() if len(parts) > 2 else ""
-    tail = parts[3] if len(parts) > 3 else ""
+    parts = first_line.split(maxsplit=2)
+    subcommand = parts[0].lower() if parts else ""
+    action = parts[1].lower() if len(parts) > 1 else ""
+    tail = parts[2] if len(parts) > 2 else ""
     body = "\n".join(lines[1:]).strip()
     if body:
         tail = f"{tail}\n{body}".strip() if tail else body
-    if subcommand == "status":
-        return build_tool_status_compact_reply()
     if subcommand == "codegraph" and action == "query":
         return run_tool_codegraph_query(tail)
     if subcommand == "understand" and action == "summary":
@@ -13742,6 +13744,70 @@ def handle_tool_command(user_text: str) -> str | None:
         return build_tool_memory_status_reply()
     if subcommand == "headroom" and action == "compress":
         return build_tool_headroom_compress_reply(tail)
+    return None
+
+
+def build_tool_evidence_reply(tail: str) -> str:
+    parts = str(tail or "").strip().split(maxsplit=1)
+    if len(parts) < 2:
+        return "Usage: /tool evidence <task_id> <tool command...>  e.g. /tool evidence OHB-20260611-001810 memory status"
+    raw_task_id, command_text = parts[0], parts[1]
+    command_label = safe_preview(" ".join(command_text.split()), 120)
+    try:
+        task_id = normalize_task_id(raw_task_id)
+        read_task(task_id)
+    except ValueError:
+        return f"tool evidence refused: invalid task id: {safe_preview(raw_task_id, 40)}\n- evidence_written: none"
+    except FileNotFoundError:
+        return f"tool evidence refused: task not found: {safe_preview(raw_task_id, 40)}\n- evidence_written: none"
+    reply = run_tool_adapter_command(command_text)
+    if reply is None:
+        return f"""tool evidence refused: unsupported tool command: {command_label}
+- evidence_written: none
+- supported: codegraph query, understand summary, research plan, memory status, headroom compress
+- browser-harness is gated and cannot be recorded or executed."""
+    match = re.search(r"(?m)^- external_execution:\s*(.+)$", reply)
+    execution_mode = match.group(1).strip() if match else "unknown"
+    evidence_body = f"""Tool report
+- tool_command: {command_label}
+- external_execution: {execution_mode}
+- boundary: thin read-only/dry-run adapter output; no secrets, no browser data.
+
+{reply}"""
+    try:
+        evidence_id = create_evidence_entry(task_id, "report", evidence_body, source="tool", verified="no")
+    except Exception as exc:
+        return f"tool evidence failed: {safe_preview(str(exc), 180)}\n- evidence_written: none"
+    return f"""tool evidence recorded: {evidence_id}
+- task_id: {task_id}
+- evidence_id: {evidence_id}
+- tool_command: {command_label}
+- external_execution: {execution_mode}
+- evidence_type: report
+- verified: no
+- path: workbench/evidence/{task_id}.md
+- next: /evidence list {task_id} or /evidence mark {task_id} {evidence_id} verified <reason>"""
+
+
+def handle_tool_command(user_text: str) -> str | None:
+    lines = user_text.strip().splitlines()
+    first_line = lines[0] if lines else ""
+    parts = first_line.split(maxsplit=2)
+    if not parts or parts[0].lower() != "/tool":
+        return None
+    subcommand = parts[1].lower() if len(parts) > 1 else "help"
+    rest = parts[2] if len(parts) > 2 else ""
+    body = "\n".join(lines[1:]).strip()
+    if body:
+        rest = f"{rest}\n{body}".strip() if rest else body
+    if subcommand == "status":
+        return build_tool_status_compact_reply()
+    if subcommand == "evidence":
+        return build_tool_evidence_reply(rest)
+    if subcommand != "help":
+        reply = run_tool_adapter_command(f"{subcommand} {rest}".strip())
+        if reply is not None:
+            return reply
     return build_tool_adapter_help_reply()
 
 
