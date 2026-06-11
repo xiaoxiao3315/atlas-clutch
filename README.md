@@ -63,7 +63,11 @@ All examples write only under `workbench/tmp/`, which is local runtime state and
 **Single file, exact-one-line acceptance:**
 
 ```text
-/auto task Allowed write target: workbench/tmp/single.txt. Write exactly one line: single ok. Do not modify source code. No git add/commit/push. --project auto_exec
+/auto task Allowed write targets:
+- workbench/tmp/single.txt
+Acceptance:
+- workbench/tmp/single.txt => exactly one line: single ok
+Do not modify source code. No git add/commit/push. --project auto_exec
 ```
 
 **Two-file file pack:**
