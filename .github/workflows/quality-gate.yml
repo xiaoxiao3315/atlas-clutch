@@ -1,0 +1,22 @@
+name: quality-gate
+
+# Runs the same 13-check suite as local `python -B scripts/quality_gate.py`.
+# windows-latest mirrors the production environment (bridge runs on Windows,
+# repo ships .cmd launchers). The gate reads no secrets and scans tracked
+# files only, so it is safe for public CI logs.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  gate:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run Atlas Clutch quality gate
+        run: python -B scripts/quality_gate.py --ci
