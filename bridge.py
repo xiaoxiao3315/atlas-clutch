@@ -113,6 +113,21 @@ EXTERNAL_EXECUTION_ENABLED = False
 HUMAN_CONFIRM_REQUIRED = True
 AUTO_EXECUTE_ENABLED = False
 READ_ONLY_AUTO_EXEC_ENABLED = True
+# Phase 1.8 loop closure flags.
+# PRE_REGISTRATION_ENFORCED: a return report may only be attached to a task
+# whose execution was registered beforehand (dispatch or handoff). This blocks
+# after-the-fact recording of work that was never entered into the workbench.
+PRE_REGISTRATION_ENFORCED = True
+# AUTO_REWORK_DECIDE_ENABLED: when auto postprocess fails only on
+# deterministic evidence/acceptance gates, record a needs_evidence (rework)
+# decision automatically instead of stopping at needs_human_review.
+# Infrastructure, authorization, and sensitive-risk failures still require a
+# human.
+AUTO_REWORK_DECIDE_ENABLED = True
+# AUTO_LEARN_SCAN_ENABLED: after an auto-closed pass creates its retro,
+# automatically scan the retro into learning candidates so playbook updates
+# enter the (human-gated) learning pipeline.
+AUTO_LEARN_SCAN_ENABLED = True
 COLLECT_ENABLED = True
 COLLECT_MODE = "read_only_whitelist"
 ARBITRARY_COMMAND_ENABLED = False
@@ -140,6 +155,7 @@ OCTO_BRIDGE_SMOKE_ALLOWLIST = [
     "smoke_dispatch.py",
     "smoke_pilot.py",
     "smoke_auto_evidence.py",
+    "smoke_loop_closure.py",
 ]
 COLLECT_PROFILES = {
     "octo-bridge": {
@@ -2493,9 +2509,47 @@ def build_task_show_reply(task_id: str) -> str:
 - safety: Atlas/Bridge records the manual workflow only; it does not execute commands or call Codex/Kiro."""
 
 
+def task_execution_registered(task_id: str, text: str | None = None) -> dict:
+    """Check whether execution for this task was registered before the report.
+
+    Registration means at least one of:
+    - a dispatch record exists for the task, or
+    - a handoff package was generated and recorded on the task timeline.
+    """
+    normalized_task_id = normalize_task_id(task_id)
+    task_text = text if text is not None else read_task(normalized_task_id)
+    dispatch = latest_dispatch_for_task(normalized_task_id)
+    if dispatch:
+        return {
+            "registered": True,
+            "via": f"dispatch {dispatch.get('dispatch_id', '')} status={dispatch.get('status', '')}",
+        }
+    timeline = task_section(task_text, "Timeline")
+    for line in timeline.splitlines():
+        if "handoff package generated" in line or "execution registered" in line:
+            return {"registered": True, "via": safe_preview(line.strip("- ").strip(), 140)}
+    return {"registered": False, "via": "none"}
+
+
+def build_pre_registration_refusal(task_id: str) -> str:
+    return f"""回传被拒绝：{task_id}
+- pre_registration_enforced: true
+- reason: 该任务没有事先登记的执行（无 dispatch 记录、无 handoff 登记）。
+- 规则：所有任务必须先进入 Workbench 再执行，不允许事后补录。
+- 正确流程：
+  1. /dispatch create {task_id} codex|claude|kiro  （或 /task handoff {task_id} codex|kiro）
+  2. 执行端完成后再回传：/task report {task_id} 或 /dispatch receive <dispatch_id>
+- 如确属历史任务补录，请先创建 dispatch 并在备注中说明补录原因。"""
+
+
 def build_task_report_reply(task_id: str, report: str) -> str:
     normalized_task_id = normalize_task_id(task_id)
     text = read_task(normalized_task_id)
+    if PRE_REGISTRATION_ENFORCED:
+        registration = task_execution_registered(normalized_task_id, text)
+        if not registration["registered"]:
+            log_event("task_report_refused_preregistration", task_id=normalized_task_id)
+            return build_pre_registration_refusal(normalized_task_id)
     intake = analyze_evidence_intake(report, task_section(text, "Acceptance Criteria"))
     clean_report = sanitize_sensitive_text(report).strip() or "- 空报告：需要补充执行证据。"
     now = iso_now()
@@ -2881,6 +2935,20 @@ task_id：{task_id}
 {evidence_required}""")
     if with_context:
         reply += "\n\n" + build_copyable_handoff_context(task_id, target, create_file=False)
+    # Pre-registration: record the handoff on the task timeline so the later
+    # return report can prove execution was registered before it ran.
+    try:
+        now = iso_now()
+        task_text = read_task(task_id)
+        task_text = append_to_section(
+            task_text,
+            "Timeline",
+            f"- {now} handoff package generated for {target}; execution registered.",
+        )
+        write_task(task_id, task_text)
+        log_event("task_handoff_registered", task_id=normalize_task_id(task_id), target=target)
+    except Exception:
+        pass
     return reply
 
 
@@ -6211,6 +6279,13 @@ def route_tools_for_task(task_id: str, task_text: str) -> list[dict]:
     for template, patterns, reason in TOOL_AUTO_ROUTING_RULES:
         for pattern in patterns:
             if re.search(pattern, haystack, re.IGNORECASE):
+                if (
+                    template == "understand summary"
+                    and any(item["command"].startswith("codegraph query") for item in matched)
+                    and re.search(r"\bstructure\b", haystack, re.IGNORECASE)
+                    and not re.search(r"\b(architecture|overview|codebase map)\b", haystack, re.IGNORECASE)
+                ):
+                    continue
                 matched.append({"command": template.format(query=query), "reason": reason})
                 break
         if len(matched) >= TOOL_AUTO_ROUTING_MAX:
@@ -8060,16 +8135,39 @@ def route_auto_executor(text: str, owner_write: bool = False) -> tuple[str, str]
     return "codex", "auto routing: no clear code-writing signal; codex stays the safe default"
 
 
+def probe_kiro_noninteractive(sandbox_mode: str = "read-only") -> dict:
+    # Kiro adapter: simulation-backed until the kiro-proxy evidence lands.
+    # Fail-closed for real invocation; OHB_EXEC_SIMULATE_KIRO=1 exercises the
+    # full dispatch -> exec -> evidence loop through the safe simulated runner.
+    if sandbox_mode != "read-only":
+        return {
+            "supported": False,
+            "mode": "not_configured",
+            "reason": f"kiro {sandbox_mode} execution is not enabled; only read-only is wired",
+            "command": [],
+        }
+    if os.environ.get("OHB_EXEC_SIMULATE_KIRO") == "1":
+        return {"supported": True, "mode": "simulated", "reason": "OHB_EXEC_SIMULATE_KIRO enabled", "command": []}
+    return {
+        "supported": False,
+        "mode": "not_configured",
+        "reason": "kiro non-interactive adapter not wired; use manual handoff, or OHB_EXEC_SIMULATE_KIRO=1 for loop verification",
+        "command": [],
+    }
+
+
 def executor_probe_for_target(target_executor: str) -> dict:
     if target_executor == "claude":
         return probe_claude_noninteractive()
+    if target_executor == "kiro":
+        return probe_kiro_noninteractive()
     return probe_codex_noninteractive()
 
 
 def executor_status_from_probe(target_executor: str, probe: dict) -> str:
     if probe.get("supported"):
         return "available"
-    return "not_configured" if target_executor == "claude" else "unavailable"
+    return "not_configured" if target_executor in {"claude", "kiro"} else "unavailable"
 
 
 def build_manual_start_hint(exec_id: str, dispatch_id: str, reason: str) -> str:
@@ -10361,6 +10459,53 @@ Dispatch sync:
 {safe_preview(dispatch_reply, 520)}"""
 
 
+# Gate failures that deterministically mean "evidence/acceptance gap" and can
+# safely auto-record a needs_evidence (rework) decision. Infrastructure,
+# authorization, sensitive-risk, and review-verdict gates are NOT listed and
+# always fall back to needs_human_review.
+AUTO_REWORK_ELIGIBLE_GATES = {
+    "acceptance_fidelity",
+    "required_validation",
+    "evidence_intake",
+    "review_has_no_remaining_gaps",
+    "closure_evidence_ready",
+    "post_run_target_fidelity",
+    "report_blocked_write",
+}
+
+
+def attempt_auto_rework_decision(task_id: str, exec_id: str, failed_gates: list[str], reason: str) -> dict:
+    """Record an automatic needs_evidence (rework) decision when every failed
+    gate is a deterministic evidence/acceptance gap. Returns decision state."""
+    fallback = {"decided": False, "decision": "needs_human_review", "preview": ""}
+    if not AUTO_REWORK_DECIDE_ENABLED:
+        return fallback
+    if not failed_gates or not set(failed_gates).issubset(AUTO_REWORK_ELIGIBLE_GATES):
+        return fallback
+    try:
+        decide_reply = build_task_decide_reply(
+            task_id,
+            "needs_evidence",
+            f"auto rework: exec {exec_id} failed deterministic evidence/acceptance gates: {safe_preview(reason, 200)}",
+        )
+        log_event("task_auto_rework_decided", task_id=task_id, exec_id=exec_id)
+        return {"decided": True, "decision": "needs_evidence", "preview": decide_reply}
+    except Exception as exc:
+        fallback["preview"] = safe_preview(str(exc), 160)
+        return fallback
+
+
+def auto_rework_commands(task_id: str, dispatch_id: str) -> str:
+    return "\n".join(
+        [
+            f"- /evidence gaps {task_id}",
+            f"- supplement evidence, then /task report {task_id}",
+            f"- or rerun: /dispatch create {task_id} codex|claude|kiro for a rework round",
+            f"- dispatch trail: /dispatch show {dispatch_id}",
+        ]
+    )
+
+
 def auto_postprocess_commands(exec_id: str, task_id: str, dispatch_id: str, reason: str = "") -> str:
     clean_reason = safe_preview(reason, 160) or "auto postprocess gate failed"
     return "\n".join(
@@ -10498,14 +10643,28 @@ def build_exec_auto_postprocess_reply(
     failed_hard = [name for name, ok in hard_gates.items() if not ok]
     if failed_hard:
         reason = "gate failed: " + ", ".join(failed_hard)
+        rework = attempt_auto_rework_decision(task_id, normalized_exec_id, failed_hard, reason)
         record_auto_postprocess_state(
             normalized_exec_id,
             task_id,
             normalized_dispatch_id,
             enabled=False,
-            decision="needs_human_review",
+            decision=rework["decision"],
             reason=reason,
         )
+        if rework["decided"]:
+            return f"""Auto postprocess: rework (needs_evidence)
+- auto_postprocess_enabled: false
+- run_policy: {exec_meta.get('run_policy', '') or 'none'}
+- auto_decision: needs_evidence
+- auto_rework_decided: true
+- auto_closed: false
+- auto_postprocess_reason: {reason}
+Next commands:
+{auto_rework_commands(task_id, normalized_dispatch_id)}
+
+Decision preview:
+{safe_preview(rework['preview'], 260)}"""
         return f"""Auto postprocess: needs_human_review
 - auto_postprocess_enabled: false
 - run_policy: {exec_meta.get('run_policy', '') or 'none'}
@@ -10528,6 +10687,9 @@ Next commands:
         false_pass_reasons = read_only_false_pass_reasons(report)
         if false_pass_reasons:
             reason = "report indicates blocked write/source implementation: " + ", ".join(false_pass_reasons[:4])
+            rework = attempt_auto_rework_decision(
+                task_id, normalized_exec_id, ["report_blocked_write"], reason
+            )
             record_auto_postprocess_state(
                 normalized_exec_id,
                 task_id,
@@ -10537,21 +10699,28 @@ Next commands:
                 evidence_verified=False,
                 review_done=False,
                 dispatch_review_linked=False,
-                decision="needs_human_review",
+                decision=rework["decision"],
                 reason=reason,
             )
-            return f"""Auto postprocess: needs_human_review
+            next_commands = (
+                auto_rework_commands(task_id, normalized_dispatch_id)
+                if rework["decided"]
+                else auto_postprocess_commands(normalized_exec_id, task_id, normalized_dispatch_id, reason)
+            )
+            verdict_label = "rework (needs_evidence)" if rework["decided"] else "needs_human_review"
+            return f"""Auto postprocess: {verdict_label}
 - auto_postprocess_enabled: true
 - run_policy: {exec_meta.get('run_policy', '') or 'none'}
 - auto_qa_done: {str(qa_done).lower()}
 - auto_evidence_verified: false
 - auto_review_done: false
 - auto_dispatch_review_linked: false
-- auto_decision: needs_human_review
+- auto_decision: {rework['decision']}
+- auto_rework_decided: {str(rework['decided']).lower()}
 - auto_closed: false
 - auto_postprocess_reason: {reason}
 Next commands:
-{auto_postprocess_commands(normalized_exec_id, task_id, normalized_dispatch_id, reason)}
+{next_commands}
 
 QA preview:
 {safe_preview(qa_reply, 260)}"""
@@ -10580,6 +10749,7 @@ QA preview:
         failed = [name for name, ok in gates.items() if not ok]
         if failed:
             reason = "gate failed: " + ", ".join(failed)
+            rework = attempt_auto_rework_decision(task_id, normalized_exec_id, failed, reason)
             record_auto_postprocess_state(
                 normalized_exec_id,
                 task_id,
@@ -10589,22 +10759,29 @@ QA preview:
                 evidence_verified=evidence_verified,
                 review_done=review_done,
                 dispatch_review_linked=dispatch_review_linked,
-                decision="needs_human_review",
+                decision=rework["decision"],
                 reason=reason,
             )
-            return f"""Auto postprocess: needs_human_review
+            next_commands = (
+                auto_rework_commands(task_id, normalized_dispatch_id)
+                if rework["decided"]
+                else auto_postprocess_commands(normalized_exec_id, task_id, normalized_dispatch_id, reason)
+            )
+            verdict_label = "rework (needs_evidence)" if rework["decided"] else "needs_human_review"
+            return f"""Auto postprocess: {verdict_label}
 - auto_postprocess_enabled: true
 - run_policy: {exec_meta.get('run_policy', '') or 'none'}
 - auto_qa_done: {str(qa_done).lower()}
 - auto_evidence_verified: {str(evidence_verified).lower()}
 - auto_review_done: {str(review_done).lower()}
 - auto_dispatch_review_linked: {str(dispatch_review_linked).lower()}
-- auto_decision: needs_human_review
+- auto_decision: {rework['decision']}
+- auto_rework_decided: {str(rework['decided']).lower()}
 - auto_closed: false
 - auto_postprocess_reason: {reason}
 - evidence_ids: {', '.join(verified_ids) if verified_ids else 'none'}
 Next commands:
-{auto_postprocess_commands(normalized_exec_id, task_id, normalized_dispatch_id, reason)}
+{next_commands}
 
 Review preview:
 {safe_preview(review_reply, 420)}
@@ -10655,6 +10832,16 @@ Decision preview:
         close_reply = build_task_close_reply(task_id)
         retro_reply = build_retro_create_reply(task_id)
         retro_created = retro_exists(task_id)
+        learn_scan_done = False
+        learn_reply = ""
+        if AUTO_LEARN_SCAN_ENABLED and retro_created:
+            # Propose learning items from the fresh retro so playbook updates
+            # enter the human-gated learning pipeline (no auto approve/apply).
+            try:
+                learn_reply = build_learn_propose_retro_reply(task_id)
+                learn_scan_done = True
+            except Exception as exc:
+                learn_reply = f"auto learn propose failed: {safe_preview(str(exc), 160)}"
         final_analysis = evidence_analysis(task_id)
         record_auto_postprocess_state(
             normalized_exec_id,
@@ -10680,6 +10867,7 @@ Decision preview:
 - auto_decision: pass
 - auto_closed: true
 - auto_retro_created: {str(retro_created).lower()}
+- auto_learn_scan_done: {str(learn_scan_done).lower()}
 - auto_postprocess_reason: all gates passed
 - evidence_ids: {', '.join(verified_ids) if verified_ids else 'none'}
 - task_status: {task_status(task_id)}
@@ -10693,6 +10881,7 @@ Close loop:
 - task decided pass via {sandbox_label}
 - task closed
 - retro draft created
+- retro scanned into learning candidates (human-gated playbook pipeline)
 
 Decision preview:
 {safe_preview(decide_reply, 260)}
@@ -10701,7 +10890,10 @@ Close preview:
 {safe_preview(close_reply, 260)}
 
 Retro preview:
-{safe_preview(retro_reply, 260)}"""
+{safe_preview(retro_reply, 260)}
+
+Learn scan preview:
+{safe_preview(learn_reply, 220)}"""
     except Exception as exc:
         reason = f"auto postprocess failed: {safe_preview(str(exc), 220)}"
         record_auto_postprocess_state(
