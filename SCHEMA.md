@@ -33,6 +33,11 @@ same-second collisions.
   to the failed execution it replaces; written by `/exec rerun` via
   `upsert_exec_field`. `scripts/metrics_snapshot.py` counts completed
   executions with `recovered_from` as `recovered_via_rerun`.
+- Evidence `source: tool-auto` (added 2026-06-11): entries written by the Atlas
+  tool pre-pass (`run_tool_prepass`) at dispatch creation — read-only adapter
+  output captured verbatim, created `verified: verified`, idempotent per
+  task+command via the `auto_tool_command:` marker line. Kill switch:
+  `OHB_TOOL_AUTOROUTE=false`.
 - Closure facts live in the task's `## Closure Evidence` section
   (`evidence_closure_state: verified_evidence_ready` is the completeness
   criterion used by metrics).
