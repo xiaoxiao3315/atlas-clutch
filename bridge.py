@@ -6168,6 +6168,103 @@ def build_dispatch_help_reply() -> str:
 Boundary: manual dispatch ledger only. It does not call Codex/Kiro, does not run commands, does not modify user project files, and writes only workbench dispatch/context/task evidence records."""
 
 
+# Atlas auto tool routing (owner request 2026-06-11): when a dispatch is
+# created, Atlas matches the task title+goal against these rules, runs the
+# corresponding THIN READ-ONLY adapters (run_tool_adapter_command surface
+# only - browser-harness has no adapter and can never be auto-run), and
+# records each output as auto-verified evidence. Patterns are deliberately
+# specific so boilerplate like "no code changes" never triggers a tool.
+TOOL_AUTO_ROUTING_RULES = (
+    (
+        "codegraph query {query}",
+        (r"\b(function|class|method|refactor|callsite|call site|symbol|codegraph)\b", r"函数|类方法|重构|调用链|符号|代码检索"),
+        "code-intelligence keywords",
+    ),
+    (
+        "understand summary",
+        (r"\b(architecture|structure|overview|codebase map)\b", r"架构|结构|代码地图|全局理解"),
+        "architecture/overview keywords",
+    ),
+    (
+        "research plan {query}",
+        (r"\b(research|survey|investigate|literature)\b", r"调研|研究计划|综述|文献"),
+        "research keywords",
+    ),
+    (
+        "memory status",
+        (r"\b(memory|recall|previously|last time)\b", r"记忆|之前经验|上次|历史经验"),
+        "memory keywords",
+    ),
+)
+TOOL_AUTO_ROUTING_MAX = 2
+
+
+def tool_auto_routing_enabled() -> bool:
+    return os.environ.get("OHB_TOOL_AUTOROUTE", "true").strip().lower() not in {"false", "0", "off"}
+
+
+def route_tools_for_task(task_id: str, task_text: str) -> list[dict]:
+    title = task_title_from_text(task_id, task_text)
+    haystack = f"{title}\n{task_section(task_text, 'Goal')}"
+    query = " ".join(title.split())[:80]
+    matched: list[dict] = []
+    for template, patterns, reason in TOOL_AUTO_ROUTING_RULES:
+        for pattern in patterns:
+            if re.search(pattern, haystack, re.IGNORECASE):
+                matched.append({"command": template.format(query=query), "reason": reason})
+                break
+        if len(matched) >= TOOL_AUTO_ROUTING_MAX:
+            break
+    return matched
+
+
+def run_tool_prepass(task_id: str) -> str:
+    """Auto-select read-only tools for a task and record output as evidence.
+
+    Outputs are captured verbatim by the bridge from deterministic read-only
+    adapters, so entries are created verified (same trust level as collector
+    git evidence). Failures never block dispatch. Kill switch:
+    OHB_TOOL_AUTOROUTE=false.
+    """
+    if not tool_auto_routing_enabled():
+        return "- tool_auto_routing: disabled (OHB_TOOL_AUTOROUTE=false)"
+    lines: list[str] = []
+    try:
+        normalized_task_id = normalize_task_id(task_id)
+        task_text = read_task(normalized_task_id)
+        routed = route_tools_for_task(normalized_task_id, task_text)
+        if not routed:
+            return "- tool_auto_routing: no matching tool"
+        existing = read_evidence_text(normalized_task_id)
+        for item in routed:
+            command = item["command"]
+            marker = f"auto_tool_command: {command}"
+            if marker in existing:
+                lines.append(f"- tool_auto_routing: {safe_preview(command, 80)} already recorded; skipped")
+                continue
+            reply = run_tool_adapter_command(command)
+            if reply is None:
+                lines.append(f"- tool_auto_routing: {safe_preview(command, 80)} unsupported; skipped")
+                continue
+            body = (
+                f"Tool auto-routing report\n{marker}\n"
+                f"- routed_reason: {item['reason']}\n"
+                "- boundary: thin read-only adapter output captured verbatim by the bridge; no installs, no MCP changes, no browser execution.\n\n"
+                f"{reply}"
+            )
+            try:
+                evidence_id = create_evidence_entry(
+                    normalized_task_id, "report", body, source="tool-auto", verified="verified"
+                )
+                lines.append(f"- tool_auto_routing: {safe_preview(command, 80)} -> {evidence_id} ({item['reason']})")
+                log_event("tool_auto_evidence", task_id=normalized_task_id, evidence_id=evidence_id)
+            except Exception as exc:
+                lines.append(f"- tool_auto_routing: evidence write failed for {safe_preview(command, 60)}: {safe_preview(str(exc), 120)}")
+    except Exception as exc:
+        lines.append(f"- tool_auto_routing: prepass failed: {safe_preview(str(exc), 120)}")
+    return "\n".join(lines)
+
+
 def build_dispatch_create_reply(tail: str) -> str:
     parts = str(tail or "").strip().split()
     if len(parts) < 2:
@@ -6185,6 +6282,7 @@ def build_dispatch_create_reply(tail: str) -> str:
     if target not in SUPPORTED_EXECUTOR_TARGETS:
         return "Usage: /dispatch create <task_id> codex|claude|kiro|auto [--with-context]"
     with_context = "--with-context" in [part.lower() for part in parts[2:]]
+    prepass_summary = run_tool_prepass(task_id)
     dispatch_id = generate_dispatch_id()
     markdown = build_dispatch_markdown(
         dispatch_id,
@@ -6198,6 +6296,10 @@ def build_dispatch_create_reply(tail: str) -> str:
     meta = task_metadata(markdown)
     log_event("dispatch_created", dispatch_id=dispatch_id, task_id=task_id, target_executor=target)
     return f"""Dispatch created: {dispatch_id}
+
+Tool Pre-pass:
+{prepass_summary}
+
 - status: ready
 - task_id: {task_id}
 - target_executor: {target}
@@ -9970,6 +10072,7 @@ def create_codex_dispatch(
     if clean_target not in SUPPORTED_EXECUTOR_TARGETS:
         raise ValueError("target_executor must be codex, claude, or kiro")
     read_task(normalized_task_id)
+    run_tool_prepass(normalized_task_id)
     dispatch_id = generate_dispatch_id()
     markdown = build_dispatch_markdown(
         dispatch_id,
@@ -13843,6 +13946,11 @@ def build_tool_adapter_help_reply() -> str:
 - /tool memory status: agentmemory lab status; never starts a service or touches memory data.
 - /tool headroom compress <text>: dry-run compression report for pasted text only.
 - /tool evidence <task_id> <tool command...>: run a safe adapter command and record its output in the task evidence ledger as a report.
+
+Auto-routing (Atlas tool pre-pass):
+- On /dispatch create and /run task flows, Atlas matches the task title+goal against routing rules (codegraph/understand/research/memory keywords), runs at most 2 matching read-only adapters, and records each output as verified evidence (source: tool-auto).
+- Idempotent per task+command; failures never block dispatch.
+- Kill switch: OHB_TOOL_AUTOROUTE=false.
 
 Boundaries:
 - No installs, no MCP config changes, no persistent services, no LAN or public exposure.
