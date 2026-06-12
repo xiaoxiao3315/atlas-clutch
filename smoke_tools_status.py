@@ -3,9 +3,9 @@
 Proves /tools is a pure read-only status surface:
 - /tools status reports every registered tool
 - no external command or subprocess runs while handling it
-- browser-harness is reported as not-connected
-- agentmemory is reported as not-connected to real Atlas/Hermes memory
-- headroom is reported as library-only / not proxying live traffic
+- browser-harness is reported as stage1-approved while still not executed
+- agentmemory is reported as ingestion-approved with MCP connect still deferred
+- headroom is reported as benchmark-first / not proxying live traffic
 """
 from __future__ import annotations
 
@@ -43,10 +43,12 @@ def main() -> int:
         assert_contains(reply, "status_surface_only")
         for tool_id in EXPECTED_TOOL_IDS:
             assert_contains(reply, f"- {tool_id}\n  status: ")
-        assert_contains(reply, "- browser-harness\n  status: not-connected")
-        assert_contains(reply, "not-connected to real Atlas/Hermes memory")
+        assert_contains(reply, "- browser-harness\n  status: stage1-approved")
+        assert_contains(reply, "Stage 2 (real profile) needs separate approval")
+        assert_contains(reply, "- agentmemory\n  status: ingestion-approved")
+        assert_contains(reply, "MCP connect still deferred")
         assert_contains(reply, "library-only; not proxying live Claude/Codex/Kiro/Hermes traffic")
-        assert_contains(reply, "agentmemory stays not-connected to real Atlas/Hermes memory")
+        assert_contains(reply, "headroom_offline_benchmark.py")
         assert_contains(reply, "headroom stays library-only and does not proxy live traffic")
 
         help_reply = bridge.handle_local_command("/tools", {})
