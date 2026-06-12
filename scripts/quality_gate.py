@@ -64,6 +64,7 @@ CHECKS: tuple[Check, ...] = (
     Check("smoke_tool_adapters", py("smoke_tool_adapters.py")),
     Check("smoke_tool_evidence", py("smoke_tool_evidence.py")),
     Check("smoke_auto_pipeline", py("smoke_auto_pipeline.py")),
+    Check("smoke_learning_loop", py("smoke_learning_loop.py")),
     Check("smoke_exec_rerun", py("smoke_exec_rerun.py")),
     Check("smoke_metrics_snapshot", py("smoke_metrics_snapshot.py")),
     Check("smoke_tool_autoroute", py("smoke_tool_autoroute.py")),

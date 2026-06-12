@@ -4104,6 +4104,38 @@ def build_learn_propose_retro_reply(task_id: str) -> str:
 - 下一步：/learn review {learn_ids[0]}"""
 
 
+def learning_proposals_for_task(task_id: str) -> list[str]:
+    """Learn ids of proposals already harvested from this task's retro."""
+    ensure_workbench_dirs()
+    ids: list[str] = []
+    try:
+        normalized_task_id = normalize_task_id(task_id)
+    except ValueError:
+        return ids
+    for path in sorted(LEARNING_PROPOSALS_DIR.glob("*.md")):
+        try:
+            meta = task_metadata(path.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        if meta.get("source_task_id", "") == normalized_task_id:
+            ids.append(path.stem)
+    return ids
+
+
+def auto_propose_learning_from_retro(task_id: str) -> tuple[list[str], str, bool]:
+    """Idempotent auto-harvest used by the auto-close pipeline.
+
+    Returns (learn_ids, summary, scan_done). A task whose retro was already
+    harvested is never harvested twice; review/approve/apply stay human-gated.
+    """
+    existing = learning_proposals_for_task(task_id)
+    if existing:
+        summary = "auto learn scan skipped: proposals already exist for this task: " + ", ".join(existing[:3])
+        return existing, summary, True
+    reply = build_learn_propose_retro_reply(task_id)
+    return learning_proposals_for_task(task_id), reply, True
+
+
 def build_learn_propose_manual_reply(title: str) -> str:
     learn_id = generate_learn_id()
     proposal = build_learning_proposal_markdown(
@@ -4340,7 +4372,8 @@ def build_learn_approve_reply(learn_id: str, note: str) -> str:
 - registry：workbench/learning/registry/{normalized_learn_id}.md
 - application_status：not_applied
 - application_enabled：false
-- 未写 Memory，未写 SkillRepo，未改 Hermes。"""
+- 未写 Memory，未写 SkillRepo，未改 Hermes。
+- 下一步（进入 playbook，仍需人工确认）：/apply plan {normalized_learn_id} global 或 /apply plan {normalized_learn_id} project <project_id>"""
 
 
 def move_learning_copy(learn_id: str, target_dir: Path, text: str) -> None:
@@ -7420,6 +7453,7 @@ auto_dispatch_review_linked: false
 auto_decision:
 auto_closed: false
 auto_retro_created: false
+auto_learning_proposals:
 auto_postprocess_reason:
 manual_copy_required: true
 
@@ -10834,12 +10868,13 @@ Decision preview:
         retro_created = retro_exists(task_id)
         learn_scan_done = False
         learn_reply = ""
+        auto_learn_ids: list[str] = []
         if AUTO_LEARN_SCAN_ENABLED and retro_created:
             # Propose learning items from the fresh retro so playbook updates
             # enter the human-gated learning pipeline (no auto approve/apply).
+            # Idempotent: a retro already harvested is never harvested twice.
             try:
-                learn_reply = build_learn_propose_retro_reply(task_id)
-                learn_scan_done = True
+                auto_learn_ids, learn_reply, learn_scan_done = auto_propose_learning_from_retro(task_id)
             except Exception as exc:
                 learn_reply = f"auto learn propose failed: {safe_preview(str(exc), 160)}"
         final_analysis = evidence_analysis(task_id)
@@ -10857,6 +10892,10 @@ Decision preview:
             retro_created=retro_created,
             reason="all gates passed",
         )
+        update_exec_fields(
+            normalized_exec_id,
+            {"auto_learning_proposals": safe_preview("; ".join(auto_learn_ids), 200) or "none"},
+        )
         return f"""Auto postprocess: pass
 - auto_postprocess_enabled: true
 - run_policy: {exec_meta.get('run_policy', '') or 'none'}
@@ -10868,6 +10907,8 @@ Decision preview:
 - auto_closed: true
 - auto_retro_created: {str(retro_created).lower()}
 - auto_learn_scan_done: {str(learn_scan_done).lower()}
+- auto_learning_proposals: {', '.join(auto_learn_ids) or 'none'}
+- next_learning_review: {f'/learn review {auto_learn_ids[0]}' if auto_learn_ids else 'none'}
 - auto_postprocess_reason: all gates passed
 - evidence_ids: {', '.join(verified_ids) if verified_ids else 'none'}
 - task_status: {task_status(task_id)}
