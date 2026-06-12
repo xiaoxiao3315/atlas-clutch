@@ -960,16 +960,20 @@ def main() -> int:
             assert route == "local_command"
             blocked_exec_id = extract_exec_id(blocked_reply)
             assert_contains(blocked_reply, "status: returned")
-            assert_contains(blocked_reply, "Auto postprocess: needs_human_review")
+            # Blocked write/source implementation is a deterministic rework
+            # signal: auto postprocess records needs_evidence automatically.
+            assert_contains(blocked_reply, "Auto postprocess: rework (needs_evidence)")
             assert_contains(blocked_reply, "report indicates blocked write/source implementation")
-            assert_contains(blocked_reply, "auto_decision: needs_human_review")
+            assert_contains(blocked_reply, "auto_decision: needs_evidence")
+            assert_contains(blocked_reply, "auto_rework_decided: true")
             assert_contains(blocked_reply, "auto_closed: false")
             assert_not_contains(blocked_reply, "Auto postprocess: pass")
             blocked_exec_text = (bridge.EXECUTIONS_DIR / f"{blocked_exec_id}.md").read_text(encoding="utf-8")
             blocked_task_text = (bridge.TASKS_DIR / f"{blocked_task_id}.md").read_text(encoding="utf-8")
-            assert_contains(blocked_exec_text, "auto_decision: needs_human_review")
+            assert_contains(blocked_exec_text, "auto_decision: needs_evidence")
             assert_contains(blocked_exec_text, "auto_evidence_verified: false")
             assert_contains(blocked_exec_text, "auto_closed: false")
+            assert_contains(blocked_task_text, "status: needs_evidence")
             assert_not_contains(blocked_task_text, "status: archived")
             if (bridge.RETROS_DIR / f"{blocked_task_id}.md").exists():
                 raise AssertionError("read-only blocked implementation must not auto-create retro")
@@ -1007,17 +1011,20 @@ def main() -> int:
             assert route == "local_command"
             gap_exec_id = extract_exec_id(gap_reply)
             assert_contains(gap_reply, "status: returned")
-            assert_contains(gap_reply, "Auto postprocess: needs_human_review")
+            # Remaining evidence gaps are deterministic: auto postprocess now
+            # records a needs_evidence (rework) decision with gap guidance.
+            assert_contains(gap_reply, "Auto postprocess: rework (needs_evidence)")
             assert_contains(gap_reply, "review_has_no_remaining_gaps")
             assert_contains(gap_reply, "closure_evidence_ready")
-            assert_contains(gap_reply, "auto_decision: needs_human_review")
-            assert_contains(gap_reply, f"/task review {gap_task_id}")
+            assert_contains(gap_reply, "auto_decision: needs_evidence")
+            assert_contains(gap_reply, "auto_rework_decided: true")
+            assert_contains(gap_reply, f"/evidence gaps {gap_task_id}")
             gap_exec_text = (bridge.EXECUTIONS_DIR / f"{gap_exec_id}.md").read_text(encoding="utf-8")
             gap_task_text = (bridge.TASKS_DIR / f"{gap_task_id}.md").read_text(encoding="utf-8")
             assert_contains(gap_exec_text, "auto_evidence_verified: true")
-            assert_contains(gap_exec_text, "auto_decision: needs_human_review")
+            assert_contains(gap_exec_text, "auto_decision: needs_evidence")
             assert_contains(gap_exec_text, "auto_closed: false")
-            assert_contains(gap_task_text, "status: reviewed")
+            assert_contains(gap_task_text, "status: needs_evidence")
             assert_contains(gap_task_text, "live_skipped: true")
             assert_not_contains(gap_task_text, "status: archived")
             if (bridge.RETROS_DIR / f"{gap_task_id}.md").exists():

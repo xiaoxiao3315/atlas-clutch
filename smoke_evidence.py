@@ -199,6 +199,7 @@ Authorization: Bearer {secret}
 
 secret: {secret}
 """
+            bridge.prepare_reply(f"/task handoff {task_id} codex", ctx)
             reported, route = bridge.prepare_reply(f"/task report {task_id}\n{report_body}", ctx)
             assert route == "local_command"
             assert_contains(reported, "自动证据")

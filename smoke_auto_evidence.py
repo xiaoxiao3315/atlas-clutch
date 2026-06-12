@@ -223,6 +223,7 @@ def main() -> int:
             assert_contains(key_preview, "sensitive_risk: true")
             assert_not_contains(key_preview, secret_key)
 
+            bridge.prepare_reply(f"/task handoff {task_id} codex", ctx)
             reported, route = bridge.prepare_reply(f"/task report {task_id}\n{report}", ctx)
             assert route == "local_command"
             assert_contains(reported, "type=api")

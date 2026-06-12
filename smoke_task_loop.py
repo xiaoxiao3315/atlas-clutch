@@ -132,6 +132,21 @@ password: hunter2
 api_key: sk-task-loop-secret
 secret: raw-secret-value
 """
+            # Pre-registration: a report without a prior dispatch/handoff must
+            # be refused (no after-the-fact recording).
+            refused, route = bridge.prepare_reply(f"/task report {task_id}\n{report_body}", ctx)
+            assert route == "local_command"
+            assert_contains(refused, "pre_registration_enforced: true")
+            assert_contains(refused, "回传被拒绝")
+            task_text = task_file.read_text(encoding="utf-8")
+            assert_not_contains(task_text, "### Report at")
+
+            handoff, route = bridge.prepare_reply(f"/task handoff {task_id} codex", ctx)
+            assert route == "local_command"
+            assert_contains(handoff, "执行交接包")
+            task_text = task_file.read_text(encoding="utf-8")
+            assert_contains(task_text, "execution registered")
+
             reported, route = bridge.prepare_reply(f"/task report {task_id}\n{report_body}", ctx)
             assert route == "local_command"
             assert_contains(reported, "status：reported")

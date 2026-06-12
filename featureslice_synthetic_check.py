@@ -231,21 +231,35 @@ with tempfile.TemporaryDirectory(prefix="ohb-featureslice-diag-") as tmp:
         ghost_reply, _ = bridge.prepare_reply(ghost_command, ctx)
         ghost_meta = bridge.task_metadata(bridge.read_exec(extract_exec_id(ghost_reply)))
         check("12b bridge-run failure fails validation", ghost_meta.get("required_validation_status") == "failed", ghost_meta.get("required_validation_reason"))
-        check("12b bridge-run failure blocked", "auto_decision: needs_human_review" in ghost_reply, ghost_reply[-400:])
+        # Deterministic validation failures now auto-record a needs_evidence
+        # (rework) decision; they never auto-close.
+        check(
+            "12b bridge-run failure rework",
+            ghost_meta.get("auto_decision") == "needs_evidence" and ghost_meta.get("auto_closed") == "false",
+            ghost_meta,
+        )
 
-        # ---- 13. nonzero validation returncode blocks ----
+        # ---- 13. nonzero validation returncode blocks auto close ----
         state.update({"wrote": False, "commands": [], "evidence": f"validation: python -B -m py_compile {TOOL} => returncode: 1\nvalidation: git diff --check => returncode: 0"})
         rc_reply, _ = bridge.prepare_reply(SLICE_COMMAND, ctx)
         rc_meta = bridge.task_metadata(bridge.read_exec(extract_exec_id(rc_reply)))
         check("13 nonzero returncode fails validation", rc_meta.get("required_validation_status") == "failed" and "returncode 1" in rc_meta.get("required_validation_reason", ""), rc_meta.get("required_validation_reason"))
-        check("13 nonzero blocked", "auto_decision: needs_human_review" in rc_reply, rc_reply[-400:])
+        check(
+            "13 nonzero rework",
+            rc_meta.get("auto_decision") == "needs_evidence" and rc_meta.get("auto_closed") == "false",
+            rc_meta,
+        )
 
-        # ---- 14. wrong acceptance content blocked ----
+        # ---- 14. wrong acceptance content blocks auto close ----
         state.update({"wrote": False, "commands": [], "files": {TOOL: "def other():\n    pass\n", NOTES: NOTES_CONTENT}, "evidence": VALID_EVIDENCE})
         wrong_reply, _ = bridge.prepare_reply(SLICE_COMMAND, ctx)
         wrong_meta = bridge.task_metadata(bridge.read_exec(extract_exec_id(wrong_reply)))
         check("14 missing literal fails acceptance", wrong_meta.get("acceptance_fidelity") == "failed" and "does not contain" in wrong_meta.get("acceptance_fidelity_reason", ""), wrong_meta.get("acceptance_fidelity_reason"))
-        check("14 wrong content blocked", "auto_decision: needs_human_review" in wrong_reply, wrong_reply[-400:])
+        check(
+            "14 wrong content rework",
+            wrong_meta.get("auto_decision") == "needs_evidence" and wrong_meta.get("auto_closed") == "false",
+            wrong_meta,
+        )
 
         # ---- 4-7. evaluator edge cases via live runs ----
         # 4: undeclared acceptance target

@@ -159,6 +159,7 @@ def main() -> int:
                 ctx,
             )
             needs_task_id = extract_task_id(needs_reply)
+            bridge.prepare_reply(f"/task handoff {needs_task_id} codex", ctx)
             bridge.prepare_reply(f"/task report {needs_task_id}\n{make_report(secret)}", ctx)
             bridge.prepare_reply(f"/task review {needs_task_id}", ctx)
             bridge.prepare_reply(
@@ -217,6 +218,7 @@ def main() -> int:
                 ctx,
             )
             passed_task_id = extract_task_id(passed_reply)
+            bridge.prepare_reply(f"/task handoff {passed_task_id} codex", ctx)
             bridge.prepare_reply(f"/task report {passed_task_id}\n{make_report(secret)}", ctx)
             bridge.prepare_reply(f"/task review {passed_task_id}", ctx)
             bridge.prepare_reply(f"/task decide {passed_task_id} pass 用户强制记录通过 {secret}", ctx)

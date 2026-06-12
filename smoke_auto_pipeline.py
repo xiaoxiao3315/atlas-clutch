@@ -252,7 +252,10 @@ def main() -> int:
                 slice_meta.get("auto_decision"),
             )
 
-            # ---- 4. acceptance failure -> needs_human_review ----
+            # ---- 4. acceptance failure -> deterministic auto rework ----
+            # Acceptance/required-validation gate failures are deterministic
+            # evidence gaps, so auto postprocess now records a needs_evidence
+            # (rework) decision instead of stopping at needs_human_review.
             reset_state({SLICE_TOOL: SLICE_WRONG_TOOL_CONTENT, SLICE_NOTES: SLICE_NOTES_CONTENT}, evidence="")
             fail_reply, _ = bridge.prepare_reply(ACCEPTANCE_FAIL_COMMAND, ctx)
             fail_meta = bridge.task_metadata(bridge.read_exec(extract_exec_id(fail_reply)))
@@ -262,9 +265,14 @@ def main() -> int:
                 fail_meta.get("acceptance_fidelity_reason"),
             )
             check(
-                "4 auto_decision needs_human_review (persisted)",
-                fail_meta.get("auto_decision") == "needs_human_review",
+                "4 auto_decision needs_evidence rework (persisted)",
+                fail_meta.get("auto_decision") == "needs_evidence",
                 fail_meta.get("auto_decision"),
+            )
+            check(
+                "4 auto rework not closed",
+                fail_meta.get("auto_closed") == "false",
+                fail_meta.get("auto_closed"),
             )
         finally:
             bridge.run_allowlisted_external_command = orig_runner

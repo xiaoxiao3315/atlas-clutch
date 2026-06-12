@@ -146,6 +146,7 @@ def main() -> int:
             task_reply, route = bridge.prepare_reply("/task new 检查 Kiro 反代当前状态 --project kiro-proxy", ctx)
             assert route == "local_command"
             task_id = extract_task_id(task_reply)
+            bridge.prepare_reply(f"/task handoff {task_id} codex", ctx)
             bridge.prepare_reply(f"/task report {task_id}\n{report(secret)}", ctx)
             bridge.prepare_reply(f"/task review {task_id}", ctx)
             bridge.prepare_reply(f"/task decide {task_id} needs_evidence 需要补真实上游请求证据 {secret}", ctx)
